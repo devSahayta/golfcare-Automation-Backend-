@@ -9,4 +9,8 @@ app.use("/webhooks/samvaadik", samvaadikWebhookRouter);
 app.use(express.json());
 app.use("/health", healthRouter);
 
+app.get("/", (_req, res) => {
+  res.json({ service: "Golf Care OS API", status: "running" });
+});
+
 module.exports = app;
