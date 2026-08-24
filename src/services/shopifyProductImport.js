@@ -1,9 +1,4 @@
-// services/shopifyProductImport.js
-//
-// Full paginated catalog import — same upsert logic the webhook handlers
-// use, so this doubles as the initial backfill AND the nightly
-// reconciliation (see shopifyReconciliation.js).
-
+// src/services/shopifyProductImport.js
 const axios = require("axios");
 const { env } = require("../config/env");
 const { getValidAccessToken } = require("./shopifyAuth");
@@ -23,8 +18,6 @@ function parseNextPageInfo(linkHeader) {
   return new URL(urlMatch[1]).searchParams.get("page_info");
 }
 
-// Minimal fake req/res so we can reuse handleProductUpsert's upsert logic
-// instead of duplicating it here.
 function fakeReqRes(product) {
   const req = { body: product };
   const res = { status: () => ({ send: () => {} }) };
@@ -48,6 +41,8 @@ async function importAllProducts() {
   let pages = 0;
   let pageInfo = null;
 
+  console.log(`Starting Shopify product import from ${shopDomain}...`);
+
   do {
     const params = { limit: PAGE_LIMIT };
     if (pageInfo) params.page_info = pageInfo;
@@ -62,9 +57,12 @@ async function importAllProducts() {
 
     totalImported += products.length;
     pages += 1;
+    console.log(
+      `  page ${pages}: imported ${products.length} products (running total: ${totalImported})`,
+    );
     pageInfo = parseNextPageInfo(res.headers?.link);
 
-    if (pageInfo) await new Promise((r) => setTimeout(r, 600)); // stay under rate limit
+    if (pageInfo) await new Promise((r) => setTimeout(r, 600));
   } while (pageInfo);
 
   console.log(
