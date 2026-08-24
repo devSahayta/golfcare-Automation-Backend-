@@ -5,6 +5,7 @@ const env = {
   nodeEnv: process.env.NODE_ENV || "development",
   port: Number(process.env.API_PORT || 4000),
   databaseUrl: process.env.DATABASE_URL || "",
+  kindeDomain: process.env.KINDE_DOMAIN || "",
   samvaadik: {
     baseUrl: process.env.SAMVAADIK_API_BASE_URL || "",
     apiKey: process.env.SAMVAADIK_API_KEY || "",
