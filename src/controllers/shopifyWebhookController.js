@@ -11,6 +11,16 @@
 //     SUPPLIER_CONFIRMED / MANUAL_OWNER / AGENT_INFERRED). So
 //     inventory_levels/update does NOT write inventory numbers anywhere
 //     yet — see handleInventoryLevelUpdate below.
+//
+// IMPORTANT — serverless constraint: every handler awaits ALL its database
+// work BEFORE calling res.send(). On Vercel, a function can be frozen or
+// killed the instant a response is sent, so any code after res.send() is
+// not guaranteed to finish — it can leave a Prisma connection open and
+// never released, which then starves a completely unrelated later request.
+// (This is exactly what caused the connection-pool-timeout errors showing
+// up under /api/users instead of the webhook route itself.) Respond-fast-
+// then-process-in-background is a pattern for always-on servers only;
+// don't reintroduce it here.
 
 const { prisma } = require("../lib/prisma");
 
@@ -26,7 +36,6 @@ function computePriceRange(variants) {
 
 async function handleProductUpsert(req, res) {
   const product = req.body;
-  res.status(200).send("ok"); // respond fast; Shopify expects <5s
 
   try {
     const { priceMin, priceMax } = computePriceRange(product.variants);
@@ -105,8 +114,11 @@ async function handleProductUpsert(req, res) {
         },
       });
     }
+
+    res.status(200).send("ok");
   } catch (err) {
     console.error("handleProductUpsert error:", err);
+    res.status(500).send("error");
   }
 }
 
@@ -114,49 +126,38 @@ async function handleProductUpsert(req, res) {
 
 async function handleProductDelete(req, res) {
   const { id: shopifyProductId } = req.body;
-  res.status(200).send("ok");
 
   try {
     await prisma.product.update({
       where: { shopifyProductId: String(shopifyProductId) },
       data: { status: "archived", syncedAt: new Date() },
     });
+    res.status(200).send("ok");
   } catch (err) {
-    // P2025 = record not found — fine, nothing to delete
-    if (err.code !== "P2025") console.error("handleProductDelete error:", err);
+    if (err.code === "P2025") {
+      res.status(200).send("ok");
+      return;
+    }
+    console.error("handleProductDelete error:", err);
+    res.status(500).send("error");
   }
 }
 
 /* ─── inventory_levels/update ───────────────────────────────────────────── */
-/*
-  STUB — pending a design decision. Your schema tracks availability as an
-  explicitly-confirmed fact (AvailabilityState.source: SUPPLIER_CONFIRMED /
-  MANUAL_OWNER / AGENT_INFERRED), not a raw Shopify stock count, and Variant
-  has no quantity field to write into. Wire this up once you've decided
-  whether a Shopify stock change should:
-    (a) create/update an AvailabilityState with source: AGENT_INFERRED, or
-    (b) just log an Event for a human/agent to act on, or
-    (c) something else.
-  Logging only for now so nothing breaks and nothing writes bad data.
-*/
 async function handleInventoryLevelUpdate(req, res) {
   const { inventory_item_id, available } = req.body;
-  res.status(200).send("ok");
   console.log(
     `[shopify webhook] inventory_levels/update received — inventory_item_id=${inventory_item_id}, available=${available}. Not yet persisted (see comment in shopifyWebhookController.js).`,
   );
+  res.status(200).send("ok");
 }
 
 /* ─── orders/create, orders/updated ─────────────────────────────────────── */
 
 async function handleOrderUpsert(req, res) {
   const order = req.body;
-  res.status(200).send("ok");
 
   try {
-    // Only link to a Customer if we can match one by shopifyCustomerId —
-    // never create a Customer here (waPhone is required/unique and the
-    // WhatsApp-driven onboarding flow owns Customer creation).
     let customerId = null;
     if (order.customer?.id) {
       const matched = await prisma.customer.findUnique({
@@ -188,21 +189,17 @@ async function handleOrderUpsert(req, res) {
         discountCodes: (order.discount_codes || []).map((d) => d.code),
       },
     });
+
+    res.status(200).send("ok");
   } catch (err) {
     console.error("handleOrderUpsert error:", err);
+    res.status(500).send("error");
   }
 }
 
 /* ─── customers/create, customers/update ────────────────────────────────── */
-/*
-  Customer.waPhone is required + unique, and Customer creation is owned by
-  the WhatsApp onboarding flow — so this only UPDATES an existing customer
-  matched by shopifyCustomerId (or by phone, backfilling shopifyCustomerId
-  the first time). It never creates a new Customer row.
-*/
 async function handleCustomerUpsert(req, res) {
   const customer = req.body;
-  res.status(200).send("ok");
 
   try {
     const byShopifyId = await prisma.customer.findUnique({
@@ -215,6 +212,7 @@ async function handleCustomerUpsert(req, res) {
         where: { id: byShopifyId.id },
         data: { email: customer.email || undefined, updatedAt: new Date() },
       });
+      res.status(200).send("ok");
       return;
     }
 
@@ -223,6 +221,7 @@ async function handleCustomerUpsert(req, res) {
       console.log(
         `[shopify webhook] customer ${customer.id} has no phone — can't match to a Customer record, skipping.`,
       );
+      res.status(200).send("ok");
       return;
     }
 
@@ -245,8 +244,11 @@ async function handleCustomerUpsert(req, res) {
         `[shopify webhook] no existing Customer matches phone ${phone} — not creating one from Shopify data.`,
       );
     }
+
+    res.status(200).send("ok");
   } catch (err) {
     console.error("handleCustomerUpsert error:", err);
+    res.status(500).send("error");
   }
 }
 
