@@ -21,7 +21,9 @@ const env = {
     locationId: process.env.SHOPIFY_LOCATION_ID || "",
     // Placeholder policy — see services/shopifyInventory.js header. Pending
     // Tejas's decision on out-of-stock storefront behaviour (plan §11.1).
-    defaultAvailableQty: Number(process.env.SHOPIFY_DEFAULT_AVAILABLE_QTY || 99),
+    defaultAvailableQty: Number(
+      process.env.SHOPIFY_DEFAULT_AVAILABLE_QTY || 99,
+    ),
   },
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
   approvalLinkBaseUrl:
@@ -29,6 +31,19 @@ const env = {
   // Placeholder default — TTL per product category is still an open
   // decision (plan §11.5). 168h = 7 days.
   availabilityTtlHours: Number(process.env.AVAILABILITY_TTL_HOURS || 168),
+
+  anthropicModel: process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6",
+  discountCeilingPercent: Number(process.env.DISCOUNT_CEILING_PERCENT || 0),
+  handoverValueThresholdInr: Number(
+    process.env.HANDOVER_VALUE_THRESHOLD_INR || 75000,
+  ),
+  agentMaxToolIterations: Number(process.env.AGENT_MAX_TOOL_ITERATIONS || 6),
+  agentHistoryMessageLimit: Number(
+    process.env.AGENT_HISTORY_MESSAGE_LIMIT || 20,
+  ),
+  agentProcessingLockStaleMinutes: Number(
+    process.env.AGENT_PROCESSING_LOCK_STALE_MINUTES || 5,
+  ),
 };
 
 module.exports = { env };

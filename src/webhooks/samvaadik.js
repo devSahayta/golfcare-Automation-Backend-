@@ -1,6 +1,12 @@
+// src/webhooks/samvaadik.js
+
 const { Router } = require("express");
 const express = require("express");
 const { prisma } = require("../lib/prisma");
+const { resolveConversation } = require("./lib/resolveConversation");
+const { runAgent } = require("../services/agentEngine");
+const salesAgentConfig = require("../services/salesAgent/salesAgentConfig");
+const { sendText, parseWebhook } = require("../lib/samvaadik/adapter");
 
 const router = Router();
 
@@ -11,54 +17,45 @@ const router = Router();
 // verification here before this handles real customer traffic in production.
 router.use(express.json());
 
-function normalizeEvents(body) {
-  const events = Array.isArray(body) ? body : [body];
-  return events.map((evt) => ({
-    event: evt.event,
-    accountId: evt.account_id,
-    from: evt.from,
-    message: evt.message,
-    messageType: evt.message_type,
-    mediaUrl: evt.media_url || null,
-    timestamp: evt.timestamp ? new Date(evt.timestamp) : new Date(),
-  }));
-}
-
 async function handleInboundMessage(evt) {
-  // Find or link a Customer by phone, if one already exists — never
-  // create a new Customer here, same rule as the Shopify order/customer
-  // sync: Customer creation is owned by the WhatsApp onboarding flow
-  // elsewhere in the system, not by this webhook.
-  const customer = await prisma.customer.findUnique({
-    where: { waPhone: evt.from },
-    select: { id: true },
-  });
+  // resolveConversation finds/links Customer or Supplier by phone, and
+  // creates a bare Customer if neither exists yet (Scenario B — the
+  // record needs to exist from message one so search/checkout are never
+  // gated on enrollment; enroll_membership fills in the rest later).
+  // NOTE: this replaces the previous "never create a Customer here" rule
+  // — see conversation with Claude if you need the reasoning again.
+  const conversation = await resolveConversation(evt.from);
 
-  // Find the most recent conversation for this phone number, or start one.
-  let conversation = await prisma.conversation.findFirst({
-    where: { waPhone: evt.from },
-    orderBy: { createdAt: "desc" },
+  // Idempotency guard — Samvaadik (or WhatsApp's own delivery layer)
+  // appears to retry webhook delivery if our response is slow, and since
+  // we deliberately await the full agent run before responding (see the
+  // Vercel-freeze note below), that retry can arrive after the first
+  // delivery's lock has already been released, looking like a brand new
+  // message and running the whole agent a second time. Same original
+  // event redelivered keeps the same `timestamp` field; a genuinely new
+  // message from the customer moments later won't. This isn't a perfect
+  // key (no message id is available in Samvaadik's forwarded payload as
+  // documented) but is a solid practical guard against exact-duplicate
+  // redelivery.
+  const existingDuplicate = await prisma.message.findFirst({
+    where: {
+      conversationId: conversation.id,
+      direction: "INBOUND",
+      body: evt.message,
+      createdAt: evt.timestamp,
+    },
   });
-
-  if (!conversation) {
-    conversation = await prisma.conversation.create({
-      data: {
-        waPhone: evt.from,
-        customerId: customer?.id || null,
-        state: "AI_HANDLING",
-        lastMessageAt: evt.timestamp,
-      },
-    });
-  } else {
-    await prisma.conversation.update({
-      where: { id: conversation.id },
-      data: {
-        lastMessageAt: evt.timestamp,
-        ...(customer?.id &&
-          !conversation.customerId && { customerId: customer.id }),
-      },
-    });
+  if (existingDuplicate) {
+    console.log(
+      `[samvaadik webhook] duplicate delivery detected for ${conversation.id}, skipping.`,
+    );
+    return;
   }
+
+  await prisma.conversation.update({
+    where: { id: conversation.id },
+    data: { lastMessageAt: evt.timestamp },
+  });
 
   await prisma.message.create({
     data: {
@@ -71,11 +68,29 @@ async function handleInboundMessage(evt) {
       createdAt: evt.timestamp,
     },
   });
+
+  if (conversation.supplierId) {
+    // Supplier Agent isn't built yet (Module 5) — leave supplier
+    // conversations untouched for now.
+    return;
+  }
+
+  // Awaited deliberately, not fire-and-forget — Vercel can freeze the
+  // function right after res.send(), same gotcha Module 1 already hit.
+  try {
+    await runAgent({
+      conversationId: conversation.id,
+      config: salesAgentConfig,
+      sendFn: async ({ conversation: c, text }) => sendText(c.waPhone, text),
+    });
+  } catch (err) {
+    console.error("[samvaadik webhook] runAgent failed:", err);
+  }
 }
 
 router.post("/", async (req, res) => {
   try {
-    const events = normalizeEvents(req.body);
+    const events = parseWebhook(req.body);
 
     for (const evt of events) {
       if (evt.event !== "message.received") {
