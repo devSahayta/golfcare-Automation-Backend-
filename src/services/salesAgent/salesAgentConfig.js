@@ -81,7 +81,7 @@ const tools = [
   {
     name: "enroll_membership",
     description:
-      "Enroll the current customer as a Golf Care member. Only call after they've agreed AND you've asked the consent line — pass their actual answer as consentMarketing, never assume true.",
+      "Enroll the current customer as a Golf Care member. Only call after they've agreed AND you've asked the consent line — pass their actual answer as consentMarketing, never assume true. Do NOT reveal the member code to the customer right after this call — it gets revealed later, at the end of profile setup.",
     input_schema: {
       type: "object",
       properties: { consentMarketing: { type: "boolean" } },
@@ -110,8 +110,13 @@ function buildSystemPrompt(context) {
   const c = context.customer;
   const gp = context.golferProfile;
 
+  // memberCode is exposed here specifically so it's still available to
+  // the model on the LAST enrolment turn, several messages after
+  // enroll_membership actually ran — tool results from earlier turns
+  // aren't visible to the model on later turns, only plain conversation
+  // text is, so this card is how the code survives across that gap.
   const customerCard = c
-    ? `Customer: ${c.firstName || "unknown name"} | Member: ${c.isMember} | Tier: ${c.tier} | ` +
+    ? `Customer: ${c.firstName || "unknown name"} | Member: ${c.isMember} | Member code: ${c.memberCode || "none yet"} | Tier: ${c.tier} | ` +
       `Budget tier: ${gp?.budgetTier || "unknown"} | Handicap: ${gp?.handicap ?? "unknown"} | ` +
       `Preferred brands: ${(gp?.preferredBrands || []).join(", ") || "none noted"}`
     : "New customer, no profile yet.";
@@ -136,16 +141,14 @@ function buildSystemPrompt(context) {
       .join("\n");
     membershipInstruction = `ENROLMENT IN PROGRESS. The customer just joined. Before pitching any product or asking anything else, walk them through these remaining setup questions, ONE per message, in this order, including the payoff line where given:
 ${remaining}
-Call record_profile_answer right after each answer. If they skip or decline one, respect it and move on — don't push. Once every field above is answered or skipped, call complete_enrolment, then send a clear, warm completion message that explicitly says something like "You're fully set up!" or "Your profile's complete!" — don't just trail off into "anything else?" without first marking the moment. Use their name and at least one detail they shared (club or ball) to make it feel personal. Do NOT quote a discount percentage or say "member pricing" — that copy isn't finalized yet.`;
+Call record_profile_answer right after each answer. If they skip or decline one, respect it and move on — don't push. Once every field above is answered or skipped, send ONE warm closing message that: (1) explicitly marks completion — "You're all set!" or similar, (2) reveals their member code (shown in the customer card above as "Member code"), (3) uses their name and at least one real detail they shared (club or ball) to make it personal. This is the moment they've been building toward — make it feel like a proper welcome, not a database confirmation. Do NOT quote a discount percentage or say "member pricing" — that copy isn't finalized yet.`;
   } else if (context.hasPitchedMembership) {
     membershipInstruction =
       "You already mentioned Golf Care membership earlier. Do NOT pitch it again unless they ask or agree to enroll.";
   } else {
-    membershipInstruction = `Pitch Golf Care membership (free) once you see a genuine buying-intent signal beyond a single SKU lookup — never on the first message. If they agree, FIRST ask this exact consent line: "${CONSENT_NOTICE_LINE}" Then call enroll_membership with consentMarketing set to true or false based on their literal answer — never assume yes. IMPORTANT: the moment enroll_membership succeeds, do NOT stop there or ask "anything else?" — immediately continue in the SAME reply into the first Part A setup question ("What should I call you?"). Enrollment and profile setup are one continuous flow from the customer's perspective, never two separate steps.`;
+    membershipInstruction = `Pitch Golf Care membership (free) once you see a genuine buying-intent signal beyond a single SKU lookup — never on the first message. If they're interested, first ask this exact consent line: "${CONSENT_NOTICE_LINE}" Once they answer, call enroll_membership with consentMarketing set to their literal answer (true/false, never assume yes). IMPORTANT: after enroll_membership succeeds, do NOT reveal the member code yet and do NOT say "you're a member" as if things are finished. Instead say something warm and brief like "Perfect, you're in — let's get your profile set up so I can look after you properly" and immediately continue in the SAME reply into the first Part A question ("What should I call you?"). The member code is the reward at the END of setup, not the opening line.`;
   }
 
-  // This return was missing before — without it, buildSystemPrompt
-  // returned undefined and every agent call broke.
   return `You are Golf Care's WhatsApp sales concierge (golfcare.in, a 20-year-old golf retail
 business). You actively help customers find and buy the right gear — don't just answer
 questions, suggest what fits their game.
