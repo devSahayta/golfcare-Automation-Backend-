@@ -61,6 +61,26 @@ function looksLikeUnverifiedProductList(
   return boldSegments.length >= 2;
 }
 
+// Hard backstop for the member-code-reveal ordering, independent of
+// whether the model follows its prompt instructions correctly. The code
+// can only legitimately appear in a reply if record_profile_answer just
+// returned enrolmentCompleted:true THIS turn (the deterministic
+// all-7-fields check in salesAgentTools.js), or the customer was already
+// a fully onboarded member before this turn even started.
+function revealsMemberCode(draftText, context) {
+  const code = context.customer?.memberCode;
+  if (!code) return false;
+  return draftText.includes(code);
+}
+
+function enrolmentJustCompleted(toolCallLog) {
+  return toolCallLog.some(
+    (c) =>
+      c.tool === "record_profile_answer" &&
+      c.output?.enrolmentCompleted === true,
+  );
+}
+
 function lastCheckoutTotal(toolCallLog) {
   const call = [...toolCallLog]
     .reverse()
@@ -105,6 +125,14 @@ function runGuardrails({ draftText, toolCallLog, context }) {
     !calledAnyProductLookup(toolCallLog, context.recentMessages)
   ) {
     return { action: "block", reason: "unverified_stock_or_price_claim" };
+  }
+
+  if (revealsMemberCode(draftText, context)) {
+    const alreadyFullyOnboarded =
+      context.customer?.onboardingState === "COMPLETED";
+    if (!alreadyFullyOnboarded && !enrolmentJustCompleted(toolCallLog)) {
+      return { action: "block", reason: "premature_member_code_reveal" };
+    }
   }
 
   const discountMatch = draftText.match(DISCOUNT_RE);
