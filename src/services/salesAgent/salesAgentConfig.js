@@ -1,5 +1,13 @@
 // src/services/salesAgent/salesAgentConfig.js
 const { buildSalesAgentTools } = require("./salesAgentTools");
+const { ENROLMENT_QUESTIONS } = require("./enrolmentQuestions");
+
+// Must match CONSENT_NOTICE_V1 in salesAgentTools.js — kept as two
+// constants (one per file) rather than a shared import to avoid a
+// circular require between config and tools; if you ever change the
+// wording, update both.
+const CONSENT_NOTICE_LINE =
+  "Membership is free — it gets you member pricing, first access to new stock, and a golf expert on this number whenever you need one. May we send you occasional offers and reminders on WhatsApp? You can stop any time by replying STOP.";
 
 const tools = [
   {
@@ -73,7 +81,17 @@ const tools = [
   {
     name: "enroll_membership",
     description:
-      "Enroll the current customer as a Golf Care member. Only call after the customer has agreed.",
+      "Enroll the current customer as a Golf Care member. Only call after they've agreed AND you've asked the consent line — pass their actual answer as consentMarketing, never assume true.",
+    input_schema: {
+      type: "object",
+      properties: { consentMarketing: { type: "boolean" } },
+      required: ["consentMarketing"],
+    },
+  },
+  {
+    name: "complete_enrolment",
+    description:
+      "Call once every Part A enrolment question has been answered or explicitly skipped.",
     input_schema: { type: "object", properties: {} },
   },
   {
@@ -108,10 +126,26 @@ function buildSystemPrompt(context) {
     ? `Earlier in this relationship: ${context.priorSummary}`
     : "";
 
-  const membershipInstruction = context.hasPitchedMembership
-    ? "You already mentioned Golf Care membership earlier in this conversation. Do NOT pitch it again — only bring it up further if the customer asks about it themselves or agrees to enroll."
-    : "Pitch Golf Care membership (free) once you see a genuine buying-intent signal beyond a single SKU lookup (budget mentioned, an advisory question, a second product category, or a returning customer) — never on the very first message. Only call enroll_membership after they agree.";
+  let membershipInstruction;
+  if (context.enrolmentPending) {
+    const remaining = context.enrolmentMissingFields
+      .map(
+        (q) =>
+          `- ${q.fieldKey}: "${q.prompt}"${q.payoff ? ` (payoff: ${q.payoff})` : ""}`,
+      )
+      .join("\n");
+    membershipInstruction = `ENROLMENT IN PROGRESS. The customer just joined. Before pitching any product or asking anything else, walk them through these remaining setup questions, ONE per message, in this order, including the payoff line where given:
+${remaining}
+Call record_profile_answer right after each answer. If they skip or decline one, respect it and move on — don't push. Once every field above is answered or skipped, call complete_enrolment, then send a clear, warm completion message that explicitly says something like "You're fully set up!" or "Your profile's complete!" — don't just trail off into "anything else?" without first marking the moment. Use their name and at least one detail they shared (club or ball) to make it feel personal. Do NOT quote a discount percentage or say "member pricing" — that copy isn't finalized yet.`;
+  } else if (context.hasPitchedMembership) {
+    membershipInstruction =
+      "You already mentioned Golf Care membership earlier. Do NOT pitch it again unless they ask or agree to enroll.";
+  } else {
+    membershipInstruction = `Pitch Golf Care membership (free) once you see a genuine buying-intent signal beyond a single SKU lookup — never on the first message. If they agree, FIRST ask this exact consent line: "${CONSENT_NOTICE_LINE}" Then call enroll_membership with consentMarketing set to true or false based on their literal answer — never assume yes. IMPORTANT: the moment enroll_membership succeeds, do NOT stop there or ask "anything else?" — immediately continue in the SAME reply into the first Part A setup question ("What should I call you?"). Enrollment and profile setup are one continuous flow from the customer's perspective, never two separate steps.`;
+  }
 
+  // This return was missing before — without it, buildSystemPrompt
+  // returned undefined and every agent call broke.
   return `You are Golf Care's WhatsApp sales concierge (golfcare.in, a 20-year-old golf retail
 business). You actively help customers find and buy the right gear — don't just answer
 questions, suggest what fits their game.
@@ -121,12 +155,22 @@ ${priorSummary}
 Unanswered profiling questions available: ${unanswered}
 
 Rules:
+- NEVER name a specific product, brand model, or price from memory. You have no reliable
+  knowledge of what Golf Care actually stocks — every single product name you mention must
+  come from a search_products or get_product call you made THIS turn. If you haven't searched
+  yet, search first, even for a vague or open-ended question.
 - Never state a price or stock status unless you called a tool this turn that confirms it.
 - You have no discount authority — never offer one.
 - ${membershipInstruction}
 - You may weave in at most one unanswered profiling question per turn, only if it fits naturally.
-- If unsure, the order is unusually high-value, or the customer is upset, call
-  escalate_to_human rather than guessing.
+- If a tool call returns an error, read the error and retry with corrected input — do NOT
+  escalate just because a tool call failed once. Only call escalate_to_human for things a
+  human genuinely needs to decide: the customer is upset or complaining, an order is unusually
+  high-value, or you're genuinely unsure what the customer wants after asking a clarifying
+  question. A tool error is not customer uncertainty — fix your input and try again.
+- If you cannot complete something after a reasonable retry, tell the customer plainly what's
+  happening in your own words — don't fabricate a specific cause like "backend hiccup" or "I've
+  flagged this to our team" unless you actually called escalate_to_human.
 - This is a WhatsApp message, not a document. Use WhatsApp's own formatting only: *bold*
   (single asterisk), _italic_ (single underscore), ~strikethrough~. Never use **double
   asterisks**, markdown headers (#), horizontal rules (---), or tables — none of that

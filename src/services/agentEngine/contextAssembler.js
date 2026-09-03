@@ -10,6 +10,9 @@
 
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
+const { ENROLMENT_QUESTIONS } = require("../salesAgent/enrolmentQuestions");
+
+const ENROLMENT_FIELD_KEYS = ENROLMENT_QUESTIONS.map((q) => q.fieldKey);
 
 async function assembleContext({ conversationId }) {
   const conversation = await prisma.conversation.findUnique({
@@ -38,6 +41,8 @@ async function assembleContext({ conversationId }) {
   const answeredKeys = new Set(); // populated below only if participant is a customer
   let unansweredQuestions = [];
   let hasPitchedMembership = false;
+  let enrolmentPending = false;
+  let enrolmentMissingFields = [];
 
   if (participantType === "CUSTOMER" && conversation.customerId) {
     const [allQuestions, answered] = await Promise.all([
@@ -61,6 +66,26 @@ async function assembleContext({ conversationId }) {
     hasPitchedMembership = recentMessages.some(
       (m) => m.sender === "AI_AGENT" && /membership/i.test(m.body || ""),
     );
+
+    // Part A enrolment gate — separate from Part C progressive profiling
+    // above. IN_PROGRESS means they've said yes to joining but haven't
+    // finished the fixed 7-question sequence yet.
+    enrolmentPending = conversation.Customer?.onboardingState === "IN_PROGRESS";
+    if (enrolmentPending) {
+      const enrolmentAnswered = await prisma.onboardingResponse.findMany({
+        where: {
+          customerId: conversation.customerId,
+          fieldKey: { in: ENROLMENT_FIELD_KEYS },
+        },
+        select: { fieldKey: true },
+      });
+      const enrolmentAnsweredSet = new Set(
+        enrolmentAnswered.map((a) => a.fieldKey),
+      );
+      enrolmentMissingFields = ENROLMENT_QUESTIONS.filter(
+        (q) => !enrolmentAnsweredSet.has(q.fieldKey),
+      );
+    }
   }
 
   return {
@@ -71,6 +96,8 @@ async function assembleContext({ conversationId }) {
     supplier: conversation.Supplier || null,
     unansweredQuestions,
     hasPitchedMembership,
+    enrolmentPending,
+    enrolmentMissingFields,
     recentMessages,
     priorSummary: conversation.summary || null,
   };

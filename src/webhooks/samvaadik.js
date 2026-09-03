@@ -18,6 +18,14 @@ const router = Router();
 router.use(express.json());
 
 async function handleInboundMessage(evt) {
+  console.log(`[samvaadik webhook] inbound message from ${evt.from}:`, evt);
+  const TESTING_ALLOWED_PHONE = "916382592767";
+  if (evt.from !== TESTING_ALLOWED_PHONE) {
+    console.log(
+      `[samvaadik webhook] ignoring message from ${evt.from} (testing mode, only ${TESTING_ALLOWED_PHONE} allowed)`,
+    );
+    return;
+  }
   // resolveConversation finds/links Customer or Supplier by phone, and
   // creates a bare Customer if neither exists yet (Scenario B — the
   // record needs to exist from message one so search/checkout are never
@@ -77,6 +85,7 @@ async function handleInboundMessage(evt) {
 
   // Awaited deliberately, not fire-and-forget — Vercel can freeze the
   // function right after res.send(), same gotcha Module 1 already hit.
+
   try {
     await runAgent({
       conversationId: conversation.id,

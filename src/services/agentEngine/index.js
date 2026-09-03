@@ -77,6 +77,14 @@ async function runAgent({ conversationId, config, sendFn }) {
       content: m.body || "",
     }));
 
+    // in index.js, right after building `history`, before calling runToolLoop:
+    if (history.length === 0 || history[history.length - 1].role !== "user") {
+      console.log(
+        `[agentEngine] ${conversationId} no new user turn to respond to, skipping.`,
+      );
+      return { skipped: true, reason: "no_new_user_message" };
+    }
+
     const { finalText, toolCallLog, hitIterationCap } = await runToolLoop({
       systemPrompt,
       tools: config.tools,

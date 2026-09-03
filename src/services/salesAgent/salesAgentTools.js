@@ -1,6 +1,19 @@
 // src/services/salesAgent/salesAgentTools.js
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
+const {
+  ENROLMENT_QUESTIONS,
+  classifyBallBudgetTier,
+  mapSkillLevel,
+  mapPlayFrequency,
+  mapGloveHand,
+} = require("./enrolmentQuestions");
+const ENROLMENT_FIELD_KEYS = ENROLMENT_QUESTIONS.map((q) => q.fieldKey);
+
+// Module-level — must be reachable from enroll_membership, not scoped
+// inside search_products.
+const CONSENT_NOTICE_V1 =
+  "Membership is free — it gets you member pricing, first access to new stock, and a golf expert on this number whenever you need one. May we send you occasional offers and reminders on WhatsApp? You can stop any time by replying STOP.";
 
 function buildSalesAgentTools(context) {
   const customerId = context.customer?.id || context.conversation.customerId;
@@ -201,11 +214,15 @@ function buildSalesAgentTools(context) {
       return { escalated: true };
     },
 
-    async enroll_membership() {
+    // enroll_membership — consent-aware, per §0/§7 (DPDP, non-negotiable).
+    // Only ONE definition of this tool now — the old no-consent version
+    // that was duplicated in here has been removed.
+    async enroll_membership({ consentMarketing }) {
       if (!customerId) return { error: "no_customer_on_conversation" };
+      if (typeof consentMarketing !== "boolean") {
+        return { error: "consentMarketing_required_boolean" };
+      }
       const memberCode = `GC${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-      const consentText =
-        "By enrolling, you agree Golf Care can contact you about your membership and orders on WhatsApp, per our privacy policy.";
 
       const updated = await prisma.customer.update({
         where: { id: customerId },
@@ -213,14 +230,19 @@ function buildSalesAgentTools(context) {
           isMember: true,
           memberSince: new Date(),
           memberCode,
-          consentMarketing: true,
+          consentMarketing,
           consentAt: new Date(),
-          consentTextShown: consentText,
+          consentTextShown: CONSENT_NOTICE_V1, // matches actual schema field name
+          consentVersion: "v1",
           onboardingState: "IN_PROGRESS",
           onboardingStartedAt: new Date(),
         },
       });
-      return { enrolled: true, memberCode: updated.memberCode };
+      return {
+        enrolled: true,
+        memberCode: updated.memberCode,
+        consentMarketing,
+      };
     },
 
     async record_profile_answer({ fieldKey, answer }) {
@@ -237,21 +259,91 @@ function buildSalesAgentTools(context) {
         },
       });
 
-      // Only a few fields map onto typed GolferProfile columns today;
-      // extend this map as more onboarding questions go live.
       const golferProfileUpdate = {};
-      if (fieldKey === "handicap")
-        golferProfileUpdate.handicap = parseInt(answer, 10) || null;
-      if (fieldKey === "skillLevel") golferProfileUpdate.skillLevel = answer;
+
+      if (fieldKey === "firstName") {
+        await prisma.customer.update({
+          where: { id: customerId },
+          data: { firstName: answer },
+        });
+      }
+
       if (fieldKey === "homeClub") golferProfileUpdate.homeClub = answer;
 
-      await prisma.golferProfile.upsert({
-        where: { customerId },
-        create: { customerId, profileScore: 1, ...golferProfileUpdate },
-        update: { profileScore: { increment: 1 }, ...golferProfileUpdate },
-      });
+      if (fieldKey === "handicap") {
+        golferProfileUpdate.handicap = parseInt(answer, 10) || null;
+      }
+
+      // Enum fields — must go through mappers, raw text will throw a
+      // Prisma invalid-enum-value error.
+      if (fieldKey === "skillLevel") {
+        const mapped = mapSkillLevel(answer);
+        if (mapped) golferProfileUpdate.skillLevel = mapped;
+        else golferProfileUpdate.handicap = parseInt(answer, 10) || null; // they gave an exact number instead of a band
+      }
+      if (fieldKey === "playFrequency") {
+        const mapped = mapPlayFrequency(answer);
+        if (mapped) golferProfileUpdate.playFrequency = mapped;
+      }
+      if (fieldKey === "gloveHand") {
+        const mapped = mapGloveHand(answer);
+        if (mapped) golferProfileUpdate.gloveHand = mapped;
+      }
+
+      // Free-text fields — fine as raw strings.
+      if (fieldKey === "gloveSize") golferProfileUpdate.gloveSize = answer;
+
+      if (fieldKey === "currentBallModel") {
+        golferProfileUpdate.currentBallModel = answer;
+        const tier = classifyBallBudgetTier(answer);
+        if (tier) {
+          golferProfileUpdate.budgetTier = tier;
+          golferProfileUpdate.budgetTierSource = "DECLARED";
+        }
+      }
+
+      if (Object.keys(golferProfileUpdate).length) {
+        await prisma.golferProfile.upsert({
+          where: { customerId },
+          create: { customerId, profileScore: 1, ...golferProfileUpdate },
+          update: { profileScore: { increment: 1 }, ...golferProfileUpdate },
+        });
+      }
+      if (ENROLMENT_FIELD_KEYS.includes(fieldKey)) {
+        const answered = await prisma.onboardingResponse.findMany({
+          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
+          select: { fieldKey: true },
+        });
+        const answeredSet = new Set(answered.map((a) => a.fieldKey));
+        const allDone = ENROLMENT_FIELD_KEYS.every((k) => answeredSet.has(k));
+        if (allDone) {
+          await prisma.customer.update({
+            where: { id: customerId },
+            data: {
+              onboardingState: "COMPLETED",
+              onboardingCompletedAt: new Date(),
+            },
+          });
+          return { recorded: true, enrolmentCompleted: true };
+        }
+      }
 
       return { recorded: true };
+    },
+
+    // Fires once every Part A enrolment field has been answered/skipped.
+    // Uses the real enum value (COMPLETED) and real Customer fields —
+    // no enrolmentCompletedAt on GolferProfile, that was scoped out.
+    async complete_enrolment() {
+      if (!customerId) return { error: "no_customer_on_conversation" };
+      await prisma.customer.update({
+        where: { id: customerId },
+        data: {
+          onboardingState: "COMPLETED",
+          onboardingCompletedAt: new Date(),
+        },
+      });
+      return { completed: true };
     },
   };
 }

@@ -148,6 +148,7 @@ model Customer {
   GolferProfile         GolferProfile?
   OnboardingResponse    OnboardingResponse[]
   Order                 Order[]
+  consentVersion        String?
 
   @@index([waPhone], map: "idx_customer_wa_phone")
 }
@@ -231,6 +232,7 @@ model GolferProfile {
   currentDriver    String?
   currentIronSet   String?
   currentBallBrand String?
+  budgetTierSource TierSource?
   bagType          String?
   preferredBrands  String[]    @default([])
   budgetTier       BudgetTier?
@@ -619,4 +621,8 @@ enum TriggerStatus {
   TEMPLATE_CREATED
   SUPPRESSED
   SENT
+}
+enum TierSource {
+  DECLARED
+  REVEALED
 }

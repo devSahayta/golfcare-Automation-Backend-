@@ -16,8 +16,49 @@ const DISCOUNT_RE = /(\d+)\s?%\s?(off|discount)/i;
 const MEMBERSHIP_CLAIM_RE =
   /you'?re (now )?a member|membership (is )?active|enrolled you/i;
 
+// Heuristic for "this response is recommending/describing specific products":
+// *bold*-style segments (WhatsApp formatting for product names) with no
+// product lookup this turn OR earlier in the visible conversation history.
+// Checking history (not just this turn) matters — a recap/pitch turn that
+// references a product verified two turns ago shouldn't be treated as a
+// fresh hallucination.
+const BOLD_SEGMENT_RE = /\*[^*\n]+\*/g;
+const PRODUCT_LOOKUP_TOOLS = [
+  "search_products",
+  "get_product",
+  "create_checkout_link",
+];
+
 function calledTool(toolCallLog, name) {
   return toolCallLog.some((c) => c.tool === name && !c.output?.error);
+}
+
+function calledToolInHistory(recentMessages, names) {
+  return (recentMessages || []).some(
+    (m) =>
+      Array.isArray(m.toolCalls) &&
+      m.toolCalls.some((c) => names.includes(c.tool) && !c.output?.error),
+  );
+}
+
+function calledAnyProductLookup(toolCallLog, recentMessages) {
+  return (
+    PRODUCT_LOOKUP_TOOLS.some((name) => calledTool(toolCallLog, name)) ||
+    calledToolInHistory(recentMessages, PRODUCT_LOOKUP_TOOLS)
+  );
+}
+
+// Catches the model recommending plausible-sounding but unverified product
+// names — two or more bold segments with no product lookup anywhere in
+// scope (this turn or recent history).
+function looksLikeUnverifiedProductList(
+  draftText,
+  toolCallLog,
+  recentMessages,
+) {
+  if (calledAnyProductLookup(toolCallLog, recentMessages)) return false;
+  const boldSegments = draftText.match(BOLD_SEGMENT_RE) || [];
+  return boldSegments.length >= 2;
 }
 
 function lastCheckoutTotal(toolCallLog) {
@@ -41,10 +82,27 @@ function runGuardrails({ draftText, toolCallLog, context }) {
   }
 
   if (
+    looksLikeUnverifiedProductList(
+      draftText,
+      toolCallLog,
+      context.recentMessages,
+    )
+  ) {
+    return { action: "block", reason: "unverified_product_names" };
+  }
+
+  // Stock/price claims only count as product claims when a specific
+  // product is actually named (bolded) alongside them — "we'll keep your
+  // usual in stock for you" is a generic service line, not a claim about
+  // any particular item's current availability, and shouldn't need a
+  // tool call to back it up.
+  const hasBoldProductRef =
+    (draftText.match(BOLD_SEGMENT_RE) || []).length >= 1;
+  if (
     (STOCK_CLAIM_RE.test(draftText) || PRICE_CLAIM_RE.test(draftText)) &&
+    hasBoldProductRef &&
     !calledTool(toolCallLog, "check_availability") &&
-    !calledTool(toolCallLog, "get_product") &&
-    !calledTool(toolCallLog, "search_products")
+    !calledAnyProductLookup(toolCallLog, context.recentMessages)
   ) {
     return { action: "block", reason: "unverified_stock_or_price_claim" };
   }
