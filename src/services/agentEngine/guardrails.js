@@ -49,8 +49,13 @@ function calledAnyProductLookup(toolCallLog, recentMessages) {
 }
 
 // Catches the model recommending plausible-sounding but unverified product
-// names — two or more bold segments with no product lookup anywhere in
-// scope (this turn or recent history).
+// names — two or more bold segments AND at least one price figure, with no
+// product lookup anywhere in scope (this turn or recent history). Requiring
+// a price alongside the bold text matters: a normal clarifying question
+// ("carry bag, cart bag, or tour bag?") legitimately uses bold category
+// words with zero prices and zero risk — it isn't asserting anything a
+// search would need to verify, so it shouldn't be treated the same as an
+// invented product+price list.
 function looksLikeUnverifiedProductList(
   draftText,
   toolCallLog,
@@ -58,7 +63,8 @@ function looksLikeUnverifiedProductList(
 ) {
   if (calledAnyProductLookup(toolCallLog, recentMessages)) return false;
   const boldSegments = draftText.match(BOLD_SEGMENT_RE) || [];
-  return boldSegments.length >= 2;
+  const hasPriceMarker = PRICE_CLAIM_RE.test(draftText);
+  return boldSegments.length >= 2 && hasPriceMarker;
 }
 
 // Hard backstop for the member-code-reveal ordering, independent of
