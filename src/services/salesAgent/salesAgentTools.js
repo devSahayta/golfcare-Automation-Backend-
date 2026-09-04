@@ -110,6 +110,7 @@ function buildSalesAgentTools(context) {
           priceMin: p.priceMin,
           priceMax: p.priceMax,
           imageUrl: p.imageUrls?.[0] || null,
+          productUrl: `https://${env.shopify.shopDomain}/products/${p.handle}`,
           variants: p.Variant.map((v) => ({
             variantId: v.id,
             title: v.title,
@@ -126,7 +127,13 @@ function buildSalesAgentTools(context) {
           include: { Product: true },
         });
         if (!variant) return { error: "variant_not_found" };
-        return { variant, product: variant.Product };
+        return {
+          variant,
+          product: {
+            ...variant.Product,
+            productUrl: `https://${env.shopify.shopDomain}/products/${variant.Product.handle}`,
+          },
+        };
       }
       if (productId) {
         const product = await prisma.product.findUnique({
@@ -134,7 +141,12 @@ function buildSalesAgentTools(context) {
           include: { Variant: true },
         });
         if (!product) return { error: "product_not_found" };
-        return { product };
+        return {
+          product: {
+            ...product,
+            productUrl: `https://${env.shopify.shopDomain}/products/${product.handle}`,
+          },
+        };
       }
       return { error: "productId_or_variantId_required" };
     },
