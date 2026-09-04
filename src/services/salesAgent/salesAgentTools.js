@@ -2,13 +2,11 @@
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
 const {
-  ENROLMENT_QUESTIONS,
   classifyBallBudgetTier,
   mapSkillLevel,
   mapPlayFrequency,
   mapGloveHand,
 } = require("./enrolmentQuestions");
-const ENROLMENT_FIELD_KEYS = ENROLMENT_QUESTIONS.map((q) => q.fieldKey);
 
 // Module-level — must be reachable from enroll_membership, not scoped
 // inside search_products.
@@ -110,7 +108,6 @@ function buildSalesAgentTools(context) {
           priceMin: p.priceMin,
           priceMax: p.priceMax,
           imageUrl: p.imageUrls?.[0] || null,
-          productUrl: `https://${env.shopify.shopDomain}/products/${p.handle}`,
           variants: p.Variant.map((v) => ({
             variantId: v.id,
             title: v.title,
@@ -127,13 +124,7 @@ function buildSalesAgentTools(context) {
           include: { Product: true },
         });
         if (!variant) return { error: "variant_not_found" };
-        return {
-          variant,
-          product: {
-            ...variant.Product,
-            productUrl: `https://${env.shopify.shopDomain}/products/${variant.Product.handle}`,
-          },
-        };
+        return { variant, product: variant.Product };
       }
       if (productId) {
         const product = await prisma.product.findUnique({
@@ -141,12 +132,7 @@ function buildSalesAgentTools(context) {
           include: { Variant: true },
         });
         if (!product) return { error: "product_not_found" };
-        return {
-          product: {
-            ...product,
-            productUrl: `https://${env.shopify.shopDomain}/products/${product.handle}`,
-          },
-        };
+        return { product };
       }
       return { error: "productId_or_variantId_required" };
     },
@@ -234,6 +220,21 @@ function buildSalesAgentTools(context) {
       if (typeof consentMarketing !== "boolean") {
         return { error: "consentMarketing_required_boolean" };
       }
+
+      // Idempotency guard — the model can and does call this tool more than
+      // once in a conversation (e.g. forgetting it already enrolled the
+      // customer mid-setup). Never regenerate a code or reset onboarding
+      // progress for an existing member — that silently orphans old codes
+      // and confuses the customer about which code is real.
+      if (context.customer?.isMember) {
+        return {
+          enrolled: true,
+          memberCode: context.customer.memberCode,
+          consentMarketing: context.customer.consentMarketing,
+          alreadyEnrolled: true,
+        };
+      }
+
       const memberCode = `GC${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
       const updated = await prisma.customer.update({
@@ -321,25 +322,6 @@ function buildSalesAgentTools(context) {
           update: { profileScore: { increment: 1 }, ...golferProfileUpdate },
         });
       }
-      if (ENROLMENT_FIELD_KEYS.includes(fieldKey)) {
-        const answered = await prisma.onboardingResponse.findMany({
-          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
-          select: { fieldKey: true },
-        });
-        const answeredSet = new Set(answered.map((a) => a.fieldKey));
-        const allDone = ENROLMENT_FIELD_KEYS.every((k) => answeredSet.has(k));
-        if (allDone) {
-          await prisma.customer.update({
-            where: { id: customerId },
-            data: {
-              onboardingState: "COMPLETED",
-              onboardingCompletedAt: new Date(),
-            },
-          });
-          return { recorded: true, enrolmentCompleted: true };
-        }
-      }
-
       return { recorded: true };
     },
 
