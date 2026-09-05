@@ -11,6 +11,21 @@
 const { env } = require("../../config/env");
 
 const STOCK_CLAIM_RE = /\b(in stock|out of stock|available|sold out)\b/i;
+
+// Catches hallucinated/reconstructed URLs — the model has seen "golfcare.in"
+// in its own persona description and can invent plausible-looking links
+// using that domain instead of copying the real productUrl from tool
+// output. Any http(s) link in the reply must point to the actual live
+// domain; anything else is treated the same as an unverified price claim.
+const URL_RE = /https?:\/\/([^\/\s]+)/gi;
+function hasHallucinatedDomain(draftText) {
+  const allowedDomain =
+    process.env.SHOPIFY_SHOP_DOMAIN || "y3tzk0-4d.myshopify.com";
+  const matches = [...draftText.matchAll(URL_RE)];
+  return matches.some(
+    (m) => m[1].toLowerCase() !== allowedDomain.toLowerCase(),
+  );
+}
 const PRICE_CLAIM_RE = /₹\s?[\d,]+/;
 const DISCOUNT_RE = /(\d+)\s?%\s?(off|discount)/i;
 const MEMBERSHIP_CLAIM_RE =
@@ -105,6 +120,10 @@ function runGuardrails({ draftText, toolCallLog, context }) {
   const sessionExpiresAt = context.conversation.sessionExpiresAt;
   if (sessionExpiresAt && new Date(sessionExpiresAt) < new Date()) {
     return { action: "block", reason: "session_window_expired" };
+  }
+
+  if (hasHallucinatedDomain(draftText)) {
+    return { action: "block", reason: "hallucinated_url_domain" };
   }
 
   if (

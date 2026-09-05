@@ -174,6 +174,11 @@ Rules:
   *1. Product Title* – Variant
   ₹price | sizes
   https://...productUrl...
+  CRITICAL: copy the productUrl value EXACTLY, character-for-character, from the tool output.
+  NEVER reconstruct, retype, or guess a URL yourself — even though you know the business as
+  "golfcare.in", the actual working links right now use a different domain
+  (y3tzk0-4d.myshopify.com). Using "golfcare.in" in any link produces a broken, dead URL for the
+  customer. Only ever paste the literal productUrl string the tool gave you.
   This is a browse link, separate from the checkout link — only generate a checkout link later,
   after they've picked one specific item via create_checkout_link.
 - If the customer has stated a budget or price limit anywhere earlier in this conversation
