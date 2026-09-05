@@ -7,7 +7,10 @@ const {
   mapPlayFrequency,
   mapGloveHand,
   mapMarketingConsent,
+  ENROLMENT_QUESTIONS,
 } = require("./enrolmentQuestions");
+
+const ENROLMENT_FIELD_KEYS = ENROLMENT_QUESTIONS.map((q) => q.fieldKey);
 
 // Module-level — must be reachable from enroll_membership, not scoped
 // inside search_products.
@@ -337,6 +340,34 @@ function buildSalesAgentTools(context) {
           update: { profileScore: { increment: 1 }, ...golferProfileUpdate },
         });
       }
+
+      // Deterministic completion — do NOT rely on the model remembering to
+      // call complete_enrolment separately. The moment every Part A field
+      // (including marketingConsent, the last one) has actually been
+      // recorded, flip onboardingState here and signal it in the return
+      // value. This return value is exactly what guardrails.js checks
+      // before allowing the member code to be revealed — without this,
+      // that guardrail blocks the completion message forever, since its
+      // conditions can never become true any other way.
+      if (ENROLMENT_FIELD_KEYS.includes(fieldKey)) {
+        const answered = await prisma.onboardingResponse.findMany({
+          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
+          select: { fieldKey: true },
+        });
+        const answeredSet = new Set(answered.map((a) => a.fieldKey));
+        const allDone = ENROLMENT_FIELD_KEYS.every((k) => answeredSet.has(k));
+        if (allDone) {
+          await prisma.customer.update({
+            where: { id: customerId },
+            data: {
+              onboardingState: "COMPLETED",
+              onboardingCompletedAt: new Date(),
+            },
+          });
+          return { recorded: true, enrolmentCompleted: true };
+        }
+      }
+
       return { recorded: true };
     },
 

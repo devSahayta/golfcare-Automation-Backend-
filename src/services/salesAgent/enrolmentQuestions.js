@@ -113,7 +113,9 @@ function mapMarketingConsent(answer) {
   const text = (answer || "").toLowerCase();
   if (/\b(no|nah|nope|don'?t|stop|not really)\b/.test(text)) return false;
   if (
-    /\b(yes|yeah|yep|sure|ok(ay)?|fine|sounds good|go ahead|works)\b/.test(text)
+    /\b(yes|yea|yeah|yep|sure|ok(ay)?|fine|sounds good|go ahead|works)\b/.test(
+      text,
+    )
   )
     return true;
   return null; // ambiguous — caller treats as false, the safe default

@@ -48,6 +48,33 @@ async function releaseLock(conversationId) {
     .catch(() => {}); // best-effort — don't let lock release itself throw past a finally
 }
 
+// Every path that ends the conversation in AWAITING_HUMAN goes through
+// this one place, so the customer is NEVER left in total silence — a
+// real, recurring UX problem where guardrail blocks or iteration caps
+// would flip state with zero message sent, leaving a long, otherwise-good
+// conversation dead-ending with no explanation at all.
+async function escalateWithMessage({
+  conversationId,
+  conversation,
+  sendFn,
+  action,
+  before,
+  after,
+  customerMessage,
+}) {
+  await prisma.conversation.update({
+    where: { id: conversationId },
+    data: { state: "AWAITING_HUMAN" },
+  });
+  await logAudit({ action, conversationId, before, after });
+  await sendFn({
+    conversation,
+    text:
+      customerMessage ||
+      "One sec — let me get someone from our team to jump in here and make sure you're looked after properly. They'll be with you shortly! 🙌",
+  }).catch(() => {});
+}
+
 /**
  * @param {object} input
  * @param {string} input.conversationId
@@ -77,7 +104,6 @@ async function runAgent({ conversationId, config, sendFn }) {
       content: m.body || "",
     }));
 
-    // in index.js, right after building `history`, before calling runToolLoop:
     if (history.length === 0 || history[history.length - 1].role !== "user") {
       console.log(
         `[agentEngine] ${conversationId} no new user turn to respond to, skipping.`,
@@ -85,43 +111,87 @@ async function runAgent({ conversationId, config, sendFn }) {
       return { skipped: true, reason: "no_new_user_message" };
     }
 
-    const { finalText, toolCallLog, hitIterationCap } = await runToolLoop({
-      systemPrompt,
-      tools: config.tools,
-      toolHandlers: config.buildToolHandlers(context),
-      history,
-      maxIterations: env.agentMaxToolIterations,
-    });
+    const toolHandlers = config.buildToolHandlers(context);
+
+    async function attempt(extraSystemNote) {
+      const promptForThisAttempt = extraSystemNote
+        ? `${systemPrompt}\n\n${extraSystemNote}`
+        : systemPrompt;
+      return runToolLoop({
+        systemPrompt: promptForThisAttempt,
+        tools: config.tools,
+        toolHandlers,
+        history,
+        maxIterations: env.agentMaxToolIterations,
+      });
+    }
+
+    let { finalText, toolCallLog, hitIterationCap } = await attempt();
 
     if (hitIterationCap) {
-      await prisma.conversation.update({
-        where: { id: conversationId },
-        data: { state: "AWAITING_HUMAN" },
-      });
-      await logAudit({
-        action: "agent_escalated_iteration_cap",
+      await escalateWithMessage({
         conversationId,
+        conversation: context.conversation,
+        sendFn,
+        action: "agent_escalated_iteration_cap",
         after: { toolCallLog },
       });
       return { escalated: true, reason: "iteration_cap" };
     }
 
-    const guardrailResult = runGuardrails({
+    let guardrailResult = runGuardrails({
       draftText: finalText,
       toolCallLog,
       context,
     });
 
+    // Self-heal: give the model ONE honest retry, telling it exactly why
+    // its draft was rejected, before ever escalating. Most guardrail
+    // blocks today have been false positives in specific phrasing (a
+    // generic "in stock" phrase, a clarifying question with bold text,
+    // revealing something a beat too early) — not genuine mistakes. A
+    // model told the precise reason can usually just rephrase and pass.
+    // This recovers automatically from that whole class of issue instead
+    // of needing a new hand-written rule every time a new phrasing trips
+    // the same underlying concern.
     if (guardrailResult.action === "block") {
-      await prisma.conversation.update({
-        where: { id: conversationId },
-        data: { state: "AWAITING_HUMAN" },
+      console.log(
+        `[agentEngine] ${conversationId} guardrail blocked (${guardrailResult.reason}), retrying once.`,
+      );
+      const retryNote = `IMPORTANT: your previous draft reply was rejected by an internal check for this reason: "${guardrailResult.reason}". Do not repeat that exact issue — revise your response to avoid it while still genuinely answering the customer's last message. If it was about naming a product or price without a fresh lookup, call the right tool first. If it was about revealing something prematurely, hold off on that specific detail this turn.`;
+      const retry = await attempt(retryNote);
+      finalText = retry.finalText;
+      toolCallLog = retry.toolCallLog;
+
+      if (retry.hitIterationCap) {
+        await escalateWithMessage({
+          conversationId,
+          conversation: context.conversation,
+          sendFn,
+          action: "agent_escalated_iteration_cap",
+          after: { toolCallLog, afterGuardrailRetry: true },
+        });
+        return { escalated: true, reason: "iteration_cap_after_retry" };
+      }
+
+      guardrailResult = runGuardrails({
+        draftText: finalText,
+        toolCallLog,
+        context,
       });
-      await logAudit({
-        action: "agent_response_blocked",
+    }
+
+    if (guardrailResult.action === "block") {
+      // Still blocked after one genuine retry — this is a real escalation
+      // now, not a phrasing hiccup. Customer still gets a warm message,
+      // never silence.
+      await escalateWithMessage({
         conversationId,
+        conversation: context.conversation,
+        sendFn,
+        action: "agent_response_blocked",
         before: { draftText: finalText },
-        after: { reason: guardrailResult.reason, toolCallLog },
+        after: { reason: guardrailResult.reason, toolCallLog, retried: true },
       });
       return { escalated: true, reason: guardrailResult.reason };
     }
