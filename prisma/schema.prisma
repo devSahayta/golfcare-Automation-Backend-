@@ -232,6 +232,7 @@ model GolferProfile {
   currentDriver    String?
   currentIronSet   String?
   currentBallBrand String?
+  currentBallModel String?
   budgetTierSource TierSource?
   bagType          String?
   preferredBrands  String[]    @default([])
