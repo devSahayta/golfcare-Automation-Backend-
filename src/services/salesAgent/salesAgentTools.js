@@ -6,6 +6,7 @@ const {
   mapSkillLevel,
   mapPlayFrequency,
   mapGloveHand,
+  mapMarketingConsent,
 } = require("./enrolmentQuestions");
 
 // Module-level — must be reachable from enroll_membership, not scoped
@@ -212,14 +213,18 @@ function buildSalesAgentTools(context) {
       return { escalated: true };
     },
 
-    // enroll_membership — consent-aware, per §0/§7 (DPDP, non-negotiable).
-    // Only ONE definition of this tool now — the old no-consent version
-    // that was duplicated in here has been removed.
-    async enroll_membership({ consentMarketing }) {
+    // enroll_membership — no longer asks for marketing consent upfront.
+    // Consent is now the LAST Part A question (marketingConsent), asked
+    // once trust is already built through the setup conversation, not
+    // cold before the customer knows anything about you. This also fixes
+    // the old double-name-ask bug: this tool used to be preceded by an
+    // ad-hoc name+consent mini-flow outside the deterministic question
+    // list, which had no fixed field key for the model to use when
+    // recording the name — hence it sometimes guessed wrong keys. Now
+    // there's exactly one path: agree to join -> enroll immediately ->
+    // Part A list handles everything, including consent, in order.
+    async enroll_membership() {
       if (!customerId) return { error: "no_customer_on_conversation" };
-      if (typeof consentMarketing !== "boolean") {
-        return { error: "consentMarketing_required_boolean" };
-      }
 
       // Idempotency guard — the model can and does call this tool more than
       // once in a conversation (e.g. forgetting it already enrolled the
@@ -230,7 +235,6 @@ function buildSalesAgentTools(context) {
         return {
           enrolled: true,
           memberCode: context.customer.memberCode,
-          consentMarketing: context.customer.consentMarketing,
           alreadyEnrolled: true,
         };
       }
@@ -243,9 +247,8 @@ function buildSalesAgentTools(context) {
           isMember: true,
           memberSince: new Date(),
           memberCode,
-          consentMarketing,
-          consentAt: new Date(),
-          consentTextShown: CONSENT_NOTICE_V1, // matches actual schema field name
+          consentMarketing: false, // not asked yet — set properly when marketingConsent is answered at the end
+          consentTextShown: CONSENT_NOTICE_V1,
           consentVersion: "v1",
           onboardingState: "IN_PROGRESS",
           onboardingStartedAt: new Date(),
@@ -254,7 +257,6 @@ function buildSalesAgentTools(context) {
       return {
         enrolled: true,
         memberCode: updated.memberCode,
-        consentMarketing,
       };
     },
 
@@ -313,6 +315,19 @@ function buildSalesAgentTools(context) {
           golferProfileUpdate.budgetTier = tier;
           golferProfileUpdate.budgetTierSource = "DECLARED";
         }
+      }
+
+      // marketingConsent — the final Part A question. This is the actual
+      // DPDP consent gate; it just lives at the end of setup now instead
+      // of before the customer knows anything about the business. Updates
+      // Customer directly (not GolferProfile) and records consentAt here,
+      // the real moment consent was captured.
+      if (fieldKey === "marketingConsent") {
+        const consented = mapMarketingConsent(answer) === true; // ambiguous answers default to false, never assume yes
+        await prisma.customer.update({
+          where: { id: customerId },
+          data: { consentMarketing: consented, consentAt: new Date() },
+        });
       }
 
       if (Object.keys(golferProfileUpdate).length) {

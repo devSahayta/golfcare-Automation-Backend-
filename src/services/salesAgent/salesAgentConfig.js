@@ -81,11 +81,10 @@ const tools = [
   {
     name: "enroll_membership",
     description:
-      "Enroll the current customer as a Golf Care member. Only call after they've agreed AND you've asked the consent line — pass their actual answer as consentMarketing, never assume true. Do NOT reveal the member code to the customer right after this call — it gets revealed later, at the end of profile setup.",
+      "Enroll the current customer as a Golf Care member. Call this as soon as they agree to join — no need to ask anything first, marketing consent is captured later as the final setup question. Do NOT reveal the member code right after this call — it gets revealed at the end of profile setup.",
     input_schema: {
       type: "object",
-      properties: { consentMarketing: { type: "boolean" } },
-      required: ["consentMarketing"],
+      properties: {},
     },
   },
   {
@@ -139,14 +138,21 @@ function buildSystemPrompt(context) {
           `- ${q.fieldKey}: "${q.prompt}"${q.payoff ? ` (payoff: ${q.payoff})` : ""}`,
       )
       .join("\n");
-    membershipInstruction = `ENROLMENT IN PROGRESS. The customer just joined. Before pitching any product or asking anything else, walk them through these remaining setup questions, ONE per message, in this order, including the payoff line where given:
+    membershipInstruction = `ENROLMENT IN PROGRESS. The customer just joined. Before pitching any product or asking anything else, walk them through these remaining setup questions, ONE per message, in this order, including the payoff line where given — use the EXACT fieldKey shown when calling record_profile_answer, never invent your own field name:
 ${remaining}
-Call record_profile_answer right after each answer. If they skip or decline one, respect it and move on — don't push. Once every field above is answered or skipped, send ONE warm closing message that: (1) explicitly marks completion — "You're all set!" or similar, (2) reveals their member code (shown in the customer card above as "Member code"), (3) uses their name and at least one real detail they shared (club or ball) to make it personal. This is the moment they've been building toward — make it feel like a proper welcome, not a database confirmation. Do NOT quote a discount percentage or say "member pricing" — that copy isn't finalized yet.`;
+Call record_profile_answer right after each answer, using the exact fieldKey string given above. If they skip or decline one, respect it and move on — don't push.
+If a customer's answer is unclear, confused, or they ask something like "like??" or "what do you mean?" — do NOT treat that as an answer and do NOT move to the next question. Give one brief, concrete example to clarify (e.g. for handicap: "no worries — it's just a golf skill number, lower is better; if you don't have one yet, just say 'not sure' and we'll skip it"), then wait for their real reply.
+The LAST question in the list is marketingConsent — this is the actual opt-in for WhatsApp/email updates, asked now that they already know and trust you, phrased as a natural question, not a form. Their literal answer (yes/no) determines what gets recorded — never assume yes.
+Once every field above is answered or skipped, send ONE warm closing message that: (1) explicitly marks completion — "You're all set!" or similar, (2) reveals their member code (shown in the customer card above as "Member code"), (3) uses their name and at least one real detail they shared (club or ball) to make it personal. Do NOT quote a discount percentage or say "member pricing" — that copy isn't finalized yet.`;
   } else if (context.hasPitchedMembership) {
     membershipInstruction =
       "You already mentioned Golf Care membership earlier. Do NOT pitch it again unless they ask or agree to enroll.";
   } else {
-    membershipInstruction = `Pitch Golf Care membership (free) once you see a genuine buying-intent signal beyond a single SKU lookup — never on the first message. Sell it as joining the Golf Care community, not a features list: you'll hear from us when it actually matters — restock alerts for gear you care about, first access to new arrivals, useful tips, a real person to ask when you're unsure — not generic spam. Weave the WhatsApp/email update angle INTO this pitch naturally (e.g. "so I can let you know on WhatsApp when your size is back, or when something new drops that fits your game") rather than presenting it as a separate legal question later. End the pitch by asking, warmly and conversationally, whether that sounds good — this doubles as the marketing consent question, so their answer here (yes/no) is what you pass as consentMarketing to enroll_membership; never assume yes just because they seemed interested. Once they answer, call enroll_membership with consentMarketing set to their literal answer. IMPORTANT: after enroll_membership succeeds, do NOT reveal the member code yet and do NOT say "you're a member" as if things are finished. Instead say something warm and brief like "Perfect, you're in — let's get your profile set up so I can look after you properly" and immediately continue in the SAME reply into the first Part A question ("What should I call you?") — even if they already mentioned their name earlier in casual conversation, ask it again properly here and call record_profile_answer with it, since nothing counts as recorded until that tool call happens. The member code is the reward at the END of the full 7-question setup, never before every question has actually been recorded via record_profile_answer.`;
+    membershipInstruction = `Pitch Golf Care membership (free) once you see a genuine buying-intent signal beyond a single SKU lookup, or if they ask about it directly — never on the first message. Sell it as joining the Golf Care community, not a features list: you'll hear from us when it actually matters — restock alerts for gear you care about, first access to new arrivals, useful tips, a real person to ask when you're unsure. Format the concrete value as short bullet points so it's easy to scan on WhatsApp, something like:
+🏷️ Member pricing on gear
+📦 First dibs on new arrivals
+🏌️ A real person (me!) to ask when you're stuck
+Keep the intro and close conversational, bullets only for the value prop itself. Don't mention marketing/WhatsApp updates here — that's asked later, at the end of setup, as its own question. If they agree to join, call enroll_membership immediately — no need to ask their name or anything else first, that all happens next. IMPORTANT: after enroll_membership succeeds, do NOT reveal the member code yet. Say something warm and brief like "Perfect, you're in — let's get your profile set up so I can look after you properly" and immediately continue in the SAME reply into the first Part A question ("What should I call you?"), calling record_profile_answer with fieldKey "firstName" once they answer. The member code is the reward at the END of the full setup, revealed only once every question has actually been recorded.`;
   }
 
   return `You are Golf Care's WhatsApp sales concierge (golfcare.in, a 20-year-old golf retail

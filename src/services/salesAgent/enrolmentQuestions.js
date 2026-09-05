@@ -40,6 +40,12 @@ const ENROLMENT_QUESTIONS = [
     prompt: "What ball are you playing right now?",
     payoff: "we'll keep your usual in stock for you",
   },
+  {
+    fieldKey: "marketingConsent",
+    prompt:
+      "Last thing — I'll drop you the occasional update on WhatsApp when something worth knowing comes up (restocks, new arrivals, offers) — that work for you?",
+    payoff: null,
+  },
 ];
 
 // Map free-text answers to Prisma enums — the model will say
@@ -100,10 +106,24 @@ function classifyBallBudgetTier(answer) {
   return "MID"; // named a real model but not a recognized tour/value ball — safe middle default
 }
 
+// Consent stays a genuine yes/no gate (DPDP opt-in requirement), just asked
+// last instead of upfront, and phrased as a natural question rather than a
+// legal form. Ambiguous answers default to false — never assume consent.
+function mapMarketingConsent(answer) {
+  const text = (answer || "").toLowerCase();
+  if (/\b(no|nah|nope|don'?t|stop|not really)\b/.test(text)) return false;
+  if (
+    /\b(yes|yeah|yep|sure|ok(ay)?|fine|sounds good|go ahead|works)\b/.test(text)
+  )
+    return true;
+  return null; // ambiguous — caller treats as false, the safe default
+}
+
 module.exports = {
   ENROLMENT_QUESTIONS,
   mapSkillLevel,
   mapPlayFrequency,
   mapGloveHand,
   classifyBallBudgetTier,
+  mapMarketingConsent,
 };
