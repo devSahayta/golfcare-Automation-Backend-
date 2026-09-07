@@ -28,8 +28,7 @@ function buildSalesAgentTools(context) {
       // match: split the query into words and match ANY of them against
       // title/vendor/tags, rather than requiring the whole query string
       // as one literal substring (which barely ever matches — variant
-      // details like size/hand aren't in the product title). Category is
-      // a soft filter tried alongside title, not required.
+      // details like size/hand aren't in the product title).
       // Swap this whole function for a prisma.$queryRaw pgvector <->
       // query once an embedding provider is decided; nothing else in the
       // codebase needs to change.
@@ -62,11 +61,23 @@ function buildSalesAgentTools(context) {
         // search term here even though it reads like a real one.
       ]);
 
-      const words = query
+      // category used to be a hard AND filter against productType only —
+      // but productType values are always specific ("Drivers", "Irons",
+      // "Fairway Woods"), never a broad word like "clubs" or "gloves"
+      // (those only exist as tags). A model-guessed category like "clubs"
+      // therefore matched zero rows even when real products existed,
+      // silently telling customers something wasn't stocked when it was.
+      // Folding category into the general keyword list makes it a SOFT
+      // signal like any other search word — it still helps narrow
+      // results via title/vendor/tag matching, but can never by itself
+      // zero out a search that should have real hits.
+      const combinedQuery = category ? `${query} ${category}` : query;
+
+      const words = combinedQuery
         .replace(/[^\w\s]/g, "")
         .split(/\s+/)
         .filter((w) => w.length > 2 && !STOPWORDS.has(w.toLowerCase()))
-        .slice(0, 6);
+        .slice(0, 8);
 
       // Cheap singularization — titles are singular ("... Driver"), but
       // the model often searches plural ("drivers"). Try both forms
@@ -77,33 +88,53 @@ function buildSalesAgentTools(context) {
           : [w],
       );
 
-      const textOr = wordForms.length
-        ? wordForms.flatMap((w) => [
-            { title: { contains: w, mode: "insensitive" } },
-            { vendor: { contains: w, mode: "insensitive" } },
-            { tags: { has: w } },
-          ])
-        : [{ title: { contains: query, mode: "insensitive" } }];
-
-      const conditions = [{ OR: textOr }];
-      if (category) {
-        conditions.push({
-          productType: { contains: category, mode: "insensitive" },
-        });
+      if (!wordForms.length) {
+        return { results: [] };
       }
+
+      const priceConditions = [];
       if (priceMin != null || priceMax != null) {
         const priceCond = {};
         if (priceMin != null) priceCond.gte = priceMin;
         if (priceMax != null) priceCond.lte = priceMax;
-        conditions.push({ priceMin: priceCond });
+        priceConditions.push({ priceMin: priceCond });
       }
-      const where = { status: "active", AND: conditions };
 
-      const products = await prisma.product.findMany({
-        where,
+      // Two-tier search: a query like "Callaway fairway wood" should
+      // prefer products whose TITLE actually says "fairway wood" over
+      // products that only match because the vendor is "Callaway" — a
+      // vendor-only match is true for all ~136 Callaway products in this
+      // catalog, so without this tiering, a brand name alone can swamp
+      // out genuinely relevant title matches with no way to tell them
+      // apart (no relevance ranking on a plain OR query).
+      const titleOr = wordForms.map((w) => ({
+        title: { contains: w, mode: "insensitive" },
+      }));
+      let products = await prisma.product.findMany({
+        where: { status: "active", AND: [{ OR: titleOr }, ...priceConditions] },
         take: Math.min(limit, 10),
         include: { Variant: { take: 3 } },
       });
+
+      // Fall back to the broader vendor/tags-inclusive search only if the
+      // stricter title-first pass found nothing — preserves support for
+      // vague/brand-only browsing ("show me Callaway stuff") without
+      // letting it dominate more specific queries.
+      if (products.length === 0) {
+        const broadOr = wordForms.flatMap((w) => [
+          { title: { contains: w, mode: "insensitive" } },
+          { vendor: { contains: w, mode: "insensitive" } },
+          { tags: { has: w } },
+        ]);
+        products = await prisma.product.findMany({
+          where: {
+            status: "active",
+            AND: [{ OR: broadOr }, ...priceConditions],
+          },
+          take: Math.min(limit, 10),
+          include: { Variant: { take: 3 } },
+        });
+      }
 
       return {
         results: products.map((p) => ({
@@ -112,6 +143,7 @@ function buildSalesAgentTools(context) {
           priceMin: p.priceMin,
           priceMax: p.priceMax,
           imageUrl: p.imageUrls?.[0] || null,
+          productUrl: `https://${env.shopify.shopDomain}/products/${p.handle}`,
           variants: p.Variant.map((v) => ({
             variantId: v.id,
             title: v.title,
