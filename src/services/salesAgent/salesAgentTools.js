@@ -242,6 +242,24 @@ function buildSalesAgentTools(context) {
         };
       }
 
+      // Deterministic guard — the model sometimes short-circuits straight
+      // from a bare invite ("have you thought about joining?") to
+      // enrolling on a single "yes", skipping the actual STEP 2 benefits
+      // explanation entirely. Prompt wording alone hasn't reliably
+      // prevented this, so it's enforced here: don't allow enrollment
+      // until a message containing the real pitch (member pricing bullet)
+      // has actually been sent in this conversation.
+      const pitchSent = (context.recentMessages || []).some(
+        (m) =>
+          m.sender === "AI_AGENT" && /member pricing|🏷️/.test(m.body || ""),
+      );
+      if (!pitchSent) {
+        return {
+          error: "benefits_not_yet_explained",
+          hint: "You haven't actually explained what membership is yet — only sent a bare invite. Explain the benefits (bullet points) and ask a clear 'want to join?' question first, THEN call this tool again once they agree to that.",
+        };
+      }
+
       const memberCode = `GC${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
       const updated = await prisma.customer.update({
