@@ -422,6 +422,8 @@ model SupplierProduct {
   variantId           String?
   supplierSku         String?
   costPrice           Decimal?     @db.Decimal
+  marginPercent       Decimal?     @db.Decimal
+  gstPercent          Decimal?     @db.Decimal
   leadTimeDays        Int?
   isPrimary           Boolean      @default(false)
   lastConfirmedStatus AvailStatus?

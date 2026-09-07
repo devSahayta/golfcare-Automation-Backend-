@@ -5,6 +5,7 @@ const cors = require("cors");
 const healthRouter = require("./routes/health");
 const userRouter = require("./routes/userRoutes");
 const availabilityRouter = require("./routes/availabilityRoutes");
+const productDraftRoutes = require("./routes/productDraftRoutes");
 const samvaadikWebhookRouter = require("./webhooks/samvaadik");
 const shopifyWebhookRoutes = require("./routes/shopifyWebhookRoutes.js");
 
@@ -16,6 +17,7 @@ app.use(express.json());
 app.use("/health", healthRouter);
 app.use("/api/users", userRouter);
 app.use("/api/availability", availabilityRouter);
+app.use("/api/product-drafts", productDraftRoutes);
 
 app.get("/", (_req, res) => {
   res.json({ service: "Golf Care OS API", status: "running" });
