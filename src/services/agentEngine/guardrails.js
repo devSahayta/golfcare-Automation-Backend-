@@ -11,13 +11,112 @@
 const { env } = require("../../config/env");
 
 const STOCK_CLAIM_RE = /\b(in stock|out of stock|available|sold out)\b/i;
+
+// Catches hallucinated/reconstructed URLs — the model has seen "golfcare.in"
+// in its own persona description and can invent plausible-looking links
+// using that domain instead of copying the real productUrl from tool
+// output. Any http(s) link in the reply must point to the actual live
+// domain; anything else is treated the same as an unverified price claim.
+const URL_RE = /https?:\/\/([^\/\s]+)/gi;
+function hasHallucinatedDomain(draftText) {
+  const allowedDomain =
+    process.env.SHOPIFY_SHOP_DOMAIN || "y3tzk0-4d.myshopify.com";
+  const matches = [...draftText.matchAll(URL_RE)];
+  return matches.some(
+    (m) => m[1].toLowerCase() !== allowedDomain.toLowerCase(),
+  );
+}
 const PRICE_CLAIM_RE = /₹\s?[\d,]+/;
 const DISCOUNT_RE = /(\d+)\s?%\s?(off|discount)/i;
 const MEMBERSHIP_CLAIM_RE =
   /you'?re (now )?a member|membership (is )?active|enrolled you/i;
 
+// Heuristic for "this response is recommending/describing specific products":
+// *bold*-style segments (WhatsApp formatting for product names) with no
+// product lookup this turn OR earlier in the visible conversation history.
+// Checking history (not just this turn) matters — a recap/pitch turn that
+// references a product verified two turns ago shouldn't be treated as a
+// fresh hallucination.
+const BOLD_SEGMENT_RE = /\*[^*\n]+\*/g;
+
+// A member code (GCXXXXXX format) is legitimately bold in completion
+// messages, but it isn't a "product name" — without this exclusion, any
+// message that both reveals the code AND mentions "in stock" generically
+// (e.g. "we'll keep your usual in stock") gets falsely flagged as an
+// unverified product claim purely because *some* bold text exists,
+// regardless of what that bold text actually is.
+const MEMBER_CODE_RE = /^GC[A-Z0-9]{6}$/;
+function countsAsProductBoldSegment(segment) {
+  const inner = segment.slice(1, -1).trim(); // strip the surrounding asterisks
+  return !MEMBER_CODE_RE.test(inner);
+}
+function productBoldSegments(draftText) {
+  return (draftText.match(BOLD_SEGMENT_RE) || []).filter(
+    countsAsProductBoldSegment,
+  );
+}
+const PRODUCT_LOOKUP_TOOLS = [
+  "search_products",
+  "get_product",
+  "create_checkout_link",
+];
+
 function calledTool(toolCallLog, name) {
   return toolCallLog.some((c) => c.tool === name && !c.output?.error);
+}
+
+function calledToolInHistory(recentMessages, names) {
+  return (recentMessages || []).some(
+    (m) =>
+      Array.isArray(m.toolCalls) &&
+      m.toolCalls.some((c) => names.includes(c.tool) && !c.output?.error),
+  );
+}
+
+function calledAnyProductLookup(toolCallLog, recentMessages) {
+  return (
+    PRODUCT_LOOKUP_TOOLS.some((name) => calledTool(toolCallLog, name)) ||
+    calledToolInHistory(recentMessages, PRODUCT_LOOKUP_TOOLS)
+  );
+}
+
+// Catches the model recommending plausible-sounding but unverified product
+// names — two or more bold segments AND at least one price figure, with no
+// product lookup anywhere in scope (this turn or recent history). Requiring
+// a price alongside the bold text matters: a normal clarifying question
+// ("carry bag, cart bag, or tour bag?") legitimately uses bold category
+// words with zero prices and zero risk — it isn't asserting anything a
+// search would need to verify, so it shouldn't be treated the same as an
+// invented product+price list.
+function looksLikeUnverifiedProductList(
+  draftText,
+  toolCallLog,
+  recentMessages,
+) {
+  if (calledAnyProductLookup(toolCallLog, recentMessages)) return false;
+  const boldSegments = productBoldSegments(draftText);
+  const hasPriceMarker = PRICE_CLAIM_RE.test(draftText);
+  return boldSegments.length >= 2 && hasPriceMarker;
+}
+
+// Hard backstop for the member-code-reveal ordering, independent of
+// whether the model follows its prompt instructions correctly. The code
+// can only legitimately appear in a reply if record_profile_answer just
+// returned enrolmentCompleted:true THIS turn (the deterministic
+// all-7-fields check in salesAgentTools.js), or the customer was already
+// a fully onboarded member before this turn even started.
+function revealsMemberCode(draftText, context) {
+  const code = context.customer?.memberCode;
+  if (!code) return false;
+  return draftText.includes(code);
+}
+
+function enrolmentJustCompleted(toolCallLog) {
+  return toolCallLog.some(
+    (c) =>
+      c.tool === "record_profile_answer" &&
+      c.output?.enrolmentCompleted === true,
+  );
 }
 
 function lastCheckoutTotal(toolCallLog) {
@@ -40,13 +139,41 @@ function runGuardrails({ draftText, toolCallLog, context }) {
     return { action: "block", reason: "session_window_expired" };
   }
 
+  if (hasHallucinatedDomain(draftText)) {
+    return { action: "block", reason: "hallucinated_url_domain" };
+  }
+
+  if (
+    looksLikeUnverifiedProductList(
+      draftText,
+      toolCallLog,
+      context.recentMessages,
+    )
+  ) {
+    return { action: "block", reason: "unverified_product_names" };
+  }
+
+  // Stock/price claims only count as product claims when a specific
+  // product is actually named (bolded) alongside them — "we'll keep your
+  // usual in stock for you" is a generic service line, not a claim about
+  // any particular item's current availability, and shouldn't need a
+  // tool call to back it up.
+  const hasBoldProductRef = productBoldSegments(draftText).length >= 1;
   if (
     (STOCK_CLAIM_RE.test(draftText) || PRICE_CLAIM_RE.test(draftText)) &&
+    hasBoldProductRef &&
     !calledTool(toolCallLog, "check_availability") &&
-    !calledTool(toolCallLog, "get_product") &&
-    !calledTool(toolCallLog, "search_products")
+    !calledAnyProductLookup(toolCallLog, context.recentMessages)
   ) {
     return { action: "block", reason: "unverified_stock_or_price_claim" };
+  }
+
+  if (revealsMemberCode(draftText, context)) {
+    const alreadyFullyOnboarded =
+      context.customer?.onboardingState === "COMPLETED";
+    if (!alreadyFullyOnboarded && !enrolmentJustCompleted(toolCallLog)) {
+      return { action: "block", reason: "premature_member_code_reveal" };
+    }
   }
 
   const discountMatch = draftText.match(DISCOUNT_RE);

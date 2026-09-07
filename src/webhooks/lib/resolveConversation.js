@@ -44,7 +44,17 @@ async function resolveConversation(waPhone) {
       data: newConversationData(waPhone, { supplierId: supplier.id }),
     });
 
-  const newCustomer = await prisma.customer.create({ data: { waPhone } });
+  // upsert, not create — two near-simultaneous webhook deliveries for a
+  // brand-new phone number can both pass the findUnique checks above
+  // before either finishes writing, and both then race to create the
+  // same waPhone, crashing on the unique constraint (P2002). upsert is
+  // atomic at the DB level: whichever request gets there first inserts,
+  // the other just fetches the row that now exists instead of erroring.
+  const newCustomer = await prisma.customer.upsert({
+    where: { waPhone },
+    create: { waPhone },
+    update: {},
+  });
   return prisma.conversation.create({
     data: newConversationData(waPhone, { customerId: newCustomer.id }),
   });

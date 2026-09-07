@@ -10,6 +10,9 @@
 
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
+const { ENROLMENT_QUESTIONS } = require("../salesAgent/enrolmentQuestions");
+
+const ENROLMENT_FIELD_KEYS = ENROLMENT_QUESTIONS.map((q) => q.fieldKey);
 
 async function assembleContext({ conversationId }) {
   const conversation = await prisma.conversation.findUnique({
@@ -39,6 +42,8 @@ async function assembleContext({ conversationId }) {
   let unansweredQuestions = [];
   let hasPitchedMembership = false;
   let pendingCheck = null; // populated below only if participant is a supplier
+  let enrolmentPending = false;
+  let enrolmentMissingFields = [];
 
   if (participantType === "CUSTOMER" && conversation.customerId) {
     const [allQuestions, answered] = await Promise.all([
@@ -56,12 +61,40 @@ async function assembleContext({ conversationId }) {
       (q) => !answeredKeys.has(q.fieldKey),
     );
 
-    // Deterministic check, not left to the model to notice on its own —
-    // it already re-pitched once in testing despite the prior pitch
-    // being right there in history.
+    // Deterministic check — but must only fire once the REAL benefits
+    // pitch (with bullets) has been sent, not just a bare "have you
+    // thought about joining?" invite. The old /membership/i regex matched
+    // even the bare invite, which meant a customer ignoring or not
+    // addressing that first mention (e.g. replying about something else
+    // entirely) permanently locked the model out of ever bringing it up
+    // again for the rest of the conversation — the invite went
+    // unanswered, membership was never actually explained, and the
+    // model was told "already pitched, don't re-ask." This marker
+    // matches the same bullet-benefits text used in the enroll_membership
+    // tool guard, so both stay in sync.
     hasPitchedMembership = recentMessages.some(
-      (m) => m.sender === "AI_AGENT" && /membership/i.test(m.body || ""),
+      (m) => m.sender === "AI_AGENT" && /member pricing|🏷️/.test(m.body || ""),
     );
+
+    // Part A enrolment gate — separate from Part C progressive profiling
+    // above. IN_PROGRESS means they've said yes to joining but haven't
+    // finished the fixed 7-question sequence yet.
+    enrolmentPending = conversation.Customer?.onboardingState === "IN_PROGRESS";
+    if (enrolmentPending) {
+      const enrolmentAnswered = await prisma.onboardingResponse.findMany({
+        where: {
+          customerId: conversation.customerId,
+          fieldKey: { in: ENROLMENT_FIELD_KEYS },
+        },
+        select: { fieldKey: true },
+      });
+      const enrolmentAnsweredSet = new Set(
+        enrolmentAnswered.map((a) => a.fieldKey),
+      );
+      enrolmentMissingFields = ENROLMENT_QUESTIONS.filter(
+        (q) => !enrolmentAnsweredSet.has(q.fieldKey),
+      );
+    }
   }
 
   if (participantType === "SUPPLIER" && conversation.supplierId) {
@@ -80,6 +113,8 @@ async function assembleContext({ conversationId }) {
     unansweredQuestions,
     hasPitchedMembership,
     pendingCheck,
+    enrolmentPending,
+    enrolmentMissingFields,
     recentMessages,
     priorSummary: conversation.summary || null,
   };

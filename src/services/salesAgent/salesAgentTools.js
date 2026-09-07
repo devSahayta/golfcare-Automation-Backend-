@@ -1,6 +1,21 @@
 // src/services/salesAgent/salesAgentTools.js
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
+const {
+  classifyBallBudgetTier,
+  mapSkillLevel,
+  mapPlayFrequency,
+  mapGloveHand,
+  mapMarketingConsent,
+  ENROLMENT_QUESTIONS,
+} = require("./enrolmentQuestions");
+
+const ENROLMENT_FIELD_KEYS = ENROLMENT_QUESTIONS.map((q) => q.fieldKey);
+
+// Module-level — must be reachable from enroll_membership, not scoped
+// inside search_products.
+const CONSENT_NOTICE_V1 =
+  "Membership is free — it gets you member pricing, first access to new stock, and a golf expert on this number whenever you need one. May we send you occasional offers and reminders on WhatsApp? You can stop any time by replying STOP.";
 
 function buildSalesAgentTools(context) {
   const customerId = context.customer?.id || context.conversation.customerId;
@@ -201,11 +216,51 @@ function buildSalesAgentTools(context) {
       return { escalated: true };
     },
 
+    // enroll_membership — no longer asks for marketing consent upfront.
+    // Consent is now the LAST Part A question (marketingConsent), asked
+    // once trust is already built through the setup conversation, not
+    // cold before the customer knows anything about you. This also fixes
+    // the old double-name-ask bug: this tool used to be preceded by an
+    // ad-hoc name+consent mini-flow outside the deterministic question
+    // list, which had no fixed field key for the model to use when
+    // recording the name — hence it sometimes guessed wrong keys. Now
+    // there's exactly one path: agree to join -> enroll immediately ->
+    // Part A list handles everything, including consent, in order.
     async enroll_membership() {
       if (!customerId) return { error: "no_customer_on_conversation" };
+
+      // Idempotency guard — the model can and does call this tool more than
+      // once in a conversation (e.g. forgetting it already enrolled the
+      // customer mid-setup). Never regenerate a code or reset onboarding
+      // progress for an existing member — that silently orphans old codes
+      // and confuses the customer about which code is real.
+      if (context.customer?.isMember) {
+        return {
+          enrolled: true,
+          memberCode: context.customer.memberCode,
+          alreadyEnrolled: true,
+        };
+      }
+
+      // Deterministic guard — the model sometimes short-circuits straight
+      // from a bare invite ("have you thought about joining?") to
+      // enrolling on a single "yes", skipping the actual STEP 2 benefits
+      // explanation entirely. Prompt wording alone hasn't reliably
+      // prevented this, so it's enforced here: don't allow enrollment
+      // until a message containing the real pitch (member pricing bullet)
+      // has actually been sent in this conversation.
+      const pitchSent = (context.recentMessages || []).some(
+        (m) =>
+          m.sender === "AI_AGENT" && /member pricing|🏷️/.test(m.body || ""),
+      );
+      if (!pitchSent) {
+        return {
+          error: "benefits_not_yet_explained",
+          hint: "You haven't actually explained what membership is yet — only sent a bare invite. Explain the benefits (bullet points) and ask a clear 'want to join?' question first, THEN call this tool again once they agree to that.",
+        };
+      }
+
       const memberCode = `GC${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
-      const consentText =
-        "By enrolling, you agree Golf Care can contact you about your membership and orders on WhatsApp, per our privacy policy.";
 
       const updated = await prisma.customer.update({
         where: { id: customerId },
@@ -213,14 +268,17 @@ function buildSalesAgentTools(context) {
           isMember: true,
           memberSince: new Date(),
           memberCode,
-          consentMarketing: true,
-          consentAt: new Date(),
-          consentTextShown: consentText,
+          consentMarketing: false, // not asked yet — set properly when marketingConsent is answered at the end
+          consentTextShown: CONSENT_NOTICE_V1,
+          consentVersion: "v1",
           onboardingState: "IN_PROGRESS",
           onboardingStartedAt: new Date(),
         },
       });
-      return { enrolled: true, memberCode: updated.memberCode };
+      return {
+        enrolled: true,
+        memberCode: updated.memberCode,
+      };
     },
 
     async record_profile_answer({ fieldKey, answer }) {
@@ -237,21 +295,113 @@ function buildSalesAgentTools(context) {
         },
       });
 
-      // Only a few fields map onto typed GolferProfile columns today;
-      // extend this map as more onboarding questions go live.
       const golferProfileUpdate = {};
-      if (fieldKey === "handicap")
-        golferProfileUpdate.handicap = parseInt(answer, 10) || null;
-      if (fieldKey === "skillLevel") golferProfileUpdate.skillLevel = answer;
+
+      if (fieldKey === "firstName") {
+        await prisma.customer.update({
+          where: { id: customerId },
+          data: { firstName: answer },
+        });
+      }
+
       if (fieldKey === "homeClub") golferProfileUpdate.homeClub = answer;
 
-      await prisma.golferProfile.upsert({
-        where: { customerId },
-        create: { customerId, profileScore: 1, ...golferProfileUpdate },
-        update: { profileScore: { increment: 1 }, ...golferProfileUpdate },
-      });
+      if (fieldKey === "handicap") {
+        golferProfileUpdate.handicap = parseInt(answer, 10) || null;
+      }
+
+      // Enum fields — must go through mappers, raw text will throw a
+      // Prisma invalid-enum-value error.
+      if (fieldKey === "skillLevel") {
+        const mapped = mapSkillLevel(answer);
+        if (mapped) golferProfileUpdate.skillLevel = mapped;
+        else golferProfileUpdate.handicap = parseInt(answer, 10) || null; // they gave an exact number instead of a band
+      }
+      if (fieldKey === "playFrequency") {
+        const mapped = mapPlayFrequency(answer);
+        if (mapped) golferProfileUpdate.playFrequency = mapped;
+      }
+      if (fieldKey === "gloveHand") {
+        const mapped = mapGloveHand(answer);
+        if (mapped) golferProfileUpdate.gloveHand = mapped;
+      }
+
+      // Free-text fields — fine as raw strings.
+      if (fieldKey === "gloveSize") golferProfileUpdate.gloveSize = answer;
+
+      if (fieldKey === "currentBallModel") {
+        golferProfileUpdate.currentBallModel = answer;
+        const tier = classifyBallBudgetTier(answer);
+        if (tier) {
+          golferProfileUpdate.budgetTier = tier;
+          golferProfileUpdate.budgetTierSource = "DECLARED";
+        }
+      }
+
+      // marketingConsent — the final Part A question. This is the actual
+      // DPDP consent gate; it just lives at the end of setup now instead
+      // of before the customer knows anything about the business. Updates
+      // Customer directly (not GolferProfile) and records consentAt here,
+      // the real moment consent was captured.
+      if (fieldKey === "marketingConsent") {
+        const consented = mapMarketingConsent(answer) === true; // ambiguous answers default to false, never assume yes
+        await prisma.customer.update({
+          where: { id: customerId },
+          data: { consentMarketing: consented, consentAt: new Date() },
+        });
+      }
+
+      if (Object.keys(golferProfileUpdate).length) {
+        await prisma.golferProfile.upsert({
+          where: { customerId },
+          create: { customerId, profileScore: 1, ...golferProfileUpdate },
+          update: { profileScore: { increment: 1 }, ...golferProfileUpdate },
+        });
+      }
+
+      // Deterministic completion — do NOT rely on the model remembering to
+      // call complete_enrolment separately. The moment every Part A field
+      // (including marketingConsent, the last one) has actually been
+      // recorded, flip onboardingState here and signal it in the return
+      // value. This return value is exactly what guardrails.js checks
+      // before allowing the member code to be revealed — without this,
+      // that guardrail blocks the completion message forever, since its
+      // conditions can never become true any other way.
+      if (ENROLMENT_FIELD_KEYS.includes(fieldKey)) {
+        const answered = await prisma.onboardingResponse.findMany({
+          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
+          select: { fieldKey: true },
+        });
+        const answeredSet = new Set(answered.map((a) => a.fieldKey));
+        const allDone = ENROLMENT_FIELD_KEYS.every((k) => answeredSet.has(k));
+        if (allDone) {
+          await prisma.customer.update({
+            where: { id: customerId },
+            data: {
+              onboardingState: "COMPLETED",
+              onboardingCompletedAt: new Date(),
+            },
+          });
+          return { recorded: true, enrolmentCompleted: true };
+        }
+      }
 
       return { recorded: true };
+    },
+
+    // Fires once every Part A enrolment field has been answered/skipped.
+    // Uses the real enum value (COMPLETED) and real Customer fields —
+    // no enrolmentCompletedAt on GolferProfile, that was scoped out.
+    async complete_enrolment() {
+      if (!customerId) return { error: "no_customer_on_conversation" };
+      await prisma.customer.update({
+        where: { id: customerId },
+        data: {
+          onboardingState: "COMPLETED",
+          onboardingCompletedAt: new Date(),
+        },
+      });
+      return { completed: true };
     },
   };
 }
