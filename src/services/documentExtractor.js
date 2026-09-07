@@ -38,10 +38,66 @@
 const ExcelJS = require("exceljs");
 const { env } = require("../config/env");
 
+// pdfjs-dist's own Node-environment setup (not pdf-parse — that's already
+// gone) tries to require("@napi-rs/canvas") at import time, purely to
+// polyfill globalThis.DOMMatrix/Path2D and to build a NodeCanvasFactory
+// used only for page *rendering*. We never render pages here (text-only
+// extraction via getTextContent()), so the canvas package is never
+// actually needed — but on Vercel's Linux runtime the optional native
+// binary isn't installed, and pdfjs-dist logs a scary warning (harmless,
+// but noisy, and the failed require is the same crash class that broke
+// pdf-parse before). Defining minimal stub globals ourselves — the same
+// guard pdfjs-dist itself checks (`if (!globalThis.DOMMatrix)`) — makes
+// pdfjs-dist skip the require entirely, on every platform, without
+// depending on any native binary being present at all. Verified: full
+// text extraction on a real supplier PDF is byte-identical with or
+// without the real @napi-rs/canvas installed once this stub is in place.
+function ensureCanvasStubGlobals() {
+  if (typeof globalThis.DOMMatrix === "undefined") {
+    globalThis.DOMMatrix = class DOMMatrix {};
+  }
+  if (typeof globalThis.Path2D === "undefined") {
+    globalThis.Path2D = class Path2D {};
+  }
+}
+
+// The real production failure (confirmed via live Vercel deploy logs and
+// the Message rows it wrote to the database — "Setting up fake worker
+// failed: Cannot find module '.../pdfjs-dist/legacy/build/pdf.worker.mjs'
+// imported from .../pdf.mjs"): pdfjs-dist locates its own worker script
+// internally via a dynamic, relative-to-itself import that Vercel's build
+// tracer (@vercel/nft, which decides which node_modules files get
+// included in the deployed function bundle) can't follow statically, so
+// pdf.worker.mjs silently isn't included in the deployed bundle even
+// though pdf.mjs is — file present locally, missing in prod, hence this
+// only ever surfaced on Vercel. This is why local testing and even some
+// earlier Vercel deploys succeeded (nft's tracing isn't fully
+// deterministic build to build) while later ones failed with the exact
+// same code. Fix: resolve the worker file ourselves via require.resolve()
+// with a literal string — nft *does* trace plain require.resolve() calls
+// — and hand pdfjs-dist that exact path via GlobalWorkerOptions.workerSrc,
+// so it never has to guess its own location at runtime.
+//
+// pdfjs-dist loads workerSrc via a raw dynamic import(), which requires a
+// proper URL, not a bare OS path — a POSIX absolute path happens to work,
+// but a Windows one doesn't (its drive letter, e.g. "C:\\...", is parsed
+// as a URL scheme and rejected: confirmed locally, "Received protocol
+// 'c:'"). pathToFileURL() produces a valid file:// URL on every platform.
+function getWorkerSrc() {
+  const { pathToFileURL } = require("url");
+  return pathToFileURL(
+    require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs"),
+  ).href;
+}
+
 let pdfjsLibPromise = null;
 function loadPdfjs() {
   if (!pdfjsLibPromise) {
-    pdfjsLibPromise = import("pdfjs-dist/legacy/build/pdf.mjs");
+    ensureCanvasStubGlobals();
+    pdfjsLibPromise = import("pdfjs-dist/legacy/build/pdf.mjs").then((lib) => {
+      lib.GlobalWorkerOptions.workerSrc = getWorkerSrc();
+      return lib;
+    });
   }
   return pdfjsLibPromise;
 }
