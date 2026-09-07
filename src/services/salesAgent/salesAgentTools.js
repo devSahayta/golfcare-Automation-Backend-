@@ -74,7 +74,7 @@ function buildSalesAgentTools(context) {
       const combinedQuery = category ? `${query} ${category}` : query;
 
       const words = combinedQuery
-        .replace(/[^\w\s]/g, "")
+        .replace(/[^\w\s']/g, "")
         .split(/\s+/)
         .filter((w) => w.length > 2 && !STOPWORDS.has(w.toLowerCase()))
         .slice(0, 8);
@@ -91,6 +91,30 @@ function buildSalesAgentTools(context) {
       if (!wordForms.length) {
         return { results: [] };
       }
+
+      // Explicit gender filter — a real AND condition, not just another
+      // OR keyword. Generic words like "shoes" match both genders'
+      // titles equally, so without this, a "men's" query still surfaces
+      // women's results whenever they happen to rank first with no
+      // relevance ordering. Uses startsWith, not contains: "Women's"
+      // literally contains the substring "men's" inside it (wo-MEN'S),
+      // so a naive contains check would wrongly match both genders.
+      const lowerCombined = combinedQuery.toLowerCase();
+      let genderFilter = null;
+      if (
+        /\bmen'?s\b/.test(lowerCombined) &&
+        !/\bwomen'?s\b/.test(lowerCombined)
+      ) {
+        genderFilter = { title: { startsWith: "Men's", mode: "insensitive" } };
+      } else if (
+        /\bwomen'?s\b/.test(lowerCombined) ||
+        /\bladies\b/.test(lowerCombined)
+      ) {
+        genderFilter = {
+          title: { startsWith: "Women's", mode: "insensitive" },
+        };
+      }
+      const genderConditions = genderFilter ? [genderFilter] : [];
 
       const priceConditions = [];
       if (priceMin != null || priceMax != null) {
@@ -110,9 +134,13 @@ function buildSalesAgentTools(context) {
       const titleOr = wordForms.map((w) => ({
         title: { contains: w, mode: "insensitive" },
       }));
+      let usedWhere = {
+        status: "active",
+        AND: [{ OR: titleOr }, ...priceConditions, ...genderConditions],
+      };
       let products = await prisma.product.findMany({
-        where: { status: "active", AND: [{ OR: titleOr }, ...priceConditions] },
-        take: Math.min(limit, 10),
+        where: usedWhere,
+        take: Math.min(limit, 15),
         include: { Variant: { take: 3 } },
       });
 
@@ -126,15 +154,21 @@ function buildSalesAgentTools(context) {
           { vendor: { contains: w, mode: "insensitive" } },
           { tags: { has: w } },
         ]);
+        usedWhere = {
+          status: "active",
+          AND: [{ OR: broadOr }, ...priceConditions, ...genderConditions],
+        };
         products = await prisma.product.findMany({
-          where: {
-            status: "active",
-            AND: [{ OR: broadOr }, ...priceConditions],
-          },
-          take: Math.min(limit, 10),
+          where: usedWhere,
+          take: Math.min(limit, 15),
           include: { Variant: { take: 3 } },
         });
       }
+
+      // Total match count (not just what's shown) — lets the model
+      // honestly offer "want to see more?" instead of guessing whether
+      // more exist, or worse, implying these 5 are all there is.
+      const totalCount = await prisma.product.count({ where: usedWhere });
 
       return {
         results: products.map((p) => ({
@@ -150,6 +184,8 @@ function buildSalesAgentTools(context) {
             price: v.price,
           })),
         })),
+        totalCount,
+        moreAvailable: totalCount > products.length,
       };
     },
 
