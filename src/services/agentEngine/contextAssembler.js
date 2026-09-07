@@ -41,6 +41,7 @@ async function assembleContext({ conversationId }) {
   const answeredKeys = new Set(); // populated below only if participant is a customer
   let unansweredQuestions = [];
   let hasPitchedMembership = false;
+  let pendingCheck = null; // populated below only if participant is a supplier
   let enrolmentPending = false;
   let enrolmentMissingFields = [];
 
@@ -96,6 +97,13 @@ async function assembleContext({ conversationId }) {
     }
   }
 
+  if (participantType === "SUPPLIER" && conversation.supplierId) {
+    pendingCheck = await prisma.supplierCheck.findFirst({
+      where: { supplierId: conversation.supplierId, status: "SENT" },
+      orderBy: { sentAt: "desc" },
+    });
+  }
+
   return {
     conversation,
     participantType,
@@ -104,6 +112,7 @@ async function assembleContext({ conversationId }) {
     supplier: conversation.Supplier || null,
     unansweredQuestions,
     hasPitchedMembership,
+    pendingCheck,
     enrolmentPending,
     enrolmentMissingFields,
     recentMessages,

@@ -144,4 +144,60 @@ async function writeAvailabilityToShopify(
   };
 }
 
-module.exports = { writeAvailabilityToShopify };
+// Shopify has a real, separate field for this — InventoryItem.cost — not
+// just the customer-facing variant price. It's what powers Shopify's own
+// profit/margin reporting in the admin, so pushing our computed cost
+// price here (alongside storing it on SupplierProduct) gives Tejas the
+// same number natively in Shopify, not just in our own database.
+async function updateInventoryItemCost(shopifyVariantId, cost, { attempts = 2, retryDelayMs = 500 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const inventoryItemId = await getInventoryItemId(shopifyVariantId);
+      const client = await shopifyClient();
+      await client.put(`/inventory_items/${inventoryItemId}.json`, {
+        inventory_item: { id: inventoryItemId, cost: String(cost) },
+      });
+      return { ok: true };
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) {
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+      }
+    }
+  }
+  return {
+    ok: false,
+    error: lastError?.response?.data || lastError?.message || String(lastError),
+  };
+}
+
+// Best-effort — same resilience shape as writeAvailabilityToShopify: try,
+// let the caller decide what to log on failure, never throw so a pricing
+// update can't roll back the DB-side commit that already happened. Golf
+// Care is pure dropship — it doesn't set retail prices independently of
+// suppliers, so pushing the supplier's MRP straight to the live Shopify
+// price is the intended behaviour, not a side effect to guard against.
+async function updateVariantPrice(shopifyVariantId, price, { attempts = 2, retryDelayMs = 500 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const client = await shopifyClient();
+      await client.put(`/variants/${shopifyVariantId}.json`, {
+        variant: { id: Number(shopifyVariantId), price: String(price) },
+      });
+      return { ok: true };
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) {
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+      }
+    }
+  }
+  return {
+    ok: false,
+    error: lastError?.response?.data || lastError?.message || String(lastError),
+  };
+}
+
+module.exports = { writeAvailabilityToShopify, updateVariantPrice, updateInventoryItemCost };

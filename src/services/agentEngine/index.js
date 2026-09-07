@@ -19,7 +19,7 @@ const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
 const { assembleContext } = require("./contextAssembler");
 const { runToolLoop } = require("./toolLoop");
-const { runGuardrails } = require("./guardrails");
+const { runGuardrails: runDefaultGuardrails } = require("./guardrails");
 const { logMessage, logAudit } = require("./logger");
 
 async function acquireLock(conversationId) {
@@ -158,7 +158,16 @@ async function runAgent({ conversationId, config, sendFn }) {
       return { escalated: true, reason: "iteration_cap" };
     }
 
-    let guardrailResult = runGuardrails({
+    // Each agent config may register its own guardrail rules (Sales
+    // checks price/discount claims, Supplier's is intentionally lean —
+    // see their respective guardrails.js/supplierGuardrails.js). Configs
+    // that don't provide one fall back to the original Sales-shaped
+    // rules, so this stays backward compatible with configs written
+    // before runGuardrails was pluggable. Used for both the initial check
+    // and the post-retry recheck below, so a config's own rules apply
+    // consistently across both passes.
+    const guardrailFn = config.runGuardrails || runDefaultGuardrails;
+    let guardrailResult = guardrailFn({
       draftText: finalText,
       toolCallLog,
       context,
@@ -193,7 +202,7 @@ async function runAgent({ conversationId, config, sendFn }) {
         return { escalated: true, reason: "iteration_cap_after_retry" };
       }
 
-      guardrailResult = runGuardrails({
+      guardrailResult = guardrailFn({
         draftText: finalText,
         toolCallLog,
         context,

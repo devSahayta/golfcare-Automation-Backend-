@@ -6,7 +6,13 @@ const { prisma } = require("../lib/prisma");
 const { resolveConversation } = require("./lib/resolveConversation");
 const { runAgent } = require("../services/agentEngine");
 const salesAgentConfig = require("../services/salesAgent/salesAgentConfig");
-const { sendText, parseWebhook } = require("../lib/samvaadik/adapter");
+const supplierAgentConfig = require("../services/supplierAgent/supplierAgentConfig");
+const {
+  sendText,
+  parseWebhook,
+  downloadMedia,
+} = require("../lib/samvaadik/adapter");
+const { extractTextFromDocument } = require("../services/documentExtractor");
 
 const router = Router();
 
@@ -39,19 +45,39 @@ async function handleInboundMessage(evt) {
   // we deliberately await the full agent run before responding (see the
   // Vercel-freeze note below), that retry can arrive after the first
   // delivery's lock has already been released, looking like a brand new
-  // message and running the whole agent a second time. Same original
-  // event redelivered keeps the same `timestamp` field; a genuinely new
-  // message from the customer moments later won't. This isn't a perfect
-  // key (no message id is available in Samvaadik's forwarded payload as
-  // documented) but is a solid practical guard against exact-duplicate
-  // redelivery.
+  // message and running the whole agent a second time.
+  //
+  // Originally matched on an EXACT timestamp — turned out wrong, confirmed
+  // against a real duplicate delivery: the same document arrived twice
+  // with the same mediaUrl but timestamps 0.48s apart and different
+  // message_type values ("pdf" then "document"). An exact match never
+  // catches that, so both deliveries got fully processed — this is what
+  // actually caused a cascade of double tool calls in a real conversation
+  // (duplicate reconcile_stock_list/create_product_draft calls). Widened
+  // to a short window instead of an exact match.
+  //
+  // Matched on mediaUrl rather than body for attachments — body ends up
+  // holding the extracted document text (see below), not evt.message, so
+  // comparing against evt.message would never match a real duplicate.
+  const DEDUP_WINDOW_MS = 15000;
+  const dedupWindow = {
+    gte: new Date(new Date(evt.timestamp).getTime() - DEDUP_WINDOW_MS),
+    lte: new Date(new Date(evt.timestamp).getTime() + DEDUP_WINDOW_MS),
+  };
   const existingDuplicate = await prisma.message.findFirst({
-    where: {
-      conversationId: conversation.id,
-      direction: "INBOUND",
-      body: evt.message,
-      createdAt: evt.timestamp,
-    },
+    where: evt.mediaUrl
+      ? {
+          conversationId: conversation.id,
+          direction: "INBOUND",
+          mediaUrl: evt.mediaUrl,
+          createdAt: dedupWindow,
+        }
+      : {
+          conversationId: conversation.id,
+          direction: "INBOUND",
+          body: evt.message,
+          createdAt: dedupWindow,
+        },
   });
   if (existingDuplicate) {
     console.log(
@@ -65,23 +91,60 @@ async function handleInboundMessage(evt) {
     data: { lastMessageAt: evt.timestamp },
   });
 
+  // A supplier's stock sheet/PDF arrives as an attachment, not typed text.
+  // Extract it to plain text once, here, so it becomes a normal-looking
+  // Message.body and needs no special handling anywhere downstream (see
+  // documentExtractor.js's header for why). Detection is by the file's
+  // own content, not Samvaadik's message_type field — no attachment value
+  // of that field has ever been documented in this codebase.
+  let body = evt.message || null;
+  let detectedFormat = null;
+  if (evt.mediaUrl) {
+    try {
+      const fileBuffer = await downloadMedia(evt.mediaUrl);
+      const extracted = await extractTextFromDocument(fileBuffer);
+      detectedFormat = extracted.ok ? extracted.format : null;
+      if (extracted.ok && extracted.format === "image") {
+        // No text to extract from a photo — module 5.2's onboarding flow
+        // uses Message.mediaUrl (already stored below) directly instead.
+        const caption = evt.message ? `${evt.message}\n\n` : "";
+        body = `${caption}[Supplier sent an image attachment]`;
+      } else if (extracted.ok) {
+        const caption = evt.message ? `${evt.message}\n\n` : "";
+        body = `${caption}[Attached file — extracted contents below]\n\n${extracted.text}`;
+      } else {
+        body = `${evt.message ? `${evt.message}\n\n` : ""}[Supplier sent an attachment that couldn't be read: ${extracted.reason}]`;
+      }
+    } catch (err) {
+      console.error(
+        `[samvaadik webhook] attachment download/extraction failed for ${conversation.id}:`,
+        err.message,
+      );
+      body = `${evt.message ? `${evt.message}\n\n` : ""}[Supplier sent an attachment that couldn't be downloaded]`;
+    }
+  }
+
   await prisma.message.create({
     data: {
       conversationId: conversation.id,
       direction: "INBOUND",
       sender: "CUSTOMER",
-      type: evt.messageType || "text",
-      body: evt.message || null,
+      // Our own detection wins when it fired — Samvaadik's message_type
+      // has no documented values for attachments (see the comment
+      // above), so it isn't reliable enough to gate on downstream (e.g.
+      // module 5.2 picking "the most recent actual photo" for a product
+      // draft — it needs this to be accurate, not just whatever Samvaadik
+      // happened to send).
+      type: detectedFormat || evt.messageType || "text",
+      body,
       mediaUrl: evt.mediaUrl,
       createdAt: evt.timestamp,
     },
   });
 
-  if (conversation.supplierId) {
-    // Supplier Agent isn't built yet (Module 5) — leave supplier
-    // conversations untouched for now.
-    return;
-  }
+  const config = conversation.supplierId
+    ? supplierAgentConfig
+    : salesAgentConfig;
 
   // Awaited deliberately, not fire-and-forget — Vercel can freeze the
   // function right after res.send(), same gotcha Module 1 already hit.
@@ -89,7 +152,7 @@ async function handleInboundMessage(evt) {
   try {
     await runAgent({
       conversationId: conversation.id,
-      config: salesAgentConfig,
+      config,
       sendFn: async ({ conversation: c, text }) => sendText(c.waPhone, text),
     });
   } catch (err) {

@@ -124,20 +124,56 @@ async function handleProductUpsert(req, res) {
 
 /* ─── products/delete ────────────────────────────────────────────────────── */
 
+// Was previously a soft delete (status -> "archived", row kept forever).
+// Changed to a real delete: a leftover archived row with no live Shopify
+// counterpart is exactly what caused a real bug (module 5.2's "does this
+// product already exist" check found an archived phantom row and tried
+// to write availability to a Shopify variant that was 404 — confirmed by
+// tracing a real write-back failure back to a leftover archived row from
+// an earlier deleted test product). Nothing else in the schema references
+// Product/Variant by foreign key outside of what's deleted below — Order
+// stores lineItems as a Json snapshot, not a live reference, so historical
+// orders are unaffected by a product being removed.
+//
+// Deleted explicitly, in FK-safe order, rather than relying on automatic
+// cascade: SupplierProduct.variantId -> Variant has no onDelete: Cascade
+// (unlike SupplierProduct.productId, AvailabilityState's two FKs, and
+// Variant.productId, which all do) — letting Postgres's cascade resolve
+// on its own risks a foreign key violation on that one relation.
 async function handleProductDelete(req, res) {
   const { id: shopifyProductId } = req.body;
 
   try {
-    await prisma.product.update({
+    const product = await prisma.product.findUnique({
       where: { shopifyProductId: String(shopifyProductId) },
-      data: { status: "archived", syncedAt: new Date() },
+      select: { id: true, title: true },
     });
-    res.status(200).send("ok");
-  } catch (err) {
-    if (err.code === "P2025") {
-      res.status(200).send("ok");
+    if (!product) {
+      res.status(200).send("ok"); // never synced, or already removed — nothing to do
       return;
     }
+
+    await prisma.availabilityLog.deleteMany({
+      where: { AvailabilityState: { productId: product.id } },
+    });
+    await prisma.availabilityState.deleteMany({ where: { productId: product.id } });
+    await prisma.supplierProduct.deleteMany({ where: { productId: product.id } });
+    await prisma.variant.deleteMany({ where: { productId: product.id } });
+    await prisma.product.delete({ where: { id: product.id } });
+
+    await prisma.auditLog.create({
+      data: {
+        actorType: "SYSTEM",
+        action: "product_deleted_on_shopify",
+        entityType: "Product",
+        entityId: product.id,
+        beforeState: { title: product.title, shopifyProductId: String(shopifyProductId) },
+        source: "shopify_webhook",
+      },
+    });
+
+    res.status(200).send("ok");
+  } catch (err) {
     console.error("handleProductDelete error:", err);
     res.status(500).send("error");
   }

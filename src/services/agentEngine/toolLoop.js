@@ -60,6 +60,25 @@ async function runToolLoop({
 
     const toolUseBlocks = response.content.filter((b) => b.type === "tool_use");
 
+    // Server tools (web_search, web_fetch) are executed by Anthropic, not
+    // us — they never appear as `tool_use` blocks (see server_tool_use /
+    // *_tool_result below), so toolHandlers never sees them and they'd
+    // otherwise be completely invisible in Message.toolCalls, making it
+    // impossible to tell from our own logs whether a search actually ran.
+    // Logged here, read-only — nothing to execute, nothing pushed back.
+    response.content
+      .filter((b) => b.type === "server_tool_use")
+      .forEach((b) => toolCallLog.push({ tool: b.name, input: b.input, server: true }));
+    response.content
+      .filter((b) => b.type.endsWith("_tool_result") && b.type !== "tool_result")
+      .forEach((b) =>
+        toolCallLog.push({
+          tool: b.type,
+          output: Array.isArray(b.content) ? b.content.slice(0, 5) : b.content,
+          server: true,
+        }),
+      );
+
     if (toolUseBlocks.length === 0) {
       const finalText = response.content
         .filter((b) => b.type === "text")
