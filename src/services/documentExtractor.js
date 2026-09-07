@@ -17,9 +17,71 @@
 // binary .xls is not supported — a different format entirely). Anything
 // else falls back to a plain/CSV-ish text decode.
 
-const { PDFParse } = require("pdf-parse");
+// PDF text extraction uses pdfjs-dist directly (Mozilla's own engine,
+// actively maintained), not the pdf-parse wrapper package — two real
+// problems ruled that out. pdf-parse v2 wraps pdfjs-dist but adds PDF
+// *rendering* features (screenshots, image extraction) that try to set
+// up browser-canvas polyfills (DOMMatrix etc, via the optional native
+// package @napi-rs/canvas) the moment the module loads, regardless of
+// whether those features are used — that native package isn't available
+// on Vercel's serverless runtime, so the polyfill setup fails and
+// pdf-parse's own code then references DOMMatrix anyway: an uncaught
+// ReferenceError that crashed the entire process at startup (confirmed
+// via real deploy logs), not just PDF handling, since this module sits
+// in the app's main require chain. Falling back to pdf-parse v1 avoids
+// that crash but bundles a vendored pdf.js from 2017 that fails to parse
+// real-world PDFs with a slightly non-standard XRef table (confirmed:
+// "bad XRef entry" on an actual supplier PDF that works fine elsewhere).
+// pdfjs-dist's own "legacy" Node build (ESM-only, hence the dynamic
+// import) has neither problem — used here for text extraction only, no
+// rendering/canvas APIs touched at all.
 const ExcelJS = require("exceljs");
 const { env } = require("../config/env");
+
+let pdfjsLibPromise = null;
+function loadPdfjs() {
+  if (!pdfjsLibPromise) {
+    pdfjsLibPromise = import("pdfjs-dist/legacy/build/pdf.mjs");
+  }
+  return pdfjsLibPromise;
+}
+
+let standardFontDataUrl = null;
+function getStandardFontDataUrl() {
+  // Best-effort only — this just silences a benign "provide
+  // standardFontDataUrl" warning pdfjs-dist logs when a PDF references a
+  // standard (non-embedded) font; extraction already works without it.
+  if (standardFontDataUrl === null) {
+    try {
+      const path = require("path");
+      standardFontDataUrl =
+        path.join(require.resolve("pdfjs-dist/package.json"), "..", "standard_fonts") + "/";
+    } catch {
+      standardFontDataUrl = undefined;
+    }
+  }
+  return standardFontDataUrl;
+}
+
+async function extractPdfText(buffer) {
+  const pdfjsLib = await loadPdfjs();
+  const loadingTask = pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    standardFontDataUrl: getStandardFontDataUrl(),
+  });
+  try {
+    const doc = await loadingTask.promise;
+    const pageTexts = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      pageTexts.push(content.items.map((item) => item.str).join(" "));
+    }
+    return pageTexts.join("\n");
+  } finally {
+    await loadingTask.destroy();
+  }
+}
 
 function detectFormat(buffer) {
   if (buffer.length >= 4 && buffer.subarray(0, 4).toString("latin1") === "%PDF") {
@@ -166,19 +228,7 @@ async function extractTextFromDocument(buffer) {
 
   try {
     if (format === "pdf") {
-      // pdf-parse v2 rewrote the whole API (class-based instead of a
-      // plain function) — this broke silently until traced through a
-      // real supplier-sent PDF: `npm install pdf-parse` with no version
-      // pin pulled v2.4.5, not the v1.x function-call API this was
-      // originally written against.
-      const parser = new PDFParse({ data: buffer });
-      let text;
-      try {
-        const result = await parser.getText();
-        text = (result.text || "").trim();
-      } finally {
-        await parser.destroy();
-      }
+      const text = (await extractPdfText(buffer)).trim();
       if (!text) return { ok: false, reason: "pdf_has_no_extractable_text" };
       return finalize(text, "pdf");
     }
