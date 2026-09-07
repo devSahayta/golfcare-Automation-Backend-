@@ -91,7 +91,26 @@ async function runAgent({ conversationId, config, sendFn }) {
   try {
     const context = await assembleContext({ conversationId });
 
-    if (context.conversation.state !== "AI_HANDLING") {
+    // AWAITING_HUMAN means "flagged for review" — it is NOT the same as
+    // HUMAN_HANDLING (a staff member has actually taken over). The AI
+    // should never go permanently silent just because something was
+    // flagged at some earlier point; the moment the customer sends
+    // anything new, resume automatically so they always get a live
+    // response. The flag itself is preserved in AuditLog for staff to
+    // review whenever they get to it — this doesn't lose that signal,
+    // it just stops it from freezing the conversation.
+    if (context.conversation.state === "AWAITING_HUMAN") {
+      await prisma.conversation.update({
+        where: { id: conversationId },
+        data: { state: "AI_HANDLING" },
+      });
+      context.conversation.state = "AI_HANDLING";
+      console.log(
+        `[agentEngine] ${conversationId} auto-resumed from AWAITING_HUMAN.`,
+      );
+    } else if (context.conversation.state !== "AI_HANDLING") {
+      // HUMAN_HANDLING or CLOSED — a real person is genuinely handling
+      // this, or the conversation is done. Never auto-override either.
       console.log(
         `[agentEngine] ${conversationId} state=${context.conversation.state}, agent not invoked.`,
       );
