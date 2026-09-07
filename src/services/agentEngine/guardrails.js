@@ -38,6 +38,23 @@ const MEMBERSHIP_CLAIM_RE =
 // references a product verified two turns ago shouldn't be treated as a
 // fresh hallucination.
 const BOLD_SEGMENT_RE = /\*[^*\n]+\*/g;
+
+// A member code (GCXXXXXX format) is legitimately bold in completion
+// messages, but it isn't a "product name" — without this exclusion, any
+// message that both reveals the code AND mentions "in stock" generically
+// (e.g. "we'll keep your usual in stock") gets falsely flagged as an
+// unverified product claim purely because *some* bold text exists,
+// regardless of what that bold text actually is.
+const MEMBER_CODE_RE = /^GC[A-Z0-9]{6}$/;
+function countsAsProductBoldSegment(segment) {
+  const inner = segment.slice(1, -1).trim(); // strip the surrounding asterisks
+  return !MEMBER_CODE_RE.test(inner);
+}
+function productBoldSegments(draftText) {
+  return (draftText.match(BOLD_SEGMENT_RE) || []).filter(
+    countsAsProductBoldSegment,
+  );
+}
 const PRODUCT_LOOKUP_TOOLS = [
   "search_products",
   "get_product",
@@ -77,7 +94,7 @@ function looksLikeUnverifiedProductList(
   recentMessages,
 ) {
   if (calledAnyProductLookup(toolCallLog, recentMessages)) return false;
-  const boldSegments = draftText.match(BOLD_SEGMENT_RE) || [];
+  const boldSegments = productBoldSegments(draftText);
   const hasPriceMarker = PRICE_CLAIM_RE.test(draftText);
   return boldSegments.length >= 2 && hasPriceMarker;
 }
@@ -141,8 +158,7 @@ function runGuardrails({ draftText, toolCallLog, context }) {
   // usual in stock for you" is a generic service line, not a claim about
   // any particular item's current availability, and shouldn't need a
   // tool call to back it up.
-  const hasBoldProductRef =
-    (draftText.match(BOLD_SEGMENT_RE) || []).length >= 1;
+  const hasBoldProductRef = productBoldSegments(draftText).length >= 1;
   if (
     (STOCK_CLAIM_RE.test(draftText) || PRICE_CLAIM_RE.test(draftText)) &&
     hasBoldProductRef &&
