@@ -61,6 +61,29 @@ function buildSalesAgentTools(context) {
         // search term here even though it reads like a real one.
       ]);
 
+      // Gender words are handled ONLY via the dedicated genderFilter
+      // below (a precise startsWith AND condition) — they must NOT also
+      // appear in the generic OR keyword list. Almost every product in
+      // this catalog is prefixed "Men's ..." or "Women's ...", so if a
+      // gender word is allowed to count as a standalone OR match, it
+      // alone is enough to match trousers, polos, caps, gloves —
+      // anything men's-branded — swamping the actual product-type words
+      // (shoes, spikeless, driver, etc.) that should be doing the real
+      // narrowing. This bit us directly: "men's spikeless shoes" started
+      // matching "Men's Tech Trousers" purely off the word "men's".
+      const GENDER_WORDS = new Set([
+        "men's",
+        "men",
+        "mens",
+        "women's",
+        "women",
+        "womens",
+        "ladies",
+        "junior's",
+        "juniors",
+        "kids",
+      ]);
+
       // category used to be a hard AND filter against productType only —
       // but productType values are always specific ("Drivers", "Irons",
       // "Fairway Woods"), never a broad word like "clubs" or "gloves"
@@ -76,7 +99,12 @@ function buildSalesAgentTools(context) {
       const words = combinedQuery
         .replace(/[^\w\s']/g, "")
         .split(/\s+/)
-        .filter((w) => w.length > 2 && !STOPWORDS.has(w.toLowerCase()))
+        .filter(
+          (w) =>
+            w.length > 2 &&
+            !STOPWORDS.has(w.toLowerCase()) &&
+            !GENDER_WORDS.has(w.toLowerCase()),
+        )
         .slice(0, 8);
 
       // Cheap singularization — titles are singular ("... Driver"), but
