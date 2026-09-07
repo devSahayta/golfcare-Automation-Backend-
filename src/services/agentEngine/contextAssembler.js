@@ -60,11 +60,19 @@ async function assembleContext({ conversationId }) {
       (q) => !answeredKeys.has(q.fieldKey),
     );
 
-    // Deterministic check, not left to the model to notice on its own —
-    // it already re-pitched once in testing despite the prior pitch
-    // being right there in history.
+    // Deterministic check — but must only fire once the REAL benefits
+    // pitch (with bullets) has been sent, not just a bare "have you
+    // thought about joining?" invite. The old /membership/i regex matched
+    // even the bare invite, which meant a customer ignoring or not
+    // addressing that first mention (e.g. replying about something else
+    // entirely) permanently locked the model out of ever bringing it up
+    // again for the rest of the conversation — the invite went
+    // unanswered, membership was never actually explained, and the
+    // model was told "already pitched, don't re-ask." This marker
+    // matches the same bullet-benefits text used in the enroll_membership
+    // tool guard, so both stay in sync.
     hasPitchedMembership = recentMessages.some(
-      (m) => m.sender === "AI_AGENT" && /membership/i.test(m.body || ""),
+      (m) => m.sender === "AI_AGENT" && /member pricing|🏷️/.test(m.body || ""),
     );
 
     // Part A enrolment gate — separate from Part C progressive profiling
