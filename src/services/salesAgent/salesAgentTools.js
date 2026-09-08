@@ -169,7 +169,7 @@ function buildSalesAgentTools(context) {
       let products = await prisma.product.findMany({
         where: usedWhere,
         take: Math.min(limit, 15),
-        include: { Variant: { take: 3 } },
+        include: { Variant: { take: 10 } },
       });
 
       // Fall back to the broader vendor/tags-inclusive search only if the
@@ -189,7 +189,7 @@ function buildSalesAgentTools(context) {
         products = await prisma.product.findMany({
           where: usedWhere,
           take: Math.min(limit, 15),
-          include: { Variant: { take: 3 } },
+          include: { Variant: { take: 10 } },
         });
       }
 
