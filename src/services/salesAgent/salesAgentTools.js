@@ -169,7 +169,7 @@ function buildSalesAgentTools(context) {
       let products = await prisma.product.findMany({
         where: usedWhere,
         take: Math.min(limit, 15),
-        include: { Variant: { take: 15 } },
+        include: { Variant: { take: 25 } },
       });
 
       // Fall back to the broader vendor/tags-inclusive search only if the
@@ -189,7 +189,7 @@ function buildSalesAgentTools(context) {
         products = await prisma.product.findMany({
           where: usedWhere,
           take: Math.min(limit, 15),
-          include: { Variant: { take: 15 } },
+          include: { Variant: { take: 25 } },
         });
       }
 
@@ -295,10 +295,16 @@ function buildSalesAgentTools(context) {
     },
 
     async escalate_to_human({ reason, urgency }) {
-      await prisma.conversation.update({
-        where: { id: context.conversation.id },
-        data: { state: "AWAITING_HUMAN" },
-      });
+      // Deliberately does NOT change conversation.state anymore. This
+      // used to flip to AWAITING_HUMAN, which froze the AI out of the
+      // conversation until either a manual reset or the next customer
+      // message triggered auto-resume — in practice this kept surprising
+      // customers with silence or a generic holding message mid-flow,
+      // even for routine "I can't confirm real stock, flagging to the
+      // team" cases that don't need the AI to stop helping. This is now
+      // purely a notification: staff still see it in AuditLog for
+      // follow-up, but the AI keeps handling the conversation live,
+      // continuously, no matter how many times this fires.
       await prisma.auditLog.create({
         data: {
           actorType: "AGENT",
