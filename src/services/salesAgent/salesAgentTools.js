@@ -84,6 +84,26 @@ function buildSalesAgentTools(context) {
         "kids",
       ]);
 
+      // Orientation words are handled ONLY via the dedicated
+      // orientationFilter below, for the exact same reason as
+      // GENDER_WORDS above — "left"/"right"/"hand" appear constantly in
+      // completely unrelated product titles (e.g. "0211 Hellcat Putter
+      // -Black Hand-Right/Length-34 Inches", "Men's M8 Steel Golf Set -
+      // Left Hand..."), since club handedness is encoded in titles the
+      // same way glove handedness is. Left in the generic OR keyword
+      // pool, these words alone are enough to match putters, full club
+      // sets, and belts ahead of the actual gloves being searched for —
+      // this is exactly the bug that surfaced when a customer asked for
+      // "left hand black leather" gloves and got putters back instead.
+      const ORIENTATION_WORDS = new Set([
+        "left",
+        "right",
+        "hand",
+        "handed",
+        "lefty",
+        "righty",
+      ]);
+
       // category used to be a hard AND filter against productType only —
       // but productType values are always specific ("Drivers", "Irons",
       // "Fairway Woods"), never a broad word like "clubs" or "gloves"
@@ -103,7 +123,8 @@ function buildSalesAgentTools(context) {
           (w) =>
             w.length > 2 &&
             !STOPWORDS.has(w.toLowerCase()) &&
-            !GENDER_WORDS.has(w.toLowerCase()),
+            !GENDER_WORDS.has(w.toLowerCase()) &&
+            !ORIENTATION_WORDS.has(w.toLowerCase()),
         )
         .slice(0, 8);
 
@@ -144,6 +165,30 @@ function buildSalesAgentTools(context) {
       }
       const genderConditions = genderFilter ? [genderFilter] : [];
 
+      // Explicit orientation filter — same shape as genderFilter, but
+      // matched against Variant.title (e.g. "Left hand / Large") rather
+      // than Product.title, since handedness lives at the variant level
+      // in this catalog, not the product level. Applied as a real AND
+      // condition so it actually narrows results instead of just being
+      // one more OR keyword that generic titles happen to satisfy.
+      let orientationFilter = null;
+      if (/\bleft\b/.test(lowerCombined)) {
+        orientationFilter = {
+          Variant: {
+            some: { title: { contains: "Left hand", mode: "insensitive" } },
+          },
+        };
+      } else if (/\bright\b/.test(lowerCombined)) {
+        orientationFilter = {
+          Variant: {
+            some: { title: { contains: "Right hand", mode: "insensitive" } },
+          },
+        };
+      }
+      const orientationConditions = orientationFilter
+        ? [orientationFilter]
+        : [];
+
       const priceConditions = [];
       if (priceMin != null || priceMax != null) {
         const priceCond = {};
@@ -164,7 +209,12 @@ function buildSalesAgentTools(context) {
       }));
       let usedWhere = {
         status: "active",
-        AND: [{ OR: titleOr }, ...priceConditions, ...genderConditions],
+        AND: [
+          { OR: titleOr },
+          ...priceConditions,
+          ...genderConditions,
+          ...orientationConditions,
+        ],
       };
       let products = await prisma.product.findMany({
         where: usedWhere,
@@ -172,19 +222,50 @@ function buildSalesAgentTools(context) {
         include: { Variant: { take: 25 } },
       });
 
+      // Honest fallback: if narrowing by hand orientation finds nothing,
+      // don't just return an empty result and force the model to either
+      // go silent or guess from memory — retry without the orientation
+      // filter, but flag it via orientationRelaxed below so the model
+      // can tell the CUSTOMER honestly ("didn't find that in left-hand
+      // specifically, here's what's available generally") instead of
+      // silently presenting these as if they matched the hand asked for.
+      let orientationRelaxed = false;
+      if (products.length === 0 && orientationFilter) {
+        orientationRelaxed = true;
+        usedWhere = {
+          status: "active",
+          AND: [{ OR: titleOr }, ...priceConditions, ...genderConditions],
+        };
+        products = await prisma.product.findMany({
+          where: usedWhere,
+          take: Math.min(limit, 15),
+          include: { Variant: { take: 25 } },
+        });
+      }
+
       // Fall back to the broader vendor/tags-inclusive search only if the
       // stricter title-first pass found nothing — preserves support for
       // vague/brand-only browsing ("show me Callaway stuff") without
-      // letting it dominate more specific queries.
+      // letting it dominate more specific queries. Keeps whatever
+      // orientation/gender conditions are currently active (which may
+      // have already been relaxed above).
       if (products.length === 0) {
         const broadOr = wordForms.flatMap((w) => [
           { title: { contains: w, mode: "insensitive" } },
           { vendor: { contains: w, mode: "insensitive" } },
           { tags: { has: w } },
         ]);
+        const activeOrientationConditions = orientationRelaxed
+          ? []
+          : orientationConditions;
         usedWhere = {
           status: "active",
-          AND: [{ OR: broadOr }, ...priceConditions, ...genderConditions],
+          AND: [
+            { OR: broadOr },
+            ...priceConditions,
+            ...genderConditions,
+            ...activeOrientationConditions,
+          ],
         };
         products = await prisma.product.findMany({
           where: usedWhere,
@@ -214,6 +295,11 @@ function buildSalesAgentTools(context) {
         })),
         totalCount,
         moreAvailable: totalCount > products.length,
+        // true = a hand-orientation filter was requested but found
+        // nothing, so these results were relaxed back to "any hand" —
+        // the model must say so plainly rather than presenting them as
+        // a match for the orientation the customer asked for.
+        orientationRelaxed,
       };
     },
 
