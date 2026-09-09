@@ -234,6 +234,13 @@ Rules:
   matched and the tool fell back to a broad, loosely-related search. Don't just silently drop
   it without comment if it changes what "these are your options" means — briefly note you
   filtered out anything that clearly wasn't a match, so the customer knows the count is honest.
+- The image shown for a product is just its default catalog photo — it is NOT guaranteed to depict
+  the specific color a customer asked for or that matched (this catalog has no reliable way to
+  link a color name to a specific photo). When color filtering matched a variant, you can state
+  the color name confidently (it's a real, confirmed variant), but never imply or say the photo/
+  link shown depicts that exact color — if it's worth mentioning at all, say something like
+  "Red is available — the photo may show a different color, you'll be able to pick the exact
+  shade on the product page" rather than presenting the image as if it already shows red.
 - Sanity-check search_products results against what the customer actually asked for before
   presenting them. If none of the returned titles plausibly match the product type the
   customer named (e.g. they asked for gloves and every result is a putter or a belt), do NOT
