@@ -495,13 +495,62 @@ function buildSalesAgentTools(context) {
           ),
         };
       }
+
+      // Re-query live DB state rather than trusting `context.customer` /
+      // `context.unansweredQuestions` as-is. Both are snapshotted ONCE at
+      // the start of the turn, before any tool calls in THIS turn have
+      // run. If enroll_membership already executed earlier in the same
+      // reply (which it can — the model is instructed to enroll, then
+      // continue straight into Part A questions in the same message),
+      // the stale `context` snapshot still shows the pre-enrollment
+      // world: isMember: false, unansweredQuestions: [] (since the
+      // context-builder had no reason to populate Part A questions for
+      // a not-yet-a-member customer at turn start). That stale "nothing
+      // to ask" signal is exactly what caused the model to skip
+      // onboarding and reveal the member code immediately after
+      // enrolling — a real customer got the code with zero profiling
+      // questions asked. Fetching fresh here makes get_customer_profile
+      // trustworthy no matter when in the turn it's called.
+      const liveCustomer = await prisma.customer.findUnique({
+        where: { id: customerId },
+      });
+      if (!liveCustomer) {
+        return {
+          isMember: false,
+          tier: null,
+          unansweredQuestions: context.unansweredQuestions.map(
+            (q) => q.fieldKey,
+          ),
+        };
+      }
+
+      const liveGolferProfile = await prisma.golferProfile.findUnique({
+        where: { customerId },
+      });
+
+      let liveUnanswered = context.unansweredQuestions.map((q) => q.fieldKey);
+      if (liveCustomer.isMember) {
+        // Once enrolled, the authoritative "what's left" list is
+        // whichever ENROLMENT_FIELD_KEYS have no OnboardingResponse row
+        // yet — computed fresh, not from the turn-start snapshot.
+        const answered = await prisma.onboardingResponse.findMany({
+          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
+          select: { fieldKey: true },
+        });
+        const answeredSet = new Set(answered.map((a) => a.fieldKey));
+        liveUnanswered = ENROLMENT_FIELD_KEYS.filter(
+          (k) => !answeredSet.has(k),
+        );
+      }
+
       return {
-        isMember: context.customer.isMember,
-        tier: context.customer.tier,
-        budgetTier: context.golferProfile?.budgetTier || null,
-        handicap: context.golferProfile?.handicap || null,
-        preferredBrands: context.golferProfile?.preferredBrands || [],
-        unansweredQuestions: context.unansweredQuestions.map((q) => q.fieldKey),
+        isMember: liveCustomer.isMember,
+        tier: liveCustomer.tier,
+        budgetTier: liveGolferProfile?.budgetTier || null,
+        handicap: liveGolferProfile?.handicap ?? null,
+        preferredBrands: liveGolferProfile?.preferredBrands || [],
+        unansweredQuestions: liveUnanswered,
+        onboardingComplete: liveCustomer.onboardingState === "COMPLETED",
       };
     },
 
@@ -569,12 +618,38 @@ function buildSalesAgentTools(context) {
       // once in a conversation (e.g. forgetting it already enrolled the
       // customer mid-setup). Never regenerate a code or reset onboarding
       // progress for an existing member — that silently orphans old codes
-      // and confuses the customer about which code is real.
+      // and confuses the customer about which code is real. Also never
+      // hand back the code on a repeat call if onboarding hasn't actually
+      // finished yet — same protection as the fresh-enrollment path below,
+      // so a second enroll_membership call mid-setup can't leak the code
+      // early either.
       if (context.customer?.isMember) {
+        if (context.customer.onboardingState === "COMPLETED") {
+          return {
+            enrolled: true,
+            memberCode: context.customer.memberCode,
+            alreadyEnrolled: true,
+          };
+        }
+        const nextUnanswered = await prisma.onboardingResponse.findMany({
+          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
+          select: { fieldKey: true },
+        });
+        const answeredSet = new Set(nextUnanswered.map((a) => a.fieldKey));
+        const nextKey = ENROLMENT_FIELD_KEYS.find((k) => !answeredSet.has(k));
+        const nextQuestion = ENROLMENT_QUESTIONS.find(
+          (q) => q.fieldKey === nextKey,
+        );
         return {
           enrolled: true,
-          memberCode: context.customer.memberCode,
           alreadyEnrolled: true,
+          doNotRevealMemberCodeYet: true,
+          nextStep: {
+            instruction:
+              "This customer already enrolled but hasn't finished setup. Do NOT mention the member code yet — continue with the next unanswered question below.",
+            fieldKey: nextQuestion?.fieldKey,
+            prompt: nextQuestion?.prompt,
+          },
         };
       }
 
@@ -611,9 +686,31 @@ function buildSalesAgentTools(context) {
           onboardingStartedAt: new Date(),
         },
       });
+
+      // Self-contained next-step instruction — do NOT rely on the model
+      // remembering the STEP 3 prompt guidance from several messages
+      // back, or on context.unansweredQuestions being fresh (it's
+      // snapshotted at turn start and won't yet reflect this enrollment
+      // — see get_customer_profile's staleness comment for the exact
+      // bug this caused: a customer got their member code with zero
+      // onboarding questions asked, because the model checked
+      // get_customer_profile mid-turn, saw a stale empty
+      // unansweredQuestions list, and concluded there was nothing left
+      // to do). The first Part A question is generated fresh right
+      // here, in the same return value as the enrollment success, so
+      // the model has no path to "forget" it exists.
+      const firstQuestion = ENROLMENT_QUESTIONS[0];
+
       return {
         enrolled: true,
         memberCode: updated.memberCode,
+        doNotRevealMemberCodeYet: true,
+        nextStep: {
+          instruction:
+            "Do NOT mention the member code in this reply. In THIS SAME reply, briefly explain you'll ask a few quick setup questions, then ask exactly the question below and call record_profile_answer with the exact fieldKey shown once they answer. The member code is only revealed once record_profile_answer eventually returns enrolmentCompleted: true — never before that.",
+          fieldKey: firstQuestion?.fieldKey,
+          prompt: firstQuestion?.prompt,
+        },
       };
     },
 

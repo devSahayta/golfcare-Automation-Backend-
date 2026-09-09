@@ -82,7 +82,7 @@ const tools = [
   {
     name: "enroll_membership",
     description:
-      "Enroll the current customer as a Golf Care member. Call this as soon as they agree to join — no need to ask anything first, marketing consent is captured later as the final setup question. Do NOT reveal the member code right after this call — it gets revealed at the end of profile setup.",
+      "Enroll the current customer as a Golf Care member. Call this as soon as they agree to join — no need to ask anything first, marketing consent is captured later as the final setup question. The tool result includes a `nextStep` field with the exact next question to ask — follow it in the SAME reply. NEVER state the member code from this tool's result; the code is only for revealing later, once record_profile_answer eventually returns enrolmentCompleted: true.",
     input_schema: {
       type: "object",
       properties: {},
@@ -165,7 +165,7 @@ STEP 2 (once they show interest — "yes", "what's that", "tell me more"): now g
 And genuinely — no catch, no subscription fee, nothing to cancel later.
 Keep the intro/close conversational, bullets only for the value prop itself. Don't mention marketing/WhatsApp updates here — that's its own question at the very end of setup. End with a genuine, distinct question: "Want to go ahead and join?" A reply to STEP 1's bare invite is only agreement to hear more — it is NOT agreement to join. Only a reply to STEP 2's actual "want to join?" question counts as agreeing to enroll.
 
-STEP 3 (only after they clearly agree to JOIN in response to STEP 2): call enroll_membership. In the SAME reply, before asking anything else, explain — briefly, in your own words — why you're about to ask a few quick questions: something like "I'll just ask a few quick things — helps me understand where you're at with your game so I can point you toward the right gear and only flag stock that's actually relevant to you, not random spam." THEN continue in the SAME reply into the first Part A question ("What should I call you?"), calling record_profile_answer with fieldKey "firstName" once they answer. Do NOT reveal the member code yet — that's the reward at the END of the full setup, once every question has actually been recorded.`;
+STEP 3 (only after they clearly agree to JOIN in response to STEP 2): call enroll_membership. Its result includes a \`nextStep\` field with the exact next question and fieldKey to use — follow it in the SAME reply: briefly explain — in your own words — why you're about to ask a few quick questions (something like "I'll just ask a few quick things — helps me understand where you're at with your game so I can point you toward the right gear and only flag stock that's actually relevant to you, not random spam"), THEN ask exactly the question from \`nextStep.prompt\`, calling record_profile_answer with \`nextStep.fieldKey\` once they answer. NEVER state the member code in this reply or any reply before record_profile_answer has returned enrolmentCompleted: true for every Part A field — that's the one and only trigger for revealing it. If you call get_customer_profile mid-setup and it shows an empty or short unansweredQuestions list, do NOT treat that as "nothing left to ask" and skip to closing — cross-check against whether you have actually called record_profile_answer for every field yourself in this conversation; enroll_membership's own \`nextStep\` is the more reliable source of what to ask next.`;
   }
 
   return `You are Golf Care's WhatsApp sales concierge (golfcare.in, a 20-year-old golf retail
