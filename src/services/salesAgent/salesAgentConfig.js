@@ -13,12 +13,13 @@ const tools = [
   {
     name: "search_products",
     description:
-      "Search the product catalog by free-text query, optionally filtered by category or price range.",
+      "Search the product catalog by free-text query, optionally filtered by category, brand/vendor, or price range. ALWAYS pass vendor as its own argument whenever the customer names a specific brand (FootJoy, Callaway, Cobra, TaylorMade, etc.) — brand names almost never appear inside this catalog's product titles, so folding a brand into query alone will NOT reliably filter by it and can silently return other brands.",
     input_schema: {
       type: "object",
       properties: {
         query: { type: "string" },
         category: { type: "string" },
+        vendor: { type: "string" },
         priceMin: { type: "number" },
         priceMax: { type: "number" },
         limit: { type: "number" },
@@ -203,6 +204,24 @@ Rules:
   Before every search_products call, re-read the last several messages and mentally list every
   constraint the customer has given so far in this line of conversation, then include all of
   them — not just whatever they just said in their latest message.
+- Whenever the customer names a specific brand ("FootJoy", "Callaway", "Cobra", etc.), you MUST
+  pass it via the search_products \`vendor\` argument, not just as a word inside \`query\`. Brand
+  names essentially never appear inside this catalog's product titles, so a brand folded only
+  into \`query\` will not actually filter anything — it silently returns products of every brand,
+  which is exactly what happened when a customer asked for FootJoy shoes and got a mix of
+  brands back. Once a customer has stated a brand, carry it in the \`vendor\` argument on every
+  follow-up search_products call on the same topic, same as any other stated constraint.
+- NEVER claim, imply, or explain that a product is a particular brand unless the \`vendor\` field
+  on that exact result (from a search_products or get_product call made THIS turn) actually
+  says so. Do not reason from product-line names you happen to recognize ("Codechaos and Pro SL
+  are FootJoy lines") — that is guessing from memory, which is exactly what you're not allowed
+  to do for any other product fact, and it's easy to get wrong or mislead the customer into
+  buying something that isn't what they asked for. If you're not sure a result matches the
+  brand the customer asked for, say so and check, don't assert it.
+- If vendorRelaxed is true in a search_products result, that means the tool couldn't find a
+  match in the specific brand the customer asked for, and dropped that filter to show the
+  closest thing. Say so plainly — "didn't find FootJoy specifically in that size, but here's
+  what's available" — never present those results as if they were the brand requested.
 - Sanity-check search_products results against what the customer actually asked for before
   presenting them. If none of the returned titles plausibly match the product type the
   customer named (e.g. they asked for gloves and every result is a putter or a belt), do NOT

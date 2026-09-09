@@ -21,7 +21,14 @@ function buildSalesAgentTools(context) {
   const customerId = context.customer?.id || context.conversation.customerId;
 
   return {
-    async search_products({ query, category, priceMin, priceMax, limit = 5 }) {
+    async search_products({
+      query,
+      category,
+      vendor,
+      priceMin,
+      priceMax,
+      limit = 5,
+    }) {
       // No embedding pipeline has been decided/built yet (open item —
       // the spec calls for pgvector similarity search, but nobody's
       // picked an embedding provider). This falls back to a keyword
@@ -189,6 +196,23 @@ function buildSalesAgentTools(context) {
         ? [orientationFilter]
         : [];
 
+      // Explicit vendor/brand filter — a real AND condition against
+      // Product.vendor, not a keyword in the generic OR pool. Brand
+      // names essentially never appear inside this catalog's product
+      // titles (e.g. "Men's Torque 2 MD Spiked Golf Shoes" has no
+      // "FootJoy" in it even though vendor="FootJoy"), so a brand word
+      // left in the generic keyword list matches ~zero titles and
+      // contributes nothing — while other generic words in the same
+      // query ("shoe", "shoes", "glove") match almost the entire
+      // category regardless of brand. Net effect without this filter:
+      // "FootJoy shoes" silently returns shoes of every brand. This is
+      // populated from the dedicated `vendor` tool argument — the model
+      // is instructed to pass a named brand there, not just fold it
+      // into `query`.
+      const vendorConditions = vendor
+        ? [{ vendor: { contains: vendor, mode: "insensitive" } }]
+        : [];
+
       const priceConditions = [];
       if (priceMin != null || priceMax != null) {
         const priceCond = {};
@@ -214,6 +238,7 @@ function buildSalesAgentTools(context) {
           ...priceConditions,
           ...genderConditions,
           ...orientationConditions,
+          ...vendorConditions,
         ],
       };
       let products = await prisma.product.findMany({
@@ -243,12 +268,44 @@ function buildSalesAgentTools(context) {
         });
       }
 
+      // Honest fallback: if the brand-narrowed search finds nothing —
+      // either the brand genuinely isn't stocked, or (more likely, given
+      // how sparsely vendor names appear verbatim in titles) the
+      // combination of brand + other constraints was too narrow. Retry
+      // without the vendor filter rather than silently returning empty,
+      // but flag it via vendorRelaxed so the model tells the customer
+      // honestly instead of presenting other brands as if they matched
+      // the one asked for (or worse, inventing a brand justification).
+      let vendorRelaxed = false;
+      if (products.length === 0 && vendorConditions.length > 0) {
+        vendorRelaxed = true;
+        usedWhere = {
+          status: "active",
+          AND: [
+            { OR: titleOr },
+            ...priceConditions,
+            ...genderConditions,
+            ...orientationConditions,
+          ],
+        };
+        products = await prisma.product.findMany({
+          where: usedWhere,
+          take: Math.min(limit, 15),
+          include: { Variant: { take: 25 } },
+        });
+      }
+
       // Fall back to the broader vendor/tags-inclusive search only if the
       // stricter title-first pass found nothing — preserves support for
       // vague/brand-only browsing ("show me Callaway stuff") without
       // letting it dominate more specific queries. Keeps whatever
-      // orientation/gender conditions are currently active (which may
-      // have already been relaxed above).
+      // orientation/gender/vendor conditions are currently active
+      // (which may have already been relaxed above). Note: once vendor
+      // has been relaxed, it must NOT be re-added here from the raw
+      // `vendor` arg — vendorRelaxed already means "we tried and it
+      // found nothing," so this pass should broaden search terms (title/
+      // vendor/tags-as-OR-keywords), not silently reimpose the same
+      // AND filter that was just proven to return zero.
       if (products.length === 0) {
         const broadOr = wordForms.flatMap((w) => [
           { title: { contains: w, mode: "insensitive" } },
@@ -258,6 +315,7 @@ function buildSalesAgentTools(context) {
         const activeOrientationConditions = orientationRelaxed
           ? []
           : orientationConditions;
+        const activeVendorConditions = vendorRelaxed ? [] : vendorConditions;
         usedWhere = {
           status: "active",
           AND: [
@@ -265,6 +323,7 @@ function buildSalesAgentTools(context) {
             ...priceConditions,
             ...genderConditions,
             ...activeOrientationConditions,
+            ...activeVendorConditions,
           ],
         };
         products = await prisma.product.findMany({
@@ -283,6 +342,7 @@ function buildSalesAgentTools(context) {
         results: products.map((p) => ({
           productId: p.id,
           title: p.title,
+          vendor: p.vendor || null,
           priceMin: p.priceMin,
           priceMax: p.priceMax,
           imageUrl: p.imageUrls?.[0] || null,
@@ -300,6 +360,12 @@ function buildSalesAgentTools(context) {
         // the model must say so plainly rather than presenting them as
         // a match for the orientation the customer asked for.
         orientationRelaxed,
+        // true = a brand/vendor filter was requested but found nothing,
+        // so these results were relaxed back to "any brand" — the model
+        // must say so plainly (and must NOT claim these results are the
+        // requested brand — check the vendor field on each result
+        // instead of asserting from memory).
+        vendorRelaxed,
       };
     },
 
