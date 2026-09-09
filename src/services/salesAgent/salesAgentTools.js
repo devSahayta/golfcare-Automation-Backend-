@@ -212,23 +212,38 @@ function buildSalesAgentTools(context) {
       const genderConditions = genderFilter ? [genderFilter] : [];
 
       // Explicit orientation filter — same shape as genderFilter, but
-      // matched against Variant.title (e.g. "Left hand / Large") rather
-      // than Product.title, since handedness lives at the variant level
-      // in this catalog, not the product level. Applied as a real AND
-      // condition so it actually narrows results instead of just being
-      // one more OR keyword that generic titles happen to satisfy.
+      // checks BOTH Product.title and Variant.title, since this catalog
+      // is inconsistent about where handedness actually lives: some
+      // products encode it on the variant ("Left hand / Large"), others
+      // on the product itself ("...Glove - Right Hand", confirmed via
+      // the Dawn Patrol glove — no hand info on any of its variants at
+      // all). Checking only one location silently excludes real matches
+      // stored the other way, so this is an OR across both, applied as
+      // a real AND condition on the query as a whole.
       let orientationFilter = null;
       if (/\bleft\b/.test(lowerCombined)) {
         orientationFilter = {
-          Variant: {
-            some: { title: { contains: "Left hand", mode: "insensitive" } },
-          },
+          OR: [
+            { title: { contains: "Left Hand", mode: "insensitive" } },
+            {
+              Variant: {
+                some: { title: { contains: "Left hand", mode: "insensitive" } },
+              },
+            },
+          ],
         };
       } else if (/\bright\b/.test(lowerCombined)) {
         orientationFilter = {
-          Variant: {
-            some: { title: { contains: "Right hand", mode: "insensitive" } },
-          },
+          OR: [
+            { title: { contains: "Right Hand", mode: "insensitive" } },
+            {
+              Variant: {
+                some: {
+                  title: { contains: "Right hand", mode: "insensitive" },
+                },
+              },
+            },
+          ],
         };
       }
       // Explicit vendor/brand filter — a real AND condition against
@@ -248,25 +263,32 @@ function buildSalesAgentTools(context) {
         ? [{ vendor: { contains: vendor, mode: "insensitive" } }]
         : [];
 
-      // Explicit color filter — same failure mode as brand and hand
-      // orientation: color words left in the generic OR keyword pool
-      // contribute almost nothing while a co-occurring generic word like
-      // "cap" or "shoe" matches nearly the whole category regardless of
-      // color. Net effect without this filter: "red cap" silently
-      // returns caps of every color. COLOR_WORDS itself is declared
-      // earlier (needed by the `words` filter above); this just builds
-      // the actual AND condition against Variant.title once
-      // lowerCombined is available.
+      // Explicit color filter — checks BOTH Product.title and
+      // Variant.title, for the exact same reason as orientation above.
+      // Proven necessary by real data: most black spiked shoes in this
+      // catalog have color ONLY in Product.title ("...Golf Shoes -
+      // Black") with a bare "UK 9" variant title carrying no color at
+      // all — a Variant-title-only filter silently excluded every one
+      // of them (5 of 7 real matches for "black spiked UK 9" were
+      // dropped), while the 1-2 products that happen to bake color into
+      // the variant title ("UK 9 / Black") passed through fine. COLOR_WORDS
+      // itself is declared earlier (needed by the `words` filter above);
+      // this builds the actual condition once lowerCombined is available.
       const requestedColor = COLOR_WORDS.find((c) =>
         new RegExp(`\\b${c}\\b`).test(lowerCombined),
       );
       const colorFilter = requestedColor
         ? {
-            Variant: {
-              some: {
-                title: { contains: requestedColor, mode: "insensitive" },
+            OR: [
+              { title: { contains: requestedColor, mode: "insensitive" } },
+              {
+                Variant: {
+                  some: {
+                    title: { contains: requestedColor, mode: "insensitive" },
+                  },
+                },
               },
-            },
+            ],
           }
         : null;
 
