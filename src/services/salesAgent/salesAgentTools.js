@@ -111,6 +111,44 @@ function buildSalesAgentTools(context) {
         "righty",
       ]);
 
+      // Color words are handled ONLY via the dedicated colorFilter below,
+      // for the same reason as GENDER_WORDS/ORIENTATION_WORDS — color
+      // usually lives in Variant.title ("Sky Blue", "Red", "Brown / UK
+      // 10"), not Product.title, so a color word left in the generic OR
+      // keyword pool matches ~zero titles and does nothing, while a
+      // co-occurring generic word ("cap", "shoe") matches nearly the
+      // whole category regardless of color. Declared up here (used by
+      // the `words` filter below) even though the actual colorFilter
+      // condition is built further down, once lowerCombined exists.
+      const COLOR_WORDS = [
+        "black",
+        "white",
+        "red",
+        "blue",
+        "navy",
+        "green",
+        "grey",
+        "gray",
+        "pink",
+        "orange",
+        "yellow",
+        "purple",
+        "brown",
+        "silver",
+        "gold",
+        "tan",
+        "charcoal",
+        "lavender",
+        "maroon",
+        "turquoise",
+        "beige",
+        "teal",
+        "olive",
+        "cream",
+        "coral",
+        "khaki",
+      ];
+
       // category used to be a hard AND filter against productType only —
       // but productType values are always specific ("Drivers", "Irons",
       // "Fairway Woods"), never a broad word like "clubs" or "gloves"
@@ -131,7 +169,8 @@ function buildSalesAgentTools(context) {
             w.length > 2 &&
             !STOPWORDS.has(w.toLowerCase()) &&
             !GENDER_WORDS.has(w.toLowerCase()) &&
-            !ORIENTATION_WORDS.has(w.toLowerCase()),
+            !ORIENTATION_WORDS.has(w.toLowerCase()) &&
+            !COLOR_WORDS.includes(w.toLowerCase()),
         )
         .slice(0, 8);
 
@@ -192,10 +231,6 @@ function buildSalesAgentTools(context) {
           },
         };
       }
-      const orientationConditions = orientationFilter
-        ? [orientationFilter]
-        : [];
-
       // Explicit vendor/brand filter — a real AND condition against
       // Product.vendor, not a keyword in the generic OR pool. Brand
       // names essentially never appear inside this catalog's product
@@ -213,6 +248,28 @@ function buildSalesAgentTools(context) {
         ? [{ vendor: { contains: vendor, mode: "insensitive" } }]
         : [];
 
+      // Explicit color filter — same failure mode as brand and hand
+      // orientation: color words left in the generic OR keyword pool
+      // contribute almost nothing while a co-occurring generic word like
+      // "cap" or "shoe" matches nearly the whole category regardless of
+      // color. Net effect without this filter: "red cap" silently
+      // returns caps of every color. COLOR_WORDS itself is declared
+      // earlier (needed by the `words` filter above); this just builds
+      // the actual AND condition against Variant.title once
+      // lowerCombined is available.
+      const requestedColor = COLOR_WORDS.find((c) =>
+        new RegExp(`\\b${c}\\b`).test(lowerCombined),
+      );
+      const colorFilter = requestedColor
+        ? {
+            Variant: {
+              some: {
+                title: { contains: requestedColor, mode: "insensitive" },
+              },
+            },
+          }
+        : null;
+
       const priceConditions = [];
       if (priceMin != null || priceMax != null) {
         const priceCond = {};
@@ -221,25 +278,39 @@ function buildSalesAgentTools(context) {
         priceConditions.push({ priceMin: priceCond });
       }
 
-      // Two-tier search: a query like "Callaway fairway wood" should
-      // prefer products whose TITLE actually says "fairway wood" over
-      // products that only match because the vendor is "Callaway" — a
-      // vendor-only match is true for all ~136 Callaway products in this
-      // catalog, so without this tiering, a brand name alone can swamp
-      // out genuinely relevant title matches with no way to tell them
-      // apart (no relevance ranking on a plain OR query).
       const titleOr = wordForms.map((w) => ({
         title: { contains: w, mode: "insensitive" },
       }));
+      const baseAnd = [
+        { OR: titleOr },
+        ...priceConditions,
+        ...genderConditions,
+      ];
+
+      // Attribute filters, in priority order — LAST item is dropped
+      // FIRST when a search returns zero results. This is the
+      // generalized replacement for what used to be two separate,
+      // copy-pasted relax blocks (one for orientation, one for vendor).
+      // Every recurring "customer says X, X lives on Variant/vendor not
+      // Product.title, so it must be a real AND filter not an OR
+      // keyword" case (hand, color, brand — and whatever the next one
+      // turns out to be) plugs into this one array instead of getting
+      // its own bespoke fallback block. Ordering reflects how load-
+      // bearing each constraint usually is to the customer: vendor
+      // (brand) is dropped last/most reluctantly since customers who
+      // name a brand usually mean it strictly; orientation is dropped
+      // first since "left/right" is sometimes just noise in the query.
+      const attributeFilters = [
+        { key: "orientation", condition: orientationFilter },
+        { key: "color", condition: colorFilter },
+        { key: "vendor", condition: vendorConditions[0] || null },
+      ].filter((f) => f.condition);
+
+      const relaxed = {}; // key -> true once that attribute has been dropped
+      let activeFilters = attributeFilters;
       let usedWhere = {
         status: "active",
-        AND: [
-          { OR: titleOr },
-          ...priceConditions,
-          ...genderConditions,
-          ...orientationConditions,
-          ...vendorConditions,
-        ],
+        AND: [...baseAnd, ...activeFilters.map((f) => f.condition)],
       };
       let products = await prisma.product.findMany({
         where: usedWhere,
@@ -247,19 +318,22 @@ function buildSalesAgentTools(context) {
         include: { Variant: { take: 25 } },
       });
 
-      // Honest fallback: if narrowing by hand orientation finds nothing,
-      // don't just return an empty result and force the model to either
-      // go silent or guess from memory — retry without the orientation
-      // filter, but flag it via orientationRelaxed below so the model
-      // can tell the CUSTOMER honestly ("didn't find that in left-hand
-      // specifically, here's what's available generally") instead of
-      // silently presenting these as if they matched the hand asked for.
-      let orientationRelaxed = false;
-      if (products.length === 0 && orientationFilter) {
-        orientationRelaxed = true;
+      // Honest relaxation: rather than silently returning empty (forcing
+      // the model to either go silent or guess from memory) or silently
+      // dropping ALL constraints at once (letting irrelevant results
+      // through with no signal), drop the least load-bearing remaining
+      // attribute filter, retry, and repeat until something matches or
+      // nothing's left to drop. Each dropped attribute is recorded in
+      // `relaxed` so the model can tell the customer honestly exactly
+      // which constraint didn't have a match, instead of presenting
+      // relaxed results as if they satisfied everything asked for.
+      while (products.length === 0 && activeFilters.length > 0) {
+        const [dropped, ...rest] = activeFilters;
+        relaxed[dropped.key] = true;
+        activeFilters = rest;
         usedWhere = {
           status: "active",
-          AND: [{ OR: titleOr }, ...priceConditions, ...genderConditions],
+          AND: [...baseAnd, ...activeFilters.map((f) => f.condition)],
         };
         products = await prisma.product.findMany({
           where: usedWhere,
@@ -268,62 +342,25 @@ function buildSalesAgentTools(context) {
         });
       }
 
-      // Honest fallback: if the brand-narrowed search finds nothing —
-      // either the brand genuinely isn't stocked, or (more likely, given
-      // how sparsely vendor names appear verbatim in titles) the
-      // combination of brand + other constraints was too narrow. Retry
-      // without the vendor filter rather than silently returning empty,
-      // but flag it via vendorRelaxed so the model tells the customer
-      // honestly instead of presenting other brands as if they matched
-      // the one asked for (or worse, inventing a brand justification).
-      let vendorRelaxed = false;
-      if (products.length === 0 && vendorConditions.length > 0) {
-        vendorRelaxed = true;
-        usedWhere = {
-          status: "active",
-          AND: [
-            { OR: titleOr },
-            ...priceConditions,
-            ...genderConditions,
-            ...orientationConditions,
-          ],
-        };
-        products = await prisma.product.findMany({
-          where: usedWhere,
-          take: Math.min(limit, 15),
-          include: { Variant: { take: 25 } },
-        });
-      }
-
-      // Fall back to the broader vendor/tags-inclusive search only if the
-      // stricter title-first pass found nothing — preserves support for
-      // vague/brand-only browsing ("show me Callaway stuff") without
-      // letting it dominate more specific queries. Keeps whatever
-      // orientation/gender/vendor conditions are currently active
-      // (which may have already been relaxed above). Note: once vendor
-      // has been relaxed, it must NOT be re-added here from the raw
-      // `vendor` arg — vendorRelaxed already means "we tried and it
-      // found nothing," so this pass should broaden search terms (title/
-      // vendor/tags-as-OR-keywords), not silently reimpose the same
-      // AND filter that was just proven to return zero.
+      // Fall back to the broader vendor/tags-inclusive search only if
+      // even fully-relaxed title matching found nothing — preserves
+      // support for vague/brand-only browsing ("show me Callaway stuff")
+      // without letting it dominate more specific queries. Any attribute
+      // filter that's already been relaxed above must NOT be silently
+      // reimposed here — it was already proven to return zero.
       if (products.length === 0) {
         const broadOr = wordForms.flatMap((w) => [
           { title: { contains: w, mode: "insensitive" } },
           { vendor: { contains: w, mode: "insensitive" } },
           { tags: { has: w } },
         ]);
-        const activeOrientationConditions = orientationRelaxed
-          ? []
-          : orientationConditions;
-        const activeVendorConditions = vendorRelaxed ? [] : vendorConditions;
         usedWhere = {
           status: "active",
           AND: [
             { OR: broadOr },
             ...priceConditions,
             ...genderConditions,
-            ...activeOrientationConditions,
-            ...activeVendorConditions,
+            ...activeFilters.map((f) => f.condition),
           ],
         };
         products = await prisma.product.findMany({
@@ -338,34 +375,57 @@ function buildSalesAgentTools(context) {
       // more exist, or worse, implying these 5 are all there is.
       const totalCount = await prisma.product.count({ where: usedWhere });
 
+      // When a color was requested AND actually satisfied (not
+      // relaxed), trim each product's variant list down to only the
+      // matching color. Without this, a product with both a "Red" and
+      // a "Sky Blue" variant would still show its full variant list, and
+      // the model has to correctly infer which one the customer meant —
+      // exactly the kind of inference that went wrong before. If color
+      // was relaxed, leave variants untouched (there's no valid color
+      // match to narrow to) and let the model rely on the colorRelaxed
+      // flag instead.
+      const variantFilter =
+        requestedColor && !relaxed.color
+          ? (v) => v.title.toLowerCase().includes(requestedColor)
+          : null;
+
       return {
-        results: products.map((p) => ({
-          productId: p.id,
-          title: p.title,
-          vendor: p.vendor || null,
-          priceMin: p.priceMin,
-          priceMax: p.priceMax,
-          imageUrl: p.imageUrls?.[0] || null,
-          productUrl: `https://${env.shopify.shopDomain}/products/${p.handle}`,
-          variants: p.Variant.map((v) => ({
-            variantId: v.id,
-            title: v.title,
-            price: v.price,
-          })),
-        })),
+        results: products.map((p) => {
+          const variants = variantFilter
+            ? p.Variant.filter(variantFilter)
+            : p.Variant;
+          return {
+            productId: p.id,
+            title: p.title,
+            vendor: p.vendor || null,
+            priceMin: p.priceMin,
+            priceMax: p.priceMax,
+            imageUrl: p.imageUrls?.[0] || null,
+            productUrl: `https://${env.shopify.shopDomain}/products/${p.handle}`,
+            variants: (variants.length ? variants : p.Variant).map((v) => ({
+              variantId: v.id,
+              title: v.title,
+              price: v.price,
+            })),
+          };
+        }),
         totalCount,
         moreAvailable: totalCount > products.length,
         // true = a hand-orientation filter was requested but found
-        // nothing, so these results were relaxed back to "any hand" —
-        // the model must say so plainly rather than presenting them as
-        // a match for the orientation the customer asked for.
-        orientationRelaxed,
+        // nothing, so results were relaxed back to "any hand" — the
+        // model must say so plainly rather than presenting them as a
+        // match for the orientation asked for.
+        orientationRelaxed: !!relaxed.orientation,
+        // true = a color filter was requested but found nothing, so
+        // results were relaxed back to "any color" — say so plainly,
+        // never present these as matching the color asked for.
+        colorRelaxed: !!relaxed.color,
         // true = a brand/vendor filter was requested but found nothing,
-        // so these results were relaxed back to "any brand" — the model
-        // must say so plainly (and must NOT claim these results are the
+        // so results were relaxed back to "any brand" — the model must
+        // say so plainly (and must NOT claim these results are the
         // requested brand — check the vendor field on each result
         // instead of asserting from memory).
-        vendorRelaxed,
+        vendorRelaxed: !!relaxed.vendor,
       };
     },
 

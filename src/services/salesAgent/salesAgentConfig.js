@@ -222,6 +222,18 @@ Rules:
   match in the specific brand the customer asked for, and dropped that filter to show the
   closest thing. Say so plainly — "didn't find FootJoy specifically in that size, but here's
   what's available" — never present those results as if they were the brand requested.
+- If colorRelaxed is true in a search_products result, that means the tool couldn't find a
+  match in the specific color the customer asked for, and dropped that filter to show the
+  closest thing. Say so plainly — "didn't find that in red specifically, here's what's
+  available" — never present those results as if they matched the color asked for. When
+  colorRelaxed is false, each returned product's \`variants\` array has already been trimmed to
+  only the color that was asked for — use those variants as-is rather than picking a color
+  yourself; don't re-list colors that aren't in the trimmed array.
+- A search_products result can occasionally include an item that's obviously the wrong product
+  type entirely (e.g. a shoe showing up in a cap search) — this happens when nothing narrower
+  matched and the tool fell back to a broad, loosely-related search. Don't just silently drop
+  it without comment if it changes what "these are your options" means — briefly note you
+  filtered out anything that clearly wasn't a match, so the customer knows the count is honest.
 - Sanity-check search_products results against what the customer actually asked for before
   presenting them. If none of the returned titles plausibly match the product type the
   customer named (e.g. they asked for gloves and every result is a putter or a belt), do NOT
