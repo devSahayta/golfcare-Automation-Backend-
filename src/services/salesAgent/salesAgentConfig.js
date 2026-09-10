@@ -132,7 +132,22 @@ function buildSystemPrompt(context) {
     : "";
 
   let membershipInstruction;
-  if (context.enrolmentPending) {
+  if (c?.isMember && c.onboardingState === "COMPLETED") {
+    // Hard priority gate — checked FIRST, before enrolmentPending or
+    // hasPitchedMembership. Previously, whether to pitch membership was
+    // decided by the STEP 1/2/3 logic below with no check of isMember at
+    // all; the model only avoided re-pitching if it happened to notice
+    // "Member: true" in the free-text customer card and reason about it
+    // correctly — which is exactly why it kept pitching membership to
+    // already-enrolled customers, and only stopped once the CUSTOMER
+    // explicitly said "I'm already a member" and made it impossible to
+    // miss in the conversation itself. A returning fully-enrolled
+    // customer should never see a membership pitch or invite again,
+    // under any circumstances, independent of turn count or whether it
+    // was pitched in THIS conversation.
+    membershipInstruction =
+      "This customer is ALREADY a Golf Care member with a completed profile. NEVER mention, pitch, or invite them to join Golf Care membership — not a bare invite, not benefits, nothing. If they bring it up themselves (e.g. ask what benefits they get), you can answer briefly using their existing membership, but do not treat it as a pitch opportunity or ask them to \"join\" anything.";
+  } else if (context.enrolmentPending) {
     const remaining = context.enrolmentMissingFields
       .map(
         (q) =>
@@ -287,6 +302,16 @@ Rules:
 - If you cannot complete something after a reasonable retry, tell the customer plainly what's
   happening in your own words — don't fabricate a specific cause like "backend hiccup" or "I've
   flagged this to our team" unless you actually called escalate_to_human.
+- Once you've sent a checkout link for a specific item in this conversation, do NOT regenerate
+  or resend it just because the customer replies with a filler acknowledgment ("ok", "okay",
+  "oky", "sure", "cool", "thanks", a thumbs up, etc.) that doesn't ask for anything new. Re-
+  running get_product/search_products/check_availability/create_checkout_link for the same item
+  and pasting the same link again looks like two separate orders were created, which is
+  confusing and untrustworthy even though the link itself is identical. Only generate a new
+  checkout link when the customer asks for a different item, a different quantity, explicitly
+  asks you to resend the link, or asks a genuinely new question you need to look something up
+  for. A bare acknowledgment after a checkout link just needs a short reply ("Sounds good — let
+  me know once you've completed it!") or no reply at all if nothing else is being asked.
 - This is a WhatsApp message, not a document. Use WhatsApp's own formatting only: *bold*
   (single asterisk), _italic_ (single underscore), ~strikethrough~. Never use **double
   asterisks**, markdown headers (#), horizontal rules (---), or tables — none of that
