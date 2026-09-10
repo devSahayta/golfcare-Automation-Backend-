@@ -26,6 +26,28 @@ function hasHallucinatedDomain(draftText) {
     (m) => m[1].toLowerCase() !== allowedDomain.toLowerCase(),
   );
 }
+
+// NEW — catches internal tool-output plumbing leaking straight into the
+// customer-facing message. Confirmed in production: a reply that opened
+// with "I see the results came back with `orientationRelaxed: true`,
+// which means the catalog doesn't separately tag right-hand as a
+// filter..." — the model narrating its own tool schema/field names to
+// the customer instead of just using the information silently. This is
+// not a phrasing nuance to leave to prompt instructions alone (same
+// class of thing as hasHallucinatedDomain above) — a customer should
+// never see a raw field name, boolean, or internal reasoning-about-the-
+// tool-output in their message, regardless of how the surrounding
+// sentence is worded. Field names are the actual JSON keys returned by
+// search_products (see salesAgentTools.js) plus a few generic internal-
+// sounding terms; deliberately NOT blocking on words like "variant" or
+// "available" alone since those are normal English a human agent would
+// also say.
+const INTERNAL_JARGON_RE =
+  /\b(orientationRelaxed|colorRelaxed|vendorRelaxed|moreAvailable|totalCount|variantId|productId|toolCalls|tool_use|tool_result|AGENT_INFERRED|SUPPLIER_CONFIRMED|MANUAL_OWNER)\b|`[a-zA-Z]+Relaxed`|\bthe results came back with\b/i;
+function leaksInternalJargon(draftText) {
+  return INTERNAL_JARGON_RE.test(draftText);
+}
+
 const PRICE_CLAIM_RE = /₹\s?[\d,]+/;
 const DISCOUNT_RE = /(\d+)\s?%\s?(off|discount)/i;
 const MEMBERSHIP_CLAIM_RE =
@@ -141,6 +163,10 @@ function runGuardrails({ draftText, toolCallLog, context }) {
 
   if (hasHallucinatedDomain(draftText)) {
     return { action: "block", reason: "hallucinated_url_domain" };
+  }
+
+  if (leaksInternalJargon(draftText)) {
+    return { action: "block", reason: "internal_jargon_leak" };
   }
 
   if (
