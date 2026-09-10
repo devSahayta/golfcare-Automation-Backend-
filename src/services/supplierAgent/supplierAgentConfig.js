@@ -193,7 +193,21 @@ function buildSystemPrompt(context) {
 
   const pendingSection = pendingList
     ? `You are collecting a stock check-in. Items still awaiting confirmation:\n${pendingList}\n\nThe supplier has only received a short WhatsApp template so far (a template opens the messaging window — it can't carry this whole list). If this itemized list hasn't been sent to them yet in this conversation, your reply should state it clearly (numbered, with SKU and product name) and ask them to confirm each one — don't wait silently for them to ask. Call confirm_availability once per item the supplier addresses, using the exact supplierProductId shown above. Don't guess which item they mean if it's ambiguous — ask.`
-    : "There is no open check-in for this supplier right now. If they're volunteering a stock update anyway, that's fine to acknowledge, but there's nothing pending to confirm against.";
+    : "There is no open check-in for this supplier right now (any earlier one has already been fully recorded). A bare acknowledgment like \"okay\", \"thanks\", or \"got it\" needs no tool call at all — just reply naturally, don't re-confirm anything. If they're volunteering a genuinely new stock update, that's fine to record, but there's nothing pending to confirm against otherwise.";
+
+  // Applies in both branches above: a supplierProductId only ever comes
+  // from the live pending-items list shown to you right now, or a
+  // reconcile_stock_list/matched-product result from earlier THIS turn —
+  // never something you're recalling from your own prior reply's text.
+  // Confirmed live: once a check-in's items scroll out of the pending
+  // list (already answered), the model had no valid id anymore but still
+  // called confirm_availability again on a plain "okay thanks", reusing
+  // the SKUs it had printed in its own earlier message as if they were
+  // the id — all five calls failed with supplier_product_not_found, and
+  // the resulting apology confused the supplier about whether their
+  // already-successful check-in had actually been recorded.
+  const idIntegrityNote =
+    "Never call confirm_availability or reconcile_stock_list with a supplierProductId (or item reference) you're recalling from your own earlier message text — a SKU you printed for the supplier is not an id. Only use one currently shown in the pending items list above, or one a tool result just gave you this turn. If you don't have a valid id and nothing new was said, don't call the tool — just reply normally.";
 
   return `You are Golf Care's WhatsApp assistant for supplier stock check-ins (golfcare.in, a
 20-year-old golf retail dropship business — Golf Care holds no stock itself, so these
@@ -201,6 +215,7 @@ confirmations are what the storefront's availability is based on).
 
 ${supplierCard}
 ${pendingSection}
+${idIntegrityNote}
 
 Attachments: a supplier message may contain "[Attached file — extracted contents below]" followed by
 the text pulled from a PDF or spreadsheet they sent — that's a real document, extracted
