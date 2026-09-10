@@ -21,7 +21,14 @@ function buildSalesAgentTools(context) {
   const customerId = context.customer?.id || context.conversation.customerId;
 
   return {
-    async search_products({ query, category, priceMin, priceMax, limit = 5 }) {
+    async search_products({
+      query,
+      category,
+      vendor,
+      priceMin,
+      priceMax,
+      limit = 5,
+    }) {
       // No embedding pipeline has been decided/built yet (open item —
       // the spec calls for pgvector similarity search, but nobody's
       // picked an embedding provider). This falls back to a keyword
@@ -61,6 +68,87 @@ function buildSalesAgentTools(context) {
         // search term here even though it reads like a real one.
       ]);
 
+      // Gender words are handled ONLY via the dedicated genderFilter
+      // below (a precise startsWith AND condition) — they must NOT also
+      // appear in the generic OR keyword list. Almost every product in
+      // this catalog is prefixed "Men's ..." or "Women's ...", so if a
+      // gender word is allowed to count as a standalone OR match, it
+      // alone is enough to match trousers, polos, caps, gloves —
+      // anything men's-branded — swamping the actual product-type words
+      // (shoes, spikeless, driver, etc.) that should be doing the real
+      // narrowing. This bit us directly: "men's spikeless shoes" started
+      // matching "Men's Tech Trousers" purely off the word "men's".
+      const GENDER_WORDS = new Set([
+        "men's",
+        "men",
+        "mens",
+        "women's",
+        "women",
+        "womens",
+        "ladies",
+        "junior's",
+        "juniors",
+        "kids",
+      ]);
+
+      // Orientation words are handled ONLY via the dedicated
+      // orientationFilter below, for the exact same reason as
+      // GENDER_WORDS above — "left"/"right"/"hand" appear constantly in
+      // completely unrelated product titles (e.g. "0211 Hellcat Putter
+      // -Black Hand-Right/Length-34 Inches", "Men's M8 Steel Golf Set -
+      // Left Hand..."), since club handedness is encoded in titles the
+      // same way glove handedness is. Left in the generic OR keyword
+      // pool, these words alone are enough to match putters, full club
+      // sets, and belts ahead of the actual gloves being searched for —
+      // this is exactly the bug that surfaced when a customer asked for
+      // "left hand black leather" gloves and got putters back instead.
+      const ORIENTATION_WORDS = new Set([
+        "left",
+        "right",
+        "hand",
+        "handed",
+        "lefty",
+        "righty",
+      ]);
+
+      // Color words are handled ONLY via the dedicated colorFilter below,
+      // for the same reason as GENDER_WORDS/ORIENTATION_WORDS — color
+      // usually lives in Variant.title ("Sky Blue", "Red", "Brown / UK
+      // 10"), not Product.title, so a color word left in the generic OR
+      // keyword pool matches ~zero titles and does nothing, while a
+      // co-occurring generic word ("cap", "shoe") matches nearly the
+      // whole category regardless of color. Declared up here (used by
+      // the `words` filter below) even though the actual colorFilter
+      // condition is built further down, once lowerCombined exists.
+      const COLOR_WORDS = [
+        "black",
+        "white",
+        "red",
+        "blue",
+        "navy",
+        "green",
+        "grey",
+        "gray",
+        "pink",
+        "orange",
+        "yellow",
+        "purple",
+        "brown",
+        "silver",
+        "gold",
+        "tan",
+        "charcoal",
+        "lavender",
+        "maroon",
+        "turquoise",
+        "beige",
+        "teal",
+        "olive",
+        "cream",
+        "coral",
+        "khaki",
+      ];
+
       // category used to be a hard AND filter against productType only —
       // but productType values are always specific ("Drivers", "Irons",
       // "Fairway Woods"), never a broad word like "clubs" or "gloves"
@@ -74,9 +162,16 @@ function buildSalesAgentTools(context) {
       const combinedQuery = category ? `${query} ${category}` : query;
 
       const words = combinedQuery
-        .replace(/[^\w\s]/g, "")
+        .replace(/[^\w\s']/g, "")
         .split(/\s+/)
-        .filter((w) => w.length > 2 && !STOPWORDS.has(w.toLowerCase()))
+        .filter(
+          (w) =>
+            w.length > 2 &&
+            !STOPWORDS.has(w.toLowerCase()) &&
+            !GENDER_WORDS.has(w.toLowerCase()) &&
+            !ORIENTATION_WORDS.has(w.toLowerCase()) &&
+            !COLOR_WORDS.includes(w.toLowerCase()),
+        )
         .slice(0, 8);
 
       // Cheap singularization — titles are singular ("... Driver"), but
@@ -92,6 +187,111 @@ function buildSalesAgentTools(context) {
         return { results: [] };
       }
 
+      // Explicit gender filter — a real AND condition, not just another
+      // OR keyword. Generic words like "shoes" match both genders'
+      // titles equally, so without this, a "men's" query still surfaces
+      // women's results whenever they happen to rank first with no
+      // relevance ordering. Uses startsWith, not contains: "Women's"
+      // literally contains the substring "men's" inside it (wo-MEN'S),
+      // so a naive contains check would wrongly match both genders.
+      const lowerCombined = combinedQuery.toLowerCase();
+      let genderFilter = null;
+      if (
+        /\bmen'?s\b/.test(lowerCombined) &&
+        !/\bwomen'?s\b/.test(lowerCombined)
+      ) {
+        genderFilter = { title: { startsWith: "Men's", mode: "insensitive" } };
+      } else if (
+        /\bwomen'?s\b/.test(lowerCombined) ||
+        /\bladies\b/.test(lowerCombined)
+      ) {
+        genderFilter = {
+          title: { startsWith: "Women's", mode: "insensitive" },
+        };
+      }
+      const genderConditions = genderFilter ? [genderFilter] : [];
+
+      // Explicit orientation filter — same shape as genderFilter, but
+      // checks BOTH Product.title and Variant.title, since this catalog
+      // is inconsistent about where handedness actually lives: some
+      // products encode it on the variant ("Left hand / Large"), others
+      // on the product itself ("...Glove - Right Hand", confirmed via
+      // the Dawn Patrol glove — no hand info on any of its variants at
+      // all). Checking only one location silently excludes real matches
+      // stored the other way, so this is an OR across both, applied as
+      // a real AND condition on the query as a whole.
+      let orientationFilter = null;
+      if (/\bleft\b/.test(lowerCombined)) {
+        orientationFilter = {
+          OR: [
+            { title: { contains: "Left Hand", mode: "insensitive" } },
+            {
+              Variant: {
+                some: { title: { contains: "Left hand", mode: "insensitive" } },
+              },
+            },
+          ],
+        };
+      } else if (/\bright\b/.test(lowerCombined)) {
+        orientationFilter = {
+          OR: [
+            { title: { contains: "Right Hand", mode: "insensitive" } },
+            {
+              Variant: {
+                some: {
+                  title: { contains: "Right hand", mode: "insensitive" },
+                },
+              },
+            },
+          ],
+        };
+      }
+      // Explicit vendor/brand filter — a real AND condition against
+      // Product.vendor, not a keyword in the generic OR pool. Brand
+      // names essentially never appear inside this catalog's product
+      // titles (e.g. "Men's Torque 2 MD Spiked Golf Shoes" has no
+      // "FootJoy" in it even though vendor="FootJoy"), so a brand word
+      // left in the generic keyword list matches ~zero titles and
+      // contributes nothing — while other generic words in the same
+      // query ("shoe", "shoes", "glove") match almost the entire
+      // category regardless of brand. Net effect without this filter:
+      // "FootJoy shoes" silently returns shoes of every brand. This is
+      // populated from the dedicated `vendor` tool argument — the model
+      // is instructed to pass a named brand there, not just fold it
+      // into `query`.
+      const vendorConditions = vendor
+        ? [{ vendor: { contains: vendor, mode: "insensitive" } }]
+        : [];
+
+      // Explicit color filter — checks BOTH Product.title and
+      // Variant.title, for the exact same reason as orientation above.
+      // Proven necessary by real data: most black spiked shoes in this
+      // catalog have color ONLY in Product.title ("...Golf Shoes -
+      // Black") with a bare "UK 9" variant title carrying no color at
+      // all — a Variant-title-only filter silently excluded every one
+      // of them (5 of 7 real matches for "black spiked UK 9" were
+      // dropped), while the 1-2 products that happen to bake color into
+      // the variant title ("UK 9 / Black") passed through fine. COLOR_WORDS
+      // itself is declared earlier (needed by the `words` filter above);
+      // this builds the actual condition once lowerCombined is available.
+      const requestedColor = COLOR_WORDS.find((c) =>
+        new RegExp(`\\b${c}\\b`).test(lowerCombined),
+      );
+      const colorFilter = requestedColor
+        ? {
+            OR: [
+              { title: { contains: requestedColor, mode: "insensitive" } },
+              {
+                Variant: {
+                  some: {
+                    title: { contains: requestedColor, mode: "insensitive" },
+                  },
+                },
+              },
+            ],
+          }
+        : null;
+
       const priceConditions = [];
       if (priceMin != null || priceMax != null) {
         const priceCond = {};
@@ -100,56 +300,154 @@ function buildSalesAgentTools(context) {
         priceConditions.push({ priceMin: priceCond });
       }
 
-      // Two-tier search: a query like "Callaway fairway wood" should
-      // prefer products whose TITLE actually says "fairway wood" over
-      // products that only match because the vendor is "Callaway" — a
-      // vendor-only match is true for all ~136 Callaway products in this
-      // catalog, so without this tiering, a brand name alone can swamp
-      // out genuinely relevant title matches with no way to tell them
-      // apart (no relevance ranking on a plain OR query).
       const titleOr = wordForms.map((w) => ({
         title: { contains: w, mode: "insensitive" },
       }));
+      const baseAnd = [
+        { OR: titleOr },
+        ...priceConditions,
+        ...genderConditions,
+      ];
+
+      // Attribute filters, in priority order — LAST item is dropped
+      // FIRST when a search returns zero results. This is the
+      // generalized replacement for what used to be two separate,
+      // copy-pasted relax blocks (one for orientation, one for vendor).
+      // Every recurring "customer says X, X lives on Variant/vendor not
+      // Product.title, so it must be a real AND filter not an OR
+      // keyword" case (hand, color, brand — and whatever the next one
+      // turns out to be) plugs into this one array instead of getting
+      // its own bespoke fallback block. Ordering reflects how load-
+      // bearing each constraint usually is to the customer: vendor
+      // (brand) is dropped last/most reluctantly since customers who
+      // name a brand usually mean it strictly; orientation is dropped
+      // first since "left/right" is sometimes just noise in the query.
+      const attributeFilters = [
+        { key: "orientation", condition: orientationFilter },
+        { key: "color", condition: colorFilter },
+        { key: "vendor", condition: vendorConditions[0] || null },
+      ].filter((f) => f.condition);
+
+      const relaxed = {}; // key -> true once that attribute has been dropped
+      let activeFilters = attributeFilters;
+      let usedWhere = {
+        status: "active",
+        AND: [...baseAnd, ...activeFilters.map((f) => f.condition)],
+      };
       let products = await prisma.product.findMany({
-        where: { status: "active", AND: [{ OR: titleOr }, ...priceConditions] },
-        take: Math.min(limit, 10),
-        include: { Variant: { take: 3 } },
+        where: usedWhere,
+        take: Math.min(limit, 15),
+        include: { Variant: { take: 25 } },
       });
 
-      // Fall back to the broader vendor/tags-inclusive search only if the
-      // stricter title-first pass found nothing — preserves support for
-      // vague/brand-only browsing ("show me Callaway stuff") without
-      // letting it dominate more specific queries.
+      // Honest relaxation: rather than silently returning empty (forcing
+      // the model to either go silent or guess from memory) or silently
+      // dropping ALL constraints at once (letting irrelevant results
+      // through with no signal), drop the least load-bearing remaining
+      // attribute filter, retry, and repeat until something matches or
+      // nothing's left to drop. Each dropped attribute is recorded in
+      // `relaxed` so the model can tell the customer honestly exactly
+      // which constraint didn't have a match, instead of presenting
+      // relaxed results as if they satisfied everything asked for.
+      while (products.length === 0 && activeFilters.length > 0) {
+        const [dropped, ...rest] = activeFilters;
+        relaxed[dropped.key] = true;
+        activeFilters = rest;
+        usedWhere = {
+          status: "active",
+          AND: [...baseAnd, ...activeFilters.map((f) => f.condition)],
+        };
+        products = await prisma.product.findMany({
+          where: usedWhere,
+          take: Math.min(limit, 15),
+          include: { Variant: { take: 25 } },
+        });
+      }
+
+      // Fall back to the broader vendor/tags-inclusive search only if
+      // even fully-relaxed title matching found nothing — preserves
+      // support for vague/brand-only browsing ("show me Callaway stuff")
+      // without letting it dominate more specific queries. Any attribute
+      // filter that's already been relaxed above must NOT be silently
+      // reimposed here — it was already proven to return zero.
       if (products.length === 0) {
         const broadOr = wordForms.flatMap((w) => [
           { title: { contains: w, mode: "insensitive" } },
           { vendor: { contains: w, mode: "insensitive" } },
           { tags: { has: w } },
         ]);
+        usedWhere = {
+          status: "active",
+          AND: [
+            { OR: broadOr },
+            ...priceConditions,
+            ...genderConditions,
+            ...activeFilters.map((f) => f.condition),
+          ],
+        };
         products = await prisma.product.findMany({
-          where: {
-            status: "active",
-            AND: [{ OR: broadOr }, ...priceConditions],
-          },
-          take: Math.min(limit, 10),
-          include: { Variant: { take: 3 } },
+          where: usedWhere,
+          take: Math.min(limit, 15),
+          include: { Variant: { take: 25 } },
         });
       }
 
+      // Total match count (not just what's shown) — lets the model
+      // honestly offer "want to see more?" instead of guessing whether
+      // more exist, or worse, implying these 5 are all there is.
+      const totalCount = await prisma.product.count({ where: usedWhere });
+
+      // When a color was requested AND actually satisfied (not
+      // relaxed), trim each product's variant list down to only the
+      // matching color. Without this, a product with both a "Red" and
+      // a "Sky Blue" variant would still show its full variant list, and
+      // the model has to correctly infer which one the customer meant —
+      // exactly the kind of inference that went wrong before. If color
+      // was relaxed, leave variants untouched (there's no valid color
+      // match to narrow to) and let the model rely on the colorRelaxed
+      // flag instead.
+      const variantFilter =
+        requestedColor && !relaxed.color
+          ? (v) => v.title.toLowerCase().includes(requestedColor)
+          : null;
+
       return {
-        results: products.map((p) => ({
-          productId: p.id,
-          title: p.title,
-          priceMin: p.priceMin,
-          priceMax: p.priceMax,
-          imageUrl: p.imageUrls?.[0] || null,
-          productUrl: `https://${env.shopify.shopDomain}/products/${p.handle}`,
-          variants: p.Variant.map((v) => ({
-            variantId: v.id,
-            title: v.title,
-            price: v.price,
-          })),
-        })),
+        results: products.map((p) => {
+          const variants = variantFilter
+            ? p.Variant.filter(variantFilter)
+            : p.Variant;
+          return {
+            productId: p.id,
+            title: p.title,
+            vendor: p.vendor || null,
+            priceMin: p.priceMin,
+            priceMax: p.priceMax,
+            imageUrl: p.imageUrls?.[0] || null,
+            productUrl: `https://${env.shopify.shopDomain}/products/${p.handle}`,
+            variants: (variants.length ? variants : p.Variant).map((v) => ({
+              variantId: v.id,
+              title: v.title,
+              price: v.price,
+            })),
+          };
+        }),
+        totalCount,
+        moreAvailable: totalCount > products.length,
+        // true = a hand-orientation filter was requested but found
+        // nothing, so results were relaxed back to "any hand" — the
+        // model must say so plainly rather than presenting them as a
+        // match for the orientation asked for.
+        orientationRelaxed: !!relaxed.orientation,
+        // true = a color filter was requested but found nothing, so
+        // results were relaxed back to "any color" — say so plainly,
+        // never present these as matching the color asked for.
+        colorRelaxed: !!relaxed.color,
+        // true = a brand/vendor filter was requested but found nothing,
+        // so results were relaxed back to "any brand" — the model must
+        // say so plainly (and must NOT claim these results are the
+        // requested brand — check the vendor field on each result
+        // instead of asserting from memory).
+        vendorRelaxed: !!relaxed.vendor,
       };
     },
 
@@ -197,13 +495,62 @@ function buildSalesAgentTools(context) {
           ),
         };
       }
+
+      // Re-query live DB state rather than trusting `context.customer` /
+      // `context.unansweredQuestions` as-is. Both are snapshotted ONCE at
+      // the start of the turn, before any tool calls in THIS turn have
+      // run. If enroll_membership already executed earlier in the same
+      // reply (which it can — the model is instructed to enroll, then
+      // continue straight into Part A questions in the same message),
+      // the stale `context` snapshot still shows the pre-enrollment
+      // world: isMember: false, unansweredQuestions: [] (since the
+      // context-builder had no reason to populate Part A questions for
+      // a not-yet-a-member customer at turn start). That stale "nothing
+      // to ask" signal is exactly what caused the model to skip
+      // onboarding and reveal the member code immediately after
+      // enrolling — a real customer got the code with zero profiling
+      // questions asked. Fetching fresh here makes get_customer_profile
+      // trustworthy no matter when in the turn it's called.
+      const liveCustomer = await prisma.customer.findUnique({
+        where: { id: customerId },
+      });
+      if (!liveCustomer) {
+        return {
+          isMember: false,
+          tier: null,
+          unansweredQuestions: context.unansweredQuestions.map(
+            (q) => q.fieldKey,
+          ),
+        };
+      }
+
+      const liveGolferProfile = await prisma.golferProfile.findUnique({
+        where: { customerId },
+      });
+
+      let liveUnanswered = context.unansweredQuestions.map((q) => q.fieldKey);
+      if (liveCustomer.isMember) {
+        // Once enrolled, the authoritative "what's left" list is
+        // whichever ENROLMENT_FIELD_KEYS have no OnboardingResponse row
+        // yet — computed fresh, not from the turn-start snapshot.
+        const answered = await prisma.onboardingResponse.findMany({
+          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
+          select: { fieldKey: true },
+        });
+        const answeredSet = new Set(answered.map((a) => a.fieldKey));
+        liveUnanswered = ENROLMENT_FIELD_KEYS.filter(
+          (k) => !answeredSet.has(k),
+        );
+      }
+
       return {
-        isMember: context.customer.isMember,
-        tier: context.customer.tier,
-        budgetTier: context.golferProfile?.budgetTier || null,
-        handicap: context.golferProfile?.handicap || null,
-        preferredBrands: context.golferProfile?.preferredBrands || [],
-        unansweredQuestions: context.unansweredQuestions.map((q) => q.fieldKey),
+        isMember: liveCustomer.isMember,
+        tier: liveCustomer.tier,
+        budgetTier: liveGolferProfile?.budgetTier || null,
+        handicap: liveGolferProfile?.handicap ?? null,
+        preferredBrands: liveGolferProfile?.preferredBrands || [],
+        unansweredQuestions: liveUnanswered,
+        onboardingComplete: liveCustomer.onboardingState === "COMPLETED",
       };
     },
 
@@ -231,10 +578,16 @@ function buildSalesAgentTools(context) {
     },
 
     async escalate_to_human({ reason, urgency }) {
-      await prisma.conversation.update({
-        where: { id: context.conversation.id },
-        data: { state: "AWAITING_HUMAN" },
-      });
+      // Deliberately does NOT change conversation.state anymore. This
+      // used to flip to AWAITING_HUMAN, which froze the AI out of the
+      // conversation until either a manual reset or the next customer
+      // message triggered auto-resume — in practice this kept surprising
+      // customers with silence or a generic holding message mid-flow,
+      // even for routine "I can't confirm real stock, flagging to the
+      // team" cases that don't need the AI to stop helping. This is now
+      // purely a notification: staff still see it in AuditLog for
+      // follow-up, but the AI keeps handling the conversation live,
+      // continuously, no matter how many times this fires.
       await prisma.auditLog.create({
         data: {
           actorType: "AGENT",
@@ -265,12 +618,38 @@ function buildSalesAgentTools(context) {
       // once in a conversation (e.g. forgetting it already enrolled the
       // customer mid-setup). Never regenerate a code or reset onboarding
       // progress for an existing member — that silently orphans old codes
-      // and confuses the customer about which code is real.
+      // and confuses the customer about which code is real. Also never
+      // hand back the code on a repeat call if onboarding hasn't actually
+      // finished yet — same protection as the fresh-enrollment path below,
+      // so a second enroll_membership call mid-setup can't leak the code
+      // early either.
       if (context.customer?.isMember) {
+        if (context.customer.onboardingState === "COMPLETED") {
+          return {
+            enrolled: true,
+            memberCode: context.customer.memberCode,
+            alreadyEnrolled: true,
+          };
+        }
+        const nextUnanswered = await prisma.onboardingResponse.findMany({
+          where: { customerId, fieldKey: { in: ENROLMENT_FIELD_KEYS } },
+          select: { fieldKey: true },
+        });
+        const answeredSet = new Set(nextUnanswered.map((a) => a.fieldKey));
+        const nextKey = ENROLMENT_FIELD_KEYS.find((k) => !answeredSet.has(k));
+        const nextQuestion = ENROLMENT_QUESTIONS.find(
+          (q) => q.fieldKey === nextKey,
+        );
         return {
           enrolled: true,
-          memberCode: context.customer.memberCode,
           alreadyEnrolled: true,
+          doNotRevealMemberCodeYet: true,
+          nextStep: {
+            instruction:
+              "This customer already enrolled but hasn't finished setup. Do NOT mention the member code yet — continue with the next unanswered question below.",
+            fieldKey: nextQuestion?.fieldKey,
+            prompt: nextQuestion?.prompt,
+          },
         };
       }
 
@@ -307,9 +686,31 @@ function buildSalesAgentTools(context) {
           onboardingStartedAt: new Date(),
         },
       });
+
+      // Self-contained next-step instruction — do NOT rely on the model
+      // remembering the STEP 3 prompt guidance from several messages
+      // back, or on context.unansweredQuestions being fresh (it's
+      // snapshotted at turn start and won't yet reflect this enrollment
+      // — see get_customer_profile's staleness comment for the exact
+      // bug this caused: a customer got their member code with zero
+      // onboarding questions asked, because the model checked
+      // get_customer_profile mid-turn, saw a stale empty
+      // unansweredQuestions list, and concluded there was nothing left
+      // to do). The first Part A question is generated fresh right
+      // here, in the same return value as the enrollment success, so
+      // the model has no path to "forget" it exists.
+      const firstQuestion = ENROLMENT_QUESTIONS[0];
+
       return {
         enrolled: true,
         memberCode: updated.memberCode,
+        doNotRevealMemberCodeYet: true,
+        nextStep: {
+          instruction:
+            "Do NOT mention the member code in this reply. In THIS SAME reply, briefly explain you'll ask a few quick setup questions, then ask exactly the question below and call record_profile_answer with the exact fieldKey shown once they answer. The member code is only revealed once record_profile_answer eventually returns enrolmentCompleted: true — never before that.",
+          fieldKey: firstQuestion?.fieldKey,
+          prompt: firstQuestion?.prompt,
+        },
       };
     },
 

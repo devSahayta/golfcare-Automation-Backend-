@@ -41,7 +41,7 @@ async function assembleContext({ conversationId }) {
   const answeredKeys = new Set(); // populated below only if participant is a customer
   let unansweredQuestions = [];
   let hasPitchedMembership = false;
-  let pendingCheck = null; // populated below only if participant is a supplier
+  let shouldPitchMembershipNow = false;
   let enrolmentPending = false;
   let enrolmentMissingFields = [];
 
@@ -76,6 +76,20 @@ async function assembleContext({ conversationId }) {
       (m) => m.sender === "AI_AGENT" && /member pricing|🏷️/.test(m.body || ""),
     );
 
+    // Deterministic pitch-timing signal — "pitch after a few genuine
+    // exchanges" left entirely to the model's own judgment turned out
+    // unreliable over long conversations (12+ turns with zero pitch seen
+    // in testing). Counting real customer turns here and telling the
+    // model explicitly when it's time removes that guesswork.
+    const customerTurnCount = recentMessages.filter(
+      (m) => m.sender === "CUSTOMER",
+    ).length;
+    shouldPitchMembershipNow =
+      !hasPitchedMembership &&
+      !enrolmentPending &&
+      !conversation.Customer?.isMember &&
+      customerTurnCount >= 3;
+
     // Part A enrolment gate — separate from Part C progressive profiling
     // above. IN_PROGRESS means they've said yes to joining but haven't
     // finished the fixed 7-question sequence yet.
@@ -97,13 +111,6 @@ async function assembleContext({ conversationId }) {
     }
   }
 
-  if (participantType === "SUPPLIER" && conversation.supplierId) {
-    pendingCheck = await prisma.supplierCheck.findFirst({
-      where: { supplierId: conversation.supplierId, status: "SENT" },
-      orderBy: { sentAt: "desc" },
-    });
-  }
-
   return {
     conversation,
     participantType,
@@ -112,7 +119,7 @@ async function assembleContext({ conversationId }) {
     supplier: conversation.Supplier || null,
     unansweredQuestions,
     hasPitchedMembership,
-    pendingCheck,
+    shouldPitchMembershipNow,
     enrolmentPending,
     enrolmentMissingFields,
     recentMessages,
