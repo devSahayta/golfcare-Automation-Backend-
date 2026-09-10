@@ -118,10 +118,24 @@ async function runAgent({ conversationId, config, sendFn }) {
     }
 
     const systemPrompt = config.buildSystemPrompt(context);
-    const history = context.recentMessages.map((m) => ({
-      role: m.sender === "CUSTOMER" ? "user" : "assistant",
-      content: m.body || "",
-    }));
+    // Module 5's check-in dispatch logs the WhatsApp template send itself
+    // as a Message row (sender: "SYSTEM", body: null) purely for an audit
+    // trail — it was never meant to become a turn in the model's own
+    // conversation history. Left in, `m.body || ""` turns each one into an
+    // empty-content "assistant" turn; a run of those right before the
+    // supplier's reply gives the model nothing indicating a check-in went
+    // out at all (confirmed live: a bare "yes"/"Okay" reply got a generic
+    // reply instead of the itemized list — the pendingCheck system-prompt
+    // section was correct, but the empty turns immediately before it in
+    // history were pure noise). Filtered out here rather than given
+    // placeholder text, since the pendingCheck section already tells the
+    // model everything it needs about what was sent and what's pending.
+    const history = context.recentMessages
+      .filter((m) => m.sender !== "SYSTEM" || m.body)
+      .map((m) => ({
+        role: m.sender === "CUSTOMER" ? "user" : "assistant",
+        content: m.body || "",
+      }));
 
     if (history.length === 0 || history[history.length - 1].role !== "user") {
       console.log(

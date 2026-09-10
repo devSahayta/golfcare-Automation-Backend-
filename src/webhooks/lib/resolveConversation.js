@@ -30,7 +30,21 @@ async function resolveConversation(waPhone) {
     },
     orderBy: { lastMessageAt: "desc" },
   });
-  if (existing) return existing;
+  if (existing) {
+    // Refresh on every inbound message — matches WhatsApp's own 24h
+    // free-text window, which resets with each new message from the
+    // sender, not a fixed clock from whenever the conversation row was
+    // first created. Previously this was only ever set once, at create
+    // time, and never touched again — so a conversation that had been
+    // genuinely active for days would still "expire" here exactly 24h
+    // after its first message, silently spawning a duplicate row on the
+    // next reply (confirmed live: two Conversation rows for the same
+    // supplier phone, one abandoned mid-history with real messages in it).
+    return prisma.conversation.update({
+      where: { id: existing.id },
+      data: { sessionExpiresAt: new Date(Date.now() + SESSION_HOURS * 60 * 60 * 1000) },
+    });
+  }
 
   const customer = await prisma.customer.findUnique({ where: { waPhone } });
   if (customer)
