@@ -13,9 +13,19 @@
 // ever been captured/documented in this codebase, so trusting it would be
 // guessing. Supported: PDF (text-layer only — a scanned/photographed PDF
 // with no extractable text fails honestly rather than attempting OCR,
-// which is out of scope for v1) and modern .xlsx (via exceljs; legacy
-// binary .xls is not supported — a different format entirely). Anything
-// else falls back to a plain/CSV-ish text decode.
+// which is out of scope for v1), modern .xlsx (via exceljs), and modern
+// .docx/.pptx (legacy binary .xls/.doc/.ppt are not supported — different
+// formats entirely, pre-dating the zip-based OOXML family these all
+// share). Anything else falls back to a plain/CSV-ish text decode.
+//
+// .docx and .pptx text extraction uses jszip (already an exceljs
+// transitive dependency, so this adds no new package — just promotes one
+// already in the tree) plus a plain regex pull of each format's own text
+// runs (<w:t> for Word, <a:t> for PowerPoint) straight out of their XML —
+// not a full OOXML parser. Same tradeoff already accepted for the CSV
+// fallback below: this is a text-extraction step for an LLM to read, not
+// a round-trippable document parser, so minor fidelity loss (run-level
+// formatting, footnotes, speaker notes) is acceptable.
 
 // PDF text extraction uses pdfjs-dist directly (Mozilla's own engine,
 // actively maintained), not the pdf-parse wrapper package — two real
@@ -36,6 +46,7 @@
 // import) has neither problem — used here for text extraction only, no
 // rendering/canvas APIs touched at all.
 const ExcelJS = require("exceljs");
+const JSZip = require("jszip");
 const { env } = require("../config/env");
 
 // pdfjs-dist's own Node-environment setup (not pdf-parse — that's already
@@ -150,7 +161,15 @@ function detectFormat(buffer) {
     buffer[2] === 0x03 &&
     buffer[3] === 0x04
   ) {
-    return "xlsx"; // zip signature — .xlsx is a zip archive under the hood
+    // .xlsx/.docx/.pptx all share this exact same zip signature (OOXML is
+    // just zip underneath) — can't tell them apart from the magic bytes
+    // alone. Each format's zip always contains one distinguishing part at
+    // a fixed path, and a zip's central directory stores filenames as
+    // plain text, so a raw byte search for that path is enough — no need
+    // to actually open the archive just to sniff the format.
+    if (buffer.includes("word/document.xml", 0, "latin1")) return "docx";
+    if (buffer.includes("ppt/presentation.xml", 0, "latin1")) return "pptx";
+    return "xlsx";
   }
   // Module 5.2 — a supplier's product photo needs to be recognized (and
   // NOT run through the text fallback, which would correctly-but-
@@ -200,6 +219,64 @@ async function extractXlsxText(buffer) {
     lines.push(cells.map(cellToText).join(" | "));
   });
   return lines.join("\n");
+}
+
+// Word wraps each run of text in <w:t>...</w:t> inside word/document.xml;
+// a paragraph (<w:p>) can contain several runs (bold/italic/etc. each
+// start a new run), so runs are joined with nothing between them and
+// paragraphs are what get the newline, matching how the document actually
+// reads. xml:space="preserve" on some <w:t> tags is irrelevant here — the
+// regex only cares about the tag itself, not its attributes.
+const WORD_RUN_RE = /<w:t[^>]*>([\s\S]*?)<\/w:t>/g;
+const WORD_PARAGRAPH_RE = /<w:p[ >][\s\S]*?<\/w:p>/g;
+
+function decodeXmlEntities(str) {
+  return str
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+async function extractDocxText(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const doc = zip.file("word/document.xml");
+  if (!doc) return "";
+  const xml = await doc.async("string");
+
+  const paragraphs = xml.match(WORD_PARAGRAPH_RE) || [];
+  const lines = paragraphs.map((para) => {
+    const runs = [...para.matchAll(WORD_RUN_RE)].map((m) => decodeXmlEntities(m[1]));
+    return runs.join("");
+  });
+  return lines.join("\n");
+}
+
+// PowerPoint's text runs (<a:t>) live one per slide file
+// (ppt/slides/slide1.xml, slide2.xml, ...) — sorted numerically so slides
+// read in presentation order, not zip-entry order (which isn't
+// guaranteed to match). Each slide's runs are joined with a space (a
+// slide is closer to a set of short labels/bullets than flowing
+// paragraphs), slides separated by a blank line so the model can tell
+// where one ends and the next begins.
+const PPT_RUN_RE = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
+const PPT_SLIDE_PATH_RE = /^ppt\/slides\/slide(\d+)\.xml$/;
+
+async function extractPptxText(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+  const slideFiles = Object.keys(zip.files)
+    .map((path) => ({ path, match: path.match(PPT_SLIDE_PATH_RE) }))
+    .filter((f) => f.match)
+    .sort((a, b) => Number(a.match[1]) - Number(b.match[1]));
+
+  const slideTexts = [];
+  for (const { path } of slideFiles) {
+    const xml = await zip.file(path).async("string");
+    const runs = [...xml.matchAll(PPT_RUN_RE)].map((m) => decodeXmlEntities(m[1]));
+    slideTexts.push(runs.join(" "));
+  }
+  return slideTexts.join("\n\n");
 }
 
 // Deliberately not a regex-based CSV parser (avoids any ReDoS surface on
@@ -301,6 +378,18 @@ async function extractTextFromDocument(buffer) {
       const text = (await extractXlsxText(buffer)).trim();
       if (!text) return { ok: false, reason: "spreadsheet_appears_empty" };
       return finalize(text, "xlsx");
+    }
+
+    if (format === "docx") {
+      const text = (await extractDocxText(buffer)).trim();
+      if (!text) return { ok: false, reason: "docx_appears_empty" };
+      return finalize(text, "docx");
+    }
+
+    if (format === "pptx") {
+      const text = (await extractPptxText(buffer)).trim();
+      if (!text) return { ok: false, reason: "pptx_appears_empty" };
+      return finalize(text, "pptx");
     }
 
     const text = extractDelimitedText(buffer).trim();
