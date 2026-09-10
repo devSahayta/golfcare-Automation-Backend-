@@ -2,6 +2,7 @@
 
 const { Router } = require("express");
 const express = require("express");
+const { waitUntil } = require("@vercel/functions");
 const { prisma } = require("../lib/prisma");
 const { resolveConversation } = require("./lib/resolveConversation");
 const { runAgent } = require("../services/agentEngine");
@@ -148,6 +149,21 @@ async function handleInboundMessage(evt) {
 
   // Awaited deliberately, not fire-and-forget — Vercel can freeze the
   // function right after res.send(), same gotcha Module 1 already hit.
+  //
+  // UPDATED: this await itself is unchanged and still correct — the
+  // Vercel-freeze concern this comment describes is real and still
+  // applies. What changed is WHERE this function gets called from: it
+  // used to be awaited directly inside router.post's handler, BEFORE
+  // res.status(200).send("ok") — meaning Samvaadik's forwarder sat
+  // waiting on this entire agent run (one or more Anthropic round trips +
+  // tool calls + the actual WhatsApp send) to finish before getting its
+  // ack. That easily exceeds Samvaadik's 10s forward timeout, and the
+  // resulting retry is exactly what produced the confirmed duplicate
+  // delivery in production (996768cb-..., ~12s apart). Now this whole
+  // chain runs inside waitUntil() (see router.post below), called AFTER
+  // the ack is already sent — so the "await until it's really done"
+  // behavior this comment cares about is fully preserved, it just no
+  // longer blocks the response Samvaadik is waiting on.
 
   try {
     await runAgent({
@@ -160,26 +176,75 @@ async function handleInboundMessage(evt) {
   }
 }
 
-router.post("/", async (req, res) => {
-  try {
-    const events = parseWebhook(req.body);
-
-    for (const evt of events) {
-      if (evt.event !== "message.received") {
-        console.warn(
-          `[samvaadik webhook] unrecognized event type "${evt.event}", skipping.`,
-          evt,
-        );
-        continue;
-      }
-      await handleInboundMessage(evt);
+// NEW: runs the event loop that used to sit directly inside router.post's
+// try block, now called via waitUntil AFTER the response has already been
+// sent (see router.post below) instead of before it. Nothing about what
+// this loop does has changed — same events, same handleInboundMessage,
+// same order — only when it runs relative to the HTTP response.
+//
+// One small, deliberate improvement bundled in: each event now gets its
+// own try/catch instead of one try/catch around the whole loop. Previously,
+// if handleInboundMessage threw for the first event in a batch, the loop
+// stopped immediately and any remaining events in that same webhook call
+// were never processed at all. That was never a behavior anything relied
+// on (nothing in the code comments suggests "stop on first error" was
+// intentional) — it was just an incidental side effect of the try/catch
+// being at the wrong scope. Isolating per-event also matters more now
+// than before: with the response already sent, there's no res.status(500)
+// left to signal a failure anyway, so silently dropping the rest of a
+// batch over one bad event would be a pure loss with no compensating
+// benefit.
+async function processEventsInBackground(events) {
+  for (const evt of events) {
+    if (evt.event !== "message.received") {
+      console.warn(
+        `[samvaadik webhook] unrecognized event type "${evt.event}", skipping.`,
+        evt,
+      );
+      continue;
     }
-
-    res.status(200).send("ok");
-  } catch (err) {
-    console.error("[samvaadik webhook] error:", err);
-    res.status(500).send("error");
+    try {
+      await handleInboundMessage(evt);
+    } catch (err) {
+      // Previously this error would propagate up to router.post's outer
+      // catch, which responded res.status(500) — that response no longer
+      // exists to send by the time this runs, since the ack already went
+      // out before this function was even called. Logging is correct
+      // here: Samvaadik already has its 200, and a 500 at this point
+      // wouldn't reach anyone meaningfully anyway.
+      console.error("[samvaadik webhook] error handling event:", err);
+    }
   }
+}
+
+router.post("/", async (req, res) => {
+  let events;
+  try {
+    events = parseWebhook(req.body);
+  } catch (err) {
+    // Parsing the payload itself is fast, synchronous work and can still
+    // fail before we know whether there's anything valid to process at
+    // all — this stays exactly as it was: a real error here still gets a
+    // real 500 response, unchanged from before.
+    console.error("[samvaadik webhook] error:", err);
+    return res.status(500).send("error");
+  }
+
+  // ── THE ACTUAL FIX ──────────────────────────────────────────────────────
+  // Payload is parsed and valid — nothing that follows needs to complete
+  // before Samvaadik gets its 200, so ack now and run the real processing
+  // (including the full agent turn per event) via waitUntil(), same
+  // pattern already applied to Samvaadik's own whatsappController.js.
+  // waitUntil specifically (not just "don't await") is required because
+  // this also runs on Vercel serverless — without it, Vercel can freeze
+  // this function shortly after the response is sent, which is exactly
+  // the failure mode the original "awaited deliberately" comment above
+  // was trying to avoid. waitUntil keeps the instance alive until
+  // processEventsInBackground's promise settles, without holding up the
+  // HTTP response itself — so both concerns (don't block the ack, don't
+  // get frozen mid-processing) are satisfied at the same time.
+  res.status(200).send("ok");
+  waitUntil(processEventsInBackground(events));
 });
 
 module.exports = router;
