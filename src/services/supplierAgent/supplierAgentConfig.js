@@ -4,48 +4,9 @@ const { runGuardrails } = require("./supplierGuardrails");
 
 const tools = [
   {
-    name: "confirm_availability",
-    description:
-      "Record the supplier's confirmed availability for one item from the pending check-in list. Call once per item they address.",
-    input_schema: {
-      type: "object",
-      properties: {
-        supplierProductId: {
-          type: "string",
-          description:
-            "The id of the pending item being confirmed, exactly as given to you in the pending items list.",
-        },
-        status: {
-          type: "string",
-          enum: ["IN_STOCK", "OUT_OF_STOCK", "ON_ORDER", "DISCONTINUED"],
-        },
-        leadTimeDays: {
-          type: "number",
-          description:
-            "Only if the supplier gave a lead time (e.g. for ON_ORDER).",
-        },
-        mrp: {
-          type: "number",
-          description:
-            "Only if the supplier quoted a current price (the MRP) for this item. Triggers a cost-price recalculation — see the Pricing section of your instructions.",
-        },
-        marginPercent: {
-          type: "number",
-          description:
-            "Only needed alongside mrp the FIRST time — once it's on file for this item you don't need to give it again. You'll be told via needsPricingInfo if it's actually required.",
-        },
-        gstPercent: {
-          type: "number",
-          description: "Same as marginPercent — only needed the first time, then remembered.",
-        },
-      },
-      required: ["supplierProductId", "status"],
-    },
-  },
-  {
     name: "reconcile_stock_list",
     description:
-      "Bulk counterpart to confirm_availability, for when the supplier sends a sheet/PDF/long list instead of addressing items one at a time. Extract every row that states a clear status from the attached document's text (already in your context) and submit them all in ONE call — do not call this once per row, and do not call confirm_availability for rows from a bulk list. Rows with no stated status should be left out — ask about those instead of guessing. If a row also states a price, include it as mrp — see the Pricing section of your instructions for how margin/GST factor in.",
+      "Record the supplier's confirmed availability — for ONE item they mention individually, several mentioned in a chat message, or every row of an attached sheet/PDF/document. Always the same call shape: pass every item you have a status for as one array in one call (a single-item array is completely normal for a bare chat mention — don't call this more than once per turn just because the array has only one entry). Matching to the actual product is done server-side by SKU or name — you never need an internal id. Rows with no stated status should be left out — ask about those instead of guessing. If a row also states a price, include it as mrp — see the Pricing section of your instructions for how margin/GST factor in.",
     input_schema: {
       type: "object",
       properties: {
@@ -81,6 +42,31 @@ const tools = [
         },
       },
       required: ["items"],
+    },
+  },
+  {
+    name: "list_pending_items",
+    description:
+      "Fetch the itemized list (SKU + product name) of the supplier's currently open check-in. Only call this when the pending count you were told is small enough to read out in a WhatsApp message — if it's large, don't call this at all; just tell the supplier the total count and ask them to send an updated stock sheet/document, give one blanket status for everything (use confirm_all_pending_items), or call out specific items by name/SKU that differ (use reconcile_stock_list). Calling this on a large check-in will be refused rather than returning a huge list.",
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "confirm_all_pending_items",
+    description:
+      "Apply ONE status to every item in the supplier's currently open check-in at once, in a single cheap call — use when the supplier gives a single blanket answer for everything (e.g. \"all in stock\", \"everything's fine\", \"same as last time\") instead of addressing items individually or sending a sheet. Safe and efficient at any catalog size, including thousands of items — never try to enumerate every item yourself into reconcile_stock_list for a blanket reply like this, that both costs far more and can fail outright on a large catalog.",
+    input_schema: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["IN_STOCK", "OUT_OF_STOCK", "ON_ORDER", "DISCONTINUED"],
+        },
+        leadTimeDays: {
+          type: "number",
+          description: "Only if the supplier gave one lead time that applies to everything (e.g. for a blanket ON_ORDER).",
+        },
+      },
+      required: ["status"],
     },
   },
   {
@@ -182,32 +168,28 @@ function buildSystemPrompt(context) {
     ? `Supplier: ${supplier.name}${supplier.contactName ? ` (contact: ${supplier.contactName})` : ""}`
     : "Unknown supplier — no Supplier record linked to this conversation.";
 
-  const pendingList = check?.items?.length
-    ? check.items
-        .map(
-          (item) =>
-            `- supplierProductId: ${item.supplierProductId} | SKU: ${item.sku || "n/a"} | ${item.productTitle}${item.variantTitle ? ` (${item.variantTitle})` : ""}`,
-        )
-        .join("\n")
-    : null;
+  // Deliberately NEVER embeds the actual item list here, at any size —
+  // confirmed live at real scale (a ~2,200-item check-in): printing every
+  // pending item into the system prompt on every single turn/iteration
+  // sent ~180K input tokens per API call, ~718K for one reply (~$2.20),
+  // and separately, the model tried to enumerate all 2,200+ items into
+  // one reconcile_stock_list call for a blanket "all in stock" reply,
+  // which is both hugely expensive in output tokens and can silently
+  // truncate mid-call (the model itself reported "having a technical
+  // issue submitting the full list in one go"). A bare count costs a
+  // fixed few tokens regardless of catalog size; list_pending_items lets
+  // the model fetch the real list on demand ONLY when small enough to be
+  // useful, and confirm_all_pending_items handles the blanket-reply case
+  // as a single cheap backend operation instead of a giant tool call.
+  const pendingCount = check?.items?.length || 0;
 
-  const pendingSection = pendingList
-    ? `You are collecting a stock check-in. Items still awaiting confirmation:\n${pendingList}\n\nThe supplier has only received a short WhatsApp template so far (a template opens the messaging window — it can't carry this whole list). If this itemized list hasn't been sent to them yet in this conversation, your reply should state it clearly (numbered, with SKU and product name) and ask them to confirm each one — don't wait silently for them to ask. Call confirm_availability once per item the supplier addresses, using the exact supplierProductId shown above. Don't guess which item they mean if it's ambiguous — ask.`
-    : "There is no open check-in for this supplier right now (any earlier one has already been fully recorded). A bare acknowledgment like \"okay\", \"thanks\", or \"got it\" needs no tool call at all — just reply naturally, don't re-confirm anything. If they're volunteering a genuinely new stock update, that's fine to record, but there's nothing pending to confirm against otherwise.";
-
-  // Applies in both branches above: a supplierProductId only ever comes
-  // from the live pending-items list shown to you right now, or a
-  // reconcile_stock_list/matched-product result from earlier THIS turn —
-  // never something you're recalling from your own prior reply's text.
-  // Confirmed live: once a check-in's items scroll out of the pending
-  // list (already answered), the model had no valid id anymore but still
-  // called confirm_availability again on a plain "okay thanks", reusing
-  // the SKUs it had printed in its own earlier message as if they were
-  // the id — all five calls failed with supplier_product_not_found, and
-  // the resulting apology confused the supplier about whether their
-  // already-successful check-in had actually been recorded.
-  const idIntegrityNote =
-    "Never call confirm_availability or reconcile_stock_list with a supplierProductId (or item reference) you're recalling from your own earlier message text — a SKU you printed for the supplier is not an id. Only use one currently shown in the pending items list above, or one a tool result just gave you this turn. If you don't have a valid id and nothing new was said, don't call the tool — just reply normally.";
+  const pendingSection =
+    pendingCount > 0
+      ? `You are collecting a stock check-in — ${pendingCount} item(s) still awaiting confirmation. The supplier has only received a short WhatsApp template so far (a template opens the messaging window — it can't carry an itemized list). Decide how to proceed based on the count:
+- Small (roughly under 40): call list_pending_items to get the actual SKU/name list, then state it clearly in your reply (numbered) and ask them to confirm each one.
+- Large: don't call list_pending_items — just tell the supplier the total count and ask them to either send an updated stock sheet/document, reply with one blanket status if everything's the same (use confirm_all_pending_items), or call out specific items by name/SKU that differ (use reconcile_stock_list).
+Whichever path, use reconcile_stock_list for anything the supplier addresses by name/SKU (one item or several — matching is server-side, you never need an internal id) and confirm_all_pending_items only for a genuine blanket answer covering everything at once. Don't guess which item they mean if it's ambiguous — ask.`
+      : "There is no open check-in for this supplier right now (any earlier one has already been fully recorded). A bare acknowledgment like \"okay\", \"thanks\", or \"got it\" needs no tool call at all — just reply naturally, don't re-confirm anything. If they're volunteering a genuinely new stock update, that's fine to record via reconcile_stock_list, but there's nothing pending to confirm against otherwise.";
 
   return `You are Golf Care's WhatsApp assistant for supplier stock check-ins (golfcare.in, a
 20-year-old golf retail dropship business — Golf Care holds no stock itself, so these
@@ -215,19 +197,21 @@ confirmations are what the storefront's availability is based on).
 
 ${supplierCard}
 ${pendingSection}
-${idIntegrityNote}
 
 Attachments: a supplier message may contain "[Attached file — extracted contents below]" followed by
 the text pulled from a PDF or spreadsheet they sent — that's a real document, extracted
 automatically, not something the supplier typed. If it looks like a stock list (multiple
 rows with product/SKU and a status), use reconcile_stock_list with every row that states a
-clear status, submitted in one call — never confirm_availability one row at a time for a
-list like this. reconcile_stock_list's result has three parts:
+clear status, submitted in one call — never call it once per row for a list like this.
+reconcile_stock_list's result has three parts:
 - applied — already recorded, just mention what changed.
 - ambiguous — matched more than one plausible product; tell the supplier which item and list
   the candidate names, ask them to pick one. Don't guess.
 - unmatched — no product in their catalog looked like a match. Treat each one as a possible
-  new product — see "New products" below.
+  new product — see "New products" below. EXCEPT: if the result also has tooManyNewProducts:
+  true, unmatched comes back empty on purpose — there were too many to onboard one by one (see
+  unmatchedCount). Don't try create_product_draft for any of them; tell the supplier a human
+  will review this batch, and call escalate_to_human ONCE for the whole batch, not per item.
 - needsPricingInfo — items whose stock update went through fine, but a price was given without
   a margin/GST on file to compute a cost price from. Ask the supplier specifically about these
   items' margin and GST (not the whole list again) in the same reply.
@@ -241,8 +225,8 @@ remember": the first time a product's price is confirmed, ask the supplier what 
 GST % apply, and pass them along with the mrp. After that, don't ask again for that same
 product — future price updates only need the new mrp, the tool already has margin/GST on
 file and will recompute the cost price and update Shopify's live price to match. You'll know
-you still need to ask because the tool tells you so (needsPricingInfo on confirm_availability/
-reconcile_stock_list) — don't ask preemptively "just in case," only when told it's needed.
+you still need to ask because the tool tells you so (needsPricingInfo on reconcile_stock_list) —
+don't ask preemptively "just in case," only when told it's needed.
 
 IMPORTANT — don't reprocess the same list twice: the full text of an attachment stays visible
 to you in the conversation history on every later turn, not just the turn it arrived on. If

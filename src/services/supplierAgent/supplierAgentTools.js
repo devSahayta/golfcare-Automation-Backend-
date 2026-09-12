@@ -12,36 +12,20 @@ function buildSupplierAgentTools(context) {
   const supplier = context.supplier;
 
   return {
-    async confirm_availability({ supplierProductId, status, leadTimeDays, mrp, marginPercent, gstPercent }) {
-      if (!supplier) return { error: "no_supplier_on_conversation" };
-
-      const supplierProduct = await prisma.supplierProduct.findUnique({
-        where: { id: supplierProductId },
-      });
-      if (!supplierProduct || supplierProduct.supplierId !== supplier.id) {
-        return { error: "supplier_product_not_found" };
-      }
-
-      const result = await applyConfirmation({
-        supplier,
-        supplierProduct,
-        status,
-        leadTimeDays: leadTimeDays ?? null,
-        mrp: mrp ?? null,
-        marginPercent: marginPercent ?? null,
-        gstPercent: gstPercent ?? null,
-      });
-
-      return { recorded: true, ...result };
-    },
-
-    // Bulk counterpart to confirm_availability, for a supplier-sent
-    // sheet/PDF: the model extracts rows from the document text already
-    // in its context and submits them all in one call (avoids blowing
-    // through agentMaxToolIterations one row at a time, and avoids
-    // needing the model to already know exact supplierProductIds the way
-    // the narrow pendingCheck list lets it for confirm_availability).
-    // Matching is server-side, against this supplier's full catalog.
+    // Handles one item or many — a bare chat mention ("Ping driver is out
+    // of stock") is just a one-element items array, same shape and same
+    // handler as a whole sheet's worth of rows. Matching is server-side
+    // (matchSupplierProduct, against this supplier's full catalog), so the
+    // model never needs to know an internal id — this used to be a
+    // separate confirm_availability tool keyed by an exact supplierProductId
+    // "from the pending list," which broke in two ways confirmed live:
+    // (1) once an item's check-in was answered it fell out of the visible
+    // list, and the model reused a printed SKU as if it were the id
+    // instead of recognizing it had nothing valid to call with, and (2) at
+    // real catalog scale (thousands of pending items) embedding that list
+    // in the system prompt every turn cost ~180K input tokens per API call.
+    // Folding into this single name/SKU-matched tool removes both classes
+    // of bug by construction, not just by better prompting.
     async reconcile_stock_list({ items }) {
       if (!supplier) return { error: "no_supplier_on_conversation" };
       if (!Array.isArray(items) || items.length === 0) {
@@ -97,7 +81,171 @@ function buildSupplierAgentTools(context) {
         }
       }
 
-      return { applied, ambiguous, unmatched, needsPricingInfo };
+      // Backend-enforced cap on how many genuinely-new (unmatched) rows
+      // get handed back for one-by-one onboarding — see env.js. Each one
+      // the model tries to onboard costs a real Shopify product creation
+      // and an approval email; a sheet with dozens of new rows would
+      // otherwise try to create dozens of drafts (and send dozens of
+      // emails) in one turn. Above the cap, the model is told to escalate
+      // the whole batch instead of attempting each one.
+      const tooManyNewProducts = unmatched.length > env.supplierBulkNewProductLimit;
+
+      return {
+        applied,
+        ambiguous,
+        unmatched: tooManyNewProducts ? [] : unmatched,
+        needsPricingInfo,
+        ...(tooManyNewProducts && {
+          tooManyNewProducts: true,
+          unmatchedCount: unmatched.length,
+          guidance:
+            "Too many unrecognized rows to onboard individually. Don't call create_product_draft for these — tell the supplier a human will review this batch of new products separately, and call escalate_to_human ONCE for the whole batch (not once per item).",
+        }),
+      };
+    },
+
+    // Backend-enforced cap, not just prompt guidance — the system prompt
+    // already tells the model not to call this for a large check-in, but
+    // that alone isn't reliable (confirmed live: an earlier instruction of
+    // this exact shape was ignored). Refusing outright here is a hard
+    // guarantee this can never re-inflate the system prompt's turn history
+    // with a huge tool result, regardless of what the model decides to do.
+    async list_pending_items() {
+      if (!supplier) return { error: "no_supplier_on_conversation" };
+      const check = await prisma.supplierCheck.findFirst({
+        where: { supplierId: supplier.id, status: "SENT" },
+        orderBy: { sentAt: "desc" },
+      });
+      const items = Array.isArray(check?.items) ? check.items : [];
+      if (items.length === 0) return { error: "no_open_check_in" };
+
+      if (items.length > env.supplierListableItemLimit) {
+        return {
+          error: "too_many_items_to_list",
+          count: items.length,
+          guidance:
+            "Too many pending items to read out in a message. Tell the supplier the count and ask for a stock sheet, a blanket status (confirm_all_pending_items), or specific items by name/SKU (reconcile_stock_list).",
+        };
+      }
+
+      return {
+        items: items.map((item) => ({
+          sku: item.sku || null,
+          productTitle: item.productTitle,
+          variantTitle: item.variantTitle || null,
+        })),
+      };
+    },
+
+    // The blanket-reply counterpart to reconcile_stock_list — one status
+    // applied to every item in the currently open check-in, as a single
+    // cheap backend operation instead of a giant per-item tool call.
+    // Confirmed live: without this, a supplier's "all in stock" on a
+    // ~2,200-item check-in made the model try to enumerate every single
+    // item into reconcile_stock_list itself, which is both far more
+    // expensive and can silently truncate mid-call at that size (the model
+    // reported "having a technical issue submitting the full list in one
+    // go" — really a hit output-token ceiling, not a real system fault).
+    //
+    // Every item's own SupplierProduct record gets updated regardless of
+    // catalog size (a single bulk query — the real source of truth for
+    // "what did this supplier last say"). AvailabilityState/Shopify sync
+    // goes through the normal setAvailability() path so the DB write,
+    // AvailabilityLog, and `availability.changed` event all happen the
+    // usual way — but the live Shopify inventory write (2-3 Admin API
+    // calls each) is only attempted inline for the first
+    // bulkConfirmShopifySyncCap items, processed with bounded concurrency;
+    // see env.js for why doing this inline for thousands of items isn't
+    // safe to attempt in one request. Anything beyond the cap still gets
+    // its DB state updated correctly, just not an inline Shopify push —
+    // logged to AuditLog as deferred rather than silently dropped.
+    async confirm_all_pending_items({ status, leadTimeDays }) {
+      if (!supplier) return { error: "no_supplier_on_conversation" };
+
+      const check = await prisma.supplierCheck.findFirst({
+        where: { supplierId: supplier.id, status: "SENT" },
+        orderBy: { sentAt: "desc" },
+      });
+      if (!check) return { error: "no_open_check_in" };
+
+      const items = Array.isArray(check.items) ? check.items : [];
+      const supplierProductIds = items.map((i) => i.supplierProductId).filter(Boolean);
+      if (supplierProductIds.length === 0) return { error: "check_in_has_no_items" };
+
+      const supplierProducts = await prisma.supplierProduct.findMany({
+        where: { id: { in: supplierProductIds }, supplierId: supplier.id },
+      });
+
+      await prisma.supplierProduct.updateMany({
+        where: { id: { in: supplierProducts.map((sp) => sp.id) } },
+        data: { lastConfirmedStatus: status, lastConfirmedAt: new Date() },
+      });
+
+      // Module 2's fan-in policy: only the primary supplier's confirmation
+      // drives the actual storefront-facing AvailabilityState.
+      const primaryTargets = supplierProducts.filter((sp) => sp.isPrimary && sp.variantId);
+      const syncCap = env.bulkConfirmShopifySyncCap;
+
+      const [syncedResults, deferredResults] = await Promise.all([
+        mapWithConcurrency(primaryTargets.slice(0, syncCap), 3, (sp) =>
+          setAvailability({
+            variantId: sp.variantId,
+            productId: sp.productId,
+            status,
+            source: "SUPPLIER_CONFIRMED",
+            changedBy: supplier.id,
+            leadTimeDays: leadTimeDays ?? null,
+          }),
+        ),
+        mapWithConcurrency(primaryTargets.slice(syncCap), 20, (sp) =>
+          setAvailability({
+            variantId: sp.variantId,
+            productId: sp.productId,
+            status,
+            source: "SUPPLIER_CONFIRMED",
+            changedBy: supplier.id,
+            leadTimeDays: leadTimeDays ?? null,
+            skipShopifySync: true,
+          }),
+        ),
+      ]);
+
+      if (deferredResults.length > 0) {
+        await prisma.auditLog.create({
+          data: {
+            actorType: "SYSTEM",
+            action: "shopify_inventory_sync_deferred_bulk_confirm",
+            entityType: "SupplierCheck",
+            entityId: check.id,
+            afterState: {
+              supplierId: supplier.id,
+              status,
+              deferredCount: deferredResults.length,
+            },
+            source: "supplier_agent",
+          },
+        });
+      }
+
+      await prisma.supplierCheck.update({
+        where: { id: check.id },
+        data: {
+          status: "ANSWERED",
+          respondedAt: new Date(),
+          parsedBy: "supplier_agent",
+          rawReplies: {
+            ...(check.rawReplies || {}),
+            blanketConfirmation: { status, confirmedAt: new Date().toISOString() },
+          },
+        },
+      });
+
+      return {
+        totalItems: items.length,
+        confirmedCount: supplierProducts.length,
+        shopifySynced: syncedResults.length,
+        shopifyDeferred: deferredResults.length,
+      };
     },
 
     // Module 5.2 — a product the supplier mentioned that isn't in the
@@ -520,6 +668,25 @@ async function applyConfirmation({
 
 function numberOrNull(value) {
   return value == null ? null : Number(value);
+}
+
+// confirm_all_pending_items' bulk-apply helper — runs `fn` over `items`
+// with at most `limit` in flight at once. A plain Promise.all would fire
+// every item's setAvailability() (each its own DB transaction, and
+// sometimes several Shopify API calls) all at the same instant; bounded
+// concurrency keeps that from hammering Postgres/Shopify at real catalog
+// scale while still being far faster than a fully sequential loop.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = [];
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await fn(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 // --- reconcile_stock_list matching (v1 heuristic — see the note on

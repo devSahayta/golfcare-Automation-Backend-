@@ -40,6 +40,7 @@ function invalidateProductCache(_variantId) {
  * @param {number} [input.leadTimeDays]
  * @param {string} [input.note]
  * @param {number} [input.ttlHours] - overrides the default TTL (env AVAILABILITY_TTL_HOURS) for this write
+ * @param {boolean} [input.skipShopifySync] - skip the Shopify write-back for this call (DB stays the source of truth either way). Used by bulk callers confirming hundreds/thousands of variants in one request — each Shopify write is itself 2-3 Admin API calls (see shopifyInventory.js), so doing it inline for every item risks the request timing out and hammering Shopify's rate limit; see supplierAgentTools.js's confirm_all_pending_items for the bounded-inline-count pattern this enables.
  */
 async function setAvailability({
   variantId,
@@ -50,6 +51,7 @@ async function setAvailability({
   leadTimeDays = null,
   note = null,
   ttlHours,
+  skipShopifySync = false,
 }) {
   if (!variantId) throw new Error("setAvailability: variantId is required");
   if (!status) throw new Error("setAvailability: status is required");
@@ -129,6 +131,22 @@ async function setAvailability({
   );
 
   invalidateProductCache(variantId);
+
+  if (skipShopifySync) {
+    // The DB write above already committed — that's Golf Care OS's real
+    // source of truth. This just leaves a breadcrumb for the scheduler's
+    // shopifySyncQueueDrain job to push the Shopify inventory level later,
+    // instead of silently never syncing it at all.
+    await prisma.shopifySyncQueue
+      .create({ data: { variantId, status } })
+      .catch((err) => {
+        console.error(
+          `[availabilityService] failed to enqueue deferred Shopify sync for variant ${variantId}:`,
+          err.message,
+        );
+      });
+    return { ...availabilityState, shopifySynced: false, shopifySyncSkipped: true };
+  }
 
   const shopifyResult = await writeAvailabilityToShopify(
     { shopifyVariantId: variant.shopifyVariantId },
