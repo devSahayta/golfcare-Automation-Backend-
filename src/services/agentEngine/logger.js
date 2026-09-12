@@ -37,4 +37,42 @@ async function logAudit({ action, conversationId, before, after }) {
   });
 }
 
-module.exports = { logMessage, logAudit };
+// NEW — one row per agent turn, so real cost can be queried with SQL
+// (SUM by conversationId, by day, by outcome, etc.) instead of only
+// existing as console.log lines. usage/cost come from toolLoop.js's real
+// response.usage tracking via agentEngine/index.js — never invented here,
+// this function just persists what it's given. Failure to write a usage
+// row should never break the actual conversation flow (the customer
+// already got their reply by the time this is called), so this
+// deliberately swallows its own errors rather than throwing — same
+// best-effort spirit as releaseLock in index.js.
+async function logUsage({
+  conversationId,
+  agentName,
+  inputTokens,
+  outputTokens,
+  costUsd,
+  costInr,
+  toolCallCount,
+  outcome,
+}) {
+  return prisma.agentUsage
+    .create({
+      data: {
+        conversationId,
+        agentName: agentName || "unknown",
+        inputTokens: inputTokens || 0,
+        outputTokens: outputTokens || 0,
+        costUsd: costUsd || 0,
+        costInr: costInr || 0,
+        toolCallCount: toolCallCount || 0,
+        outcome,
+      },
+    })
+    .catch((err) => {
+      console.error("[logger] logUsage failed:", err.message);
+      return null;
+    });
+}
+
+module.exports = { logMessage, logAudit, logUsage };

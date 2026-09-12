@@ -27,6 +27,10 @@ const anthropic = new Anthropic({
  * @param {Object.<string, Function>} input.toolHandlers - name -> async (input) => output
  * @param {Array} input.history - [{role: "user"|"assistant", content: string}]
  * @param {number} input.maxIterations
+ * @returns {Promise<{finalText: string|null, toolCallLog: Array, hitIterationCap: boolean, stopReason: string, usage: {inputTokens: number, outputTokens: number}}>}
+ *   `usage` is the REAL token count summed across every Anthropic API call this
+ *   invocation made (every loop iteration is a separate billed call) — not an
+ *   estimate. Use it to compute exact per-conversation cost.
  */
 async function runToolLoop({
   systemPrompt,
@@ -39,6 +43,15 @@ async function runToolLoop({
   const toolCallLog = [];
   let iterations = 0;
 
+  // Real token usage, accumulated across every Anthropic call this loop
+  // makes (every iteration is a separate billed API call — see the
+  // per-iteration timing logs below). This is the ACTUAL data
+  // response.usage gives back on every call, not an estimate — summing
+  // it here is what lets a caller compute real, exact per-conversation
+  // cost afterward instead of guessing from typical token counts.
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+
   while (true) {
     iterations += 1;
     if (iterations > maxIterations) {
@@ -47,6 +60,10 @@ async function runToolLoop({
         toolCallLog,
         hitIterationCap: true,
         stopReason: "max_iterations",
+        usage: {
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+        },
       };
     }
 
@@ -67,6 +84,12 @@ async function runToolLoop({
     });
     console.log(
       `[toolLoop] iteration ${iterations}: anthropic.messages.create took ${Date.now() - apiCallStartedAt}ms`,
+    );
+
+    totalInputTokens += response.usage?.input_tokens || 0;
+    totalOutputTokens += response.usage?.output_tokens || 0;
+    console.log(
+      `[toolLoop] iteration ${iterations}: input_tokens=${response.usage?.input_tokens ?? "n/a"} output_tokens=${response.usage?.output_tokens ?? "n/a"} (running total: ${totalInputTokens} in / ${totalOutputTokens} out)`,
     );
 
     const toolUseBlocks = response.content.filter((b) => b.type === "tool_use");
@@ -105,6 +128,10 @@ async function runToolLoop({
         toolCallLog,
         hitIterationCap: false,
         stopReason: response.stop_reason,
+        usage: {
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+        },
       };
     }
 

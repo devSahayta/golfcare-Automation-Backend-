@@ -9,6 +9,13 @@ const { ENROLMENT_QUESTIONS } = require("./enrolmentQuestions");
 const CONSENT_NOTICE_LINE =
   "Membership is free — it gets you member pricing, first access to new stock, and a golf expert on this number whenever you need one. May we send you occasional offers and reminders on WhatsApp? You can stop any time by replying STOP.";
 
+// Self-identifies for AgentUsage cost tracking (see agentEngine/index.js) —
+// lets cost be grouped/queried per agent type once more than one config
+// exists (sales, supplier, future ones), without agentEngine needing to
+// guess which agent ran from conversation shape. Every agent config should
+// export this same field with its own name.
+const agentName = "sales";
+
 const tools = [
   {
     name: "search_products",
@@ -356,4 +363,4 @@ function buildToolHandlers(context) {
   return buildSalesAgentTools(context);
 }
 
-module.exports = { tools, buildSystemPrompt, buildToolHandlers };
+module.exports = { tools, buildSystemPrompt, buildToolHandlers, agentName };

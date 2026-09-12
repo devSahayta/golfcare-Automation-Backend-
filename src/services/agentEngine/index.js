@@ -20,7 +20,45 @@ const { env } = require("../../config/env");
 const { assembleContext } = require("./contextAssembler");
 const { runToolLoop } = require("./toolLoop");
 const { runGuardrails: runDefaultGuardrails } = require("./guardrails");
-const { logMessage, logAudit } = require("./logger");
+const { logMessage, logAudit, logUsage } = require("./logger");
+
+// Cost-estimate constants — ONLY used to print an approximate $/₹ figure
+// next to the real, exact token counts in the log line below. The token
+// counts themselves (from toolLoop.js's usage tracking, which reads the
+// actual response.usage the Anthropic API returns on every call) are the
+// real, authoritative numbers; this conversion is just a convenience so
+// nobody has to do the math by hand from the logs every time. Update
+// these two rates if the model changes or Anthropic's pricing changes —
+// current as of Sept 2026 for Claude Sonnet 4.6 ($3/$15 per million
+// input/output tokens). USD_TO_INR is a rough static rate, not fetched
+// live — good enough for a ballpark next to real token counts, not
+// intended as a billing-accurate conversion.
+const COST_INPUT_USD_PER_MTOK = 3;
+const COST_OUTPUT_USD_PER_MTOK = 15;
+const USD_TO_INR = 95;
+
+function estimateCostInr(usage) {
+  if (!usage) return null;
+  const inputCost = (usage.inputTokens / 1_000_000) * COST_INPUT_USD_PER_MTOK;
+  const outputCost =
+    (usage.outputTokens / 1_000_000) * COST_OUTPUT_USD_PER_MTOK;
+  const usd = inputCost + outputCost;
+  return { usd, inr: usd * USD_TO_INR };
+}
+
+// Sums usage across every attempt() call made for a single runAgent()
+// invocation — the initial attempt PLUS a guardrail self-heal retry if
+// one happened. A retry is a real, separately-billed Anthropic call (it
+// re-sends the system prompt + full history again, same as any other
+// iteration), so it must be counted too — logging only the final
+// attempt's usage would understate the true cost of any conversation
+// that needed a retry.
+function addUsage(a, b) {
+  return {
+    inputTokens: (a?.inputTokens || 0) + (b?.inputTokens || 0),
+    outputTokens: (a?.outputTokens || 0) + (b?.outputTokens || 0),
+  };
+}
 
 async function acquireLock(conversationId) {
   const staleBefore = new Date(
@@ -146,6 +184,14 @@ async function runAgent({ conversationId, config, sendFn }) {
 
     const toolHandlers = config.buildToolHandlers(context);
 
+    // Which agent ran this turn, for AgentUsage cost tracking. Prefers an
+    // explicit config.agentName (see salesAgentConfig.js) — falls back to
+    // context.participantType (CUSTOMER/SUPPLIER/UNKNOWN, already computed
+    // generically in contextAssembler.js for every conversation) so this
+    // still works correctly even for agent configs that haven't added
+    // their own agentName yet, e.g. the current supplierAgentConfig.js.
+    const agentName = config.agentName || context.participantType || "unknown";
+
     async function attempt(extraSystemNote) {
       const promptForThisAttempt = extraSystemNote
         ? `${systemPrompt}\n\n${extraSystemNote}`
@@ -159,9 +205,28 @@ async function runAgent({ conversationId, config, sendFn }) {
       });
     }
 
-    let { finalText, toolCallLog, hitIterationCap } = await attempt();
+    let { finalText, toolCallLog, hitIterationCap, usage } = await attempt();
+    let totalUsage = usage;
 
     if (hitIterationCap) {
+      const cost = estimateCostInr(totalUsage);
+      console.log(
+        `[agentEngine] ${conversationId} escalated (iteration_cap). ` +
+          `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
+          (cost
+            ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)}).`
+            : "."),
+      );
+      await logUsage({
+        conversationId,
+        agentName,
+        inputTokens: totalUsage?.inputTokens,
+        outputTokens: totalUsage?.outputTokens,
+        costUsd: cost?.usd,
+        costInr: cost?.inr,
+        toolCallCount: toolCallLog.length,
+        outcome: "escalated_iteration_cap",
+      });
       await escalateWithMessage({
         conversationId,
         conversation: context.conversation,
@@ -204,8 +269,31 @@ async function runAgent({ conversationId, config, sendFn }) {
       const retry = await attempt(retryNote);
       finalText = retry.finalText;
       toolCallLog = retry.toolCallLog;
+      // A retry is a real, separately-billed Anthropic call — add its
+      // usage to the running total rather than replacing it, so the
+      // final logged cost reflects BOTH attempts, not just whichever one
+      // happened to end the turn.
+      totalUsage = addUsage(totalUsage, retry.usage);
 
       if (retry.hitIterationCap) {
+        const cost = estimateCostInr(totalUsage);
+        console.log(
+          `[agentEngine] ${conversationId} escalated (iteration_cap_after_retry). ` +
+            `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
+            (cost
+              ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)}).`
+              : "."),
+        );
+        await logUsage({
+          conversationId,
+          agentName,
+          inputTokens: totalUsage?.inputTokens,
+          outputTokens: totalUsage?.outputTokens,
+          costUsd: cost?.usd,
+          costInr: cost?.inr,
+          toolCallCount: toolCallLog.length,
+          outcome: "escalated_iteration_cap_after_retry",
+        });
         await escalateWithMessage({
           conversationId,
           conversation: context.conversation,
@@ -227,6 +315,24 @@ async function runAgent({ conversationId, config, sendFn }) {
       // Still blocked after one genuine retry — this is a real escalation
       // now, not a phrasing hiccup. Customer still gets a warm message,
       // never silence.
+      const cost = estimateCostInr(totalUsage);
+      console.log(
+        `[agentEngine] ${conversationId} escalated (${guardrailResult.reason}). ` +
+          `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
+          (cost
+            ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)}).`
+            : "."),
+      );
+      await logUsage({
+        conversationId,
+        agentName,
+        inputTokens: totalUsage?.inputTokens,
+        outputTokens: totalUsage?.outputTokens,
+        costUsd: cost?.usd,
+        costInr: cost?.inr,
+        toolCallCount: toolCallLog.length,
+        outcome: `escalated_${guardrailResult.reason}`,
+      });
       await escalateWithMessage({
         conversationId,
         conversation: context.conversation,
@@ -253,10 +359,34 @@ async function runAgent({ conversationId, config, sendFn }) {
       data: { lastMessageAt: new Date() },
     });
 
+    // Real cost for THIS turn (not the whole conversation — sum this
+    // across every turn in a conversationId to get the true total, e.g.
+    // by aggregating these log lines through whatever log pipeline
+    // you're already using). inputTokens/outputTokens come straight from
+    // toolLoop.js's usage tracking, which reads response.usage on every
+    // real Anthropic call this turn made — this is exact, not an
+    // estimate. The $/₹ figure next to it IS an estimate (see
+    // COST_INPUT_USD_PER_MTOK etc. above) — a fixed conversion applied
+    // to a real number, not a guess about the number itself.
+    const cost = estimateCostInr(totalUsage);
     console.log(
-      `[agentEngine] ${conversationId} sent reply (${toolCallLog.length} tool call(s)).`,
+      `[agentEngine] ${conversationId} sent reply (${toolCallLog.length} tool call(s)). ` +
+        `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
+        (cost
+          ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)} this turn).`
+          : "."),
     );
-    return { sent: true, text: finalText, toolCallLog };
+    await logUsage({
+      conversationId,
+      agentName,
+      inputTokens: totalUsage?.inputTokens,
+      outputTokens: totalUsage?.outputTokens,
+      costUsd: cost?.usd,
+      costInr: cost?.inr,
+      toolCallCount: toolCallLog.length,
+      outcome: "sent",
+    });
+    return { sent: true, text: finalText, toolCallLog, usage: totalUsage };
   } finally {
     await releaseLock(conversationId);
   }
