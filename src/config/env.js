@@ -51,13 +51,28 @@ const env = {
   // item's DB record (the real source of truth), but each Shopify
   // inventory write is itself 2-3 Admin API calls — doing that inline for
   // thousands of items in one webhook request risks a serverless timeout
-  // and hammers Shopify's rate limit. Only the first N (by this cap) get
-  // an inline Shopify sync per bulk-confirm call; the rest are logged to
-  // AuditLog as deferred rather than silently dropped. Raise this only
-  // alongside the route's serverless maxDuration.
+  // and hammers Shopify's rate limit (confirmed live: 100 inline at
+  // concurrency 3 hit "Exceeded 2 calls per second" repeatedly). Only the
+  // first N (by this cap) get an inline Shopify sync per bulk-confirm
+  // call, paced at roughly Shopify's own real limit (see
+  // SHOPIFY_SYNC_CONCURRENCY_DELAY_MS below); the rest — and anything
+  // among the first N that still fails — land in ShopifySyncQueue for the
+  // scheduler to catch up on its own schedule. Lowered from 100: at a
+  // rate-limit-safe pace, 100 inline would take ~2.5 minutes in one
+  // request — fine for local testing, not for a real Vercel deploy.
   bulkConfirmShopifySyncCap: Number(
-    process.env.BULK_CONFIRM_SHOPIFY_SYNC_CAP || 100,
+    process.env.BULK_CONFIRM_SHOPIFY_SYNC_CAP || 20,
   ),
+  // Applies to any code pacing multiple Shopify Admin API writes in a
+  // loop (confirm_all_pending_items here; shopifySyncQueueDrain.js in the
+  // scheduler repo has its own copy of this same constant). Shopify's
+  // real sustained limit is ~2 requests/second, and each variant sync is
+  // itself up to 3 sequential requests (resolve inventory item, ensure
+  // tracked, set level) — so pacing by variant, not by raw request, needs
+  // real headroom. 1500ms between variants keeps sustained throughput
+  // comfortably under the limit even on a cold cache (no request memoized
+  // yet from a prior call in this process).
+  shopifySyncPaceMs: Number(process.env.SHOPIFY_SYNC_PACE_MS || 1500),
   // reconcile_stock_list's unmatched rows are the "maybe a new product"
   // path — each one the model tries to actively onboard costs a real
   // Shopify product-creation call, an approval email, and potentially a

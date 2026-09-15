@@ -158,6 +158,21 @@ async function setAvailability({
       `[availabilityService] Shopify write-back failed for variant ${variantId}:`,
       shopifyResult.error,
     );
+    // A genuine failure (e.g. Shopify rate limiting — confirmed live: 18
+    // of a 100-item inline bulk-confirm batch hit "Exceeded 2 calls per
+    // second") used to only get logged here, never retried — silently
+    // leaving Golf Care OS's own DB correct but Shopify's live inventory
+    // permanently stale for that variant. Same queue the deliberate
+    // skipShopifySync path already uses, so one scheduler job (see
+    // shopifySyncQueueDrain.js) catches up both deferred AND failed syncs.
+    await prisma.shopifySyncQueue
+      .create({ data: { variantId, status } })
+      .catch((err) => {
+        console.error(
+          `[availabilityService] failed to enqueue retry for variant ${variantId}:`,
+          err.message,
+        );
+      });
     await prisma.auditLog.create({
       data: {
         actorType: "SYSTEM",

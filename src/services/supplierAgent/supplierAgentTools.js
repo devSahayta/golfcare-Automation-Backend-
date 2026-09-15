@@ -186,8 +186,16 @@ function buildSupplierAgentTools(context) {
       const primaryTargets = supplierProducts.filter((sp) => sp.isPrimary && sp.variantId);
       const syncCap = env.bulkConfirmShopifySyncCap;
 
+      // Sequential + paced, not concurrent — confirmed live: concurrency 3
+      // here meant up to 3 variants' worth of Shopify calls in flight at
+      // once, and each variant sync is itself up to 3 sequential Admin API
+      // calls, so this was really bursting far more than 3 req/sec against
+      // a ~2 req/sec limit ("Exceeded 2 calls per second" on 18 of 100).
+      // Any call that still fails (rate limit or otherwise) now gets
+      // queued for retry too (see availabilityService.js), so this doesn't
+      // need to be perfectly rate-safe, just not actively hostile to it.
       const [syncedResults, deferredResults] = await Promise.all([
-        mapWithConcurrency(primaryTargets.slice(0, syncCap), 3, (sp) =>
+        mapSequentialPaced(primaryTargets.slice(0, syncCap), env.shopifySyncPaceMs, (sp) =>
           setAvailability({
             variantId: sp.variantId,
             productId: sp.productId,
@@ -686,6 +694,23 @@ async function mapWithConcurrency(items, limit, fn) {
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// Used specifically for the subset of confirm_all_pending_items' work that
+// makes real Shopify Admin API calls — one at a time, with a real delay
+// between each, unlike mapWithConcurrency's overlapping workers. Shopify's
+// rate limit is per-request, not per-variant, and each variant sync here
+// is itself up to 3 sequential requests — bounded *concurrency* alone
+// (confirmed live, at 3) still bursts several times that in requests/sec.
+async function mapSequentialPaced(items, delayMs, fn) {
+  const results = [];
+  for (let i = 0; i < items.length; i++) {
+    results.push(await fn(items[i]));
+    if (i < items.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
   return results;
 }
 
