@@ -20,6 +20,7 @@
 // Enforce that at the Module 5 call site; this function is call-site
 // agnostic.
 
+const crypto = require("crypto");
 const { prisma } = require("../lib/prisma");
 const { writeAvailabilityToShopify } = require("./shopifyInventory");
 const { env } = require("../config/env");
@@ -189,4 +190,158 @@ async function setAvailability({
   return { ...availabilityState, shopifySynced: shopifyResult.ok };
 }
 
-module.exports = { setAvailability };
+// Bulk DB-only sibling of setAvailability() — same status, same source,
+// applied to hundreds/thousands of variants in a handful of queries
+// instead of one transaction per variant. Built after confirming live
+// that the "obvious" fix (setAvailability() in a loop, even DB-only with
+// skipShopifySync and modest concurrency) is fundamentally too slow at
+// real scale over a real network connection to Postgres — 2,212 variants
+// that way took 22.9 minutes, useless for anything that has to reply to a
+// WhatsApp message. This does the same three writes (AvailabilityState,
+// AvailabilityLog, Event) as bulk operations, and always queues every
+// target for the scheduler's Shopify sync — there is no non-bulk Shopify
+// path here at all, unlike setAvailability's optional skipShopifySync.
+//
+// @param {object} input
+// @param {{variantId: string, productId: string}[]} input.targets
+// @param {"IN_STOCK"|"OUT_OF_STOCK"|"ON_ORDER"|"DISCONTINUED"|"UNKNOWN"} input.status
+// @param {"SUPPLIER_CONFIRMED"|"MANUAL_OWNER"|"AGENT_INFERRED"} input.source
+// @param {string} [input.changedBy]
+// @param {number} [input.leadTimeDays]
+// @param {string} [input.note] - explicit note for this write; defaults to
+//   clearing any prior note (matches setAvailability's own default), NOT
+//   leaving whatever was there before. Confirmed live: without this, a
+//   variant's "Confirmation expired (TTL sweep)" note from the TTL sweep
+//   was still sitting there after a real supplier reconfirmation via this
+//   function, because the updateMany simply never mentioned the column.
+// @param {number} [input.ttlHours]
+// @returns {Promise<number>} how many variants were written
+async function bulkSetAvailabilityDbOnly({
+  targets,
+  status,
+  source,
+  changedBy,
+  leadTimeDays = null,
+  note = null,
+  ttlHours,
+}) {
+  if (!Array.isArray(targets) || targets.length === 0) return 0;
+  if (!status) throw new Error("bulkSetAvailabilityDbOnly: status is required");
+  if (!source) throw new Error("bulkSetAvailabilityDbOnly: source is required");
+
+  const variantIds = targets.map((t) => t.variantId);
+  const now = new Date();
+  const expiresAt = new Date(
+    now.getTime() + (ttlHours ?? env.availabilityTtlHours) * 60 * 60 * 1000,
+  );
+
+  const existing = await prisma.availabilityState.findMany({
+    where: { variantId: { in: variantIds } },
+    select: { id: true, variantId: true, status: true },
+  });
+  const existingByVariantId = new Map(existing.map((e) => [e.variantId, e]));
+
+  const toUpdateVariantIds = [];
+  const toCreate = [];
+  for (const t of targets) {
+    if (existingByVariantId.has(t.variantId)) {
+      toUpdateVariantIds.push(t.variantId);
+    } else {
+      // Id generated client-side (Prisma accepts an explicit value even
+      // though the column has a DB-side default) so AvailabilityLog below
+      // can reference it without a second round-trip to re-read what
+      // createMany just inserted — createMany doesn't return rows.
+      toCreate.push({
+        id: crypto.randomUUID(),
+        variantId: t.variantId,
+        productId: t.productId,
+        status,
+        source,
+        leadTimeDays,
+        confirmedBy: changedBy || null,
+        confirmedAt: now,
+        expiresAt,
+        note,
+      });
+    }
+  }
+
+  if (toUpdateVariantIds.length > 0) {
+    await prisma.availabilityState.updateMany({
+      where: { variantId: { in: toUpdateVariantIds } },
+      data: {
+        status,
+        source,
+        leadTimeDays,
+        confirmedBy: changedBy || null,
+        confirmedAt: now,
+        expiresAt,
+        note,
+      },
+    });
+  }
+  if (toCreate.length > 0) {
+    await prisma.availabilityState.createMany({ data: toCreate });
+  }
+
+  const stateIdByVariantId = new Map(existing.map((e) => [e.variantId, e.id]));
+  toCreate.forEach((row) => stateIdByVariantId.set(row.variantId, row.id));
+
+  // Raw SQL via unnest(), not prisma.availabilityLog.createMany() and not
+  // a VALUES-list of Prisma.sql rows either — both confirmed live as
+  // genuinely too slow at real scale, for two different reasons stacked
+  // on each other:
+  //   1. createMany() on this exact table took 14.5s for just 50 rows,
+  //      even though EXPLAIN ANALYZE showed the underlying INSERT itself
+  //      is ~1.5ms (FK trigger to AvailabilityState included) — an 18x gap
+  //      not explained by RLS (identical on every table in this schema,
+  //      including ones that were fast) or anything visible in the query
+  //      plan, so treat it as a known-bad path for this table's shape
+  //      (required FK + nullable enum column) rather than dig further.
+  //   2. A hand-built multi-row VALUES list, even fully parameterized via
+  //      Prisma.sql/Prisma.join (one bind parameter per cell), was WORSE:
+  //      still hadn't finished after 2 minutes at 1,000 rows (6,000 bind
+  //      parameters). unnest() takes one array parameter per COLUMN
+  //      instead — 5 parameters total regardless of row count — and ran
+  //      the identical 1,000-row insert in 1.2s. Casts happen AFTER
+  //      unnest(), on the scalar per-row value, not on the array itself —
+  //      casting an all-NULL array directly to "AvailStatus"[] fails
+  //      (Postgres can't infer the array's element type from the driver),
+  //      but casting each unnested NULL to "AvailStatus" is a normal,
+  //      always-valid NULL.
+  const logIds = targets.map(() => crypto.randomUUID());
+  const logStateIds = targets.map((t) => stateIdByVariantId.get(t.variantId));
+  const logPrevStatuses = targets.map((t) => existingByVariantId.get(t.variantId)?.status ?? null);
+  const logChangedBy = changedBy || "system";
+  await prisma.$executeRaw`
+    INSERT INTO "AvailabilityLog" (id, "availabilityStateId", "previousStatus", "newStatus", "changedBy", "changedAt")
+    SELECT id, "availabilityStateId", "previousStatus"::"AvailStatus", ${status}::"AvailStatus", ${logChangedBy}, ${now}::timestamptz
+    FROM unnest(${logIds}::text[], ${logStateIds}::text[], ${logPrevStatuses}::text[])
+    AS t(id, "availabilityStateId", "previousStatus")
+  `;
+
+  await prisma.event.createMany({
+    data: targets.map((t) => ({
+      type: "availability.changed",
+      payload: {
+        variantId: t.variantId,
+        productId: t.productId,
+        previousStatus: existingByVariantId.get(t.variantId)?.status ?? null,
+        newStatus: status,
+        source,
+        changedBy: changedBy || null,
+      },
+    })),
+  });
+
+  // Every target here was DB-only by construction — queue all of them for
+  // the scheduler's shopifySyncQueueDrain job, same table setAvailability's
+  // skipShopifySync/failure paths use.
+  await prisma.shopifySyncQueue.createMany({
+    data: targets.map((t) => ({ variantId: t.variantId, status })),
+  });
+
+  return targets.length;
+}
+
+module.exports = { setAvailability, bulkSetAvailabilityDbOnly };

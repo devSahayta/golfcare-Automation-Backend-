@@ -2,7 +2,7 @@
 const crypto = require("crypto");
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
-const { setAvailability } = require("../availabilityService");
+const { setAvailability, bulkSetAvailabilityDbOnly } = require("../availabilityService");
 const { createDraftProduct } = require("../shopifyProductCreate");
 const { sendProductDraftApprovalEmail } = require("../emailService");
 const { updateVariantPrice, updateInventoryItemCost } = require("../shopifyInventory");
@@ -186,15 +186,17 @@ function buildSupplierAgentTools(context) {
       const primaryTargets = supplierProducts.filter((sp) => sp.isPrimary && sp.variantId);
       const syncCap = env.bulkConfirmShopifySyncCap;
 
-      // Sequential + paced, not concurrent — confirmed live: concurrency 3
-      // here meant up to 3 variants' worth of Shopify calls in flight at
-      // once, and each variant sync is itself up to 3 sequential Admin API
-      // calls, so this was really bursting far more than 3 req/sec against
-      // a ~2 req/sec limit ("Exceeded 2 calls per second" on 18 of 100).
-      // Any call that still fails (rate limit or otherwise) now gets
-      // queued for retry too (see availabilityService.js), so this doesn't
-      // need to be perfectly rate-safe, just not actively hostile to it.
-      const [syncedResults, deferredResults] = await Promise.all([
+      // Sequential + paced, not concurrent, for the small inline-Shopify
+      // slice — confirmed live: concurrency 3 here meant up to 3 variants'
+      // worth of Shopify calls in flight at once, and each variant sync is
+      // itself up to 3 sequential Admin API calls, so this was really
+      // bursting far more than 3 req/sec against a ~2 req/sec limit
+      // ("Exceeded 2 calls per second" on 18 of 100). Any call that still
+      // fails (rate limit or otherwise) now gets queued for retry too (see
+      // availabilityService.js), so this doesn't need to be perfectly
+      // rate-safe, just not actively hostile to it.
+      const deferredTargets = primaryTargets.slice(syncCap);
+      const [syncedResults] = await Promise.all([
         mapSequentialPaced(primaryTargets.slice(0, syncCap), env.shopifySyncPaceMs, (sp) =>
           setAvailability({
             variantId: sp.variantId,
@@ -205,20 +207,25 @@ function buildSupplierAgentTools(context) {
             leadTimeDays: leadTimeDays ?? null,
           }),
         ),
-        mapWithConcurrency(primaryTargets.slice(syncCap), 20, (sp) =>
-          setAvailability({
-            variantId: sp.variantId,
-            productId: sp.productId,
-            status,
-            source: "SUPPLIER_CONFIRMED",
-            changedBy: supplier.id,
-            leadTimeDays: leadTimeDays ?? null,
-            skipShopifySync: true,
-          }),
-        ),
+        // Bulk, not one setAvailability() transaction per item — confirmed
+        // live this matters, not just in theory: even DB-only (no Shopify
+        // call) at a conservative concurrency of 5, ~2,200 variants took
+        // 22.9 minutes over a real network connection to Postgres, useless
+        // for anything replying to a WhatsApp message. bulkSetAvailabilityDbOnly
+        // does the same three writes (AvailabilityState, AvailabilityLog,
+        // Event) as a handful of bulk queries instead of thousands of
+        // individual transactions, and always queues every target for the
+        // scheduler's Shopify sync.
+        bulkSetAvailabilityDbOnly({
+          targets: deferredTargets.map((sp) => ({ variantId: sp.variantId, productId: sp.productId })),
+          status,
+          source: "SUPPLIER_CONFIRMED",
+          changedBy: supplier.id,
+          leadTimeDays: leadTimeDays ?? null,
+        }),
       ]);
 
-      if (deferredResults.length > 0) {
+      if (deferredTargets.length > 0) {
         await prisma.auditLog.create({
           data: {
             actorType: "SYSTEM",
@@ -228,7 +235,7 @@ function buildSupplierAgentTools(context) {
             afterState: {
               supplierId: supplier.id,
               status,
-              deferredCount: deferredResults.length,
+              deferredCount: deferredTargets.length,
             },
             source: "supplier_agent",
           },
@@ -252,7 +259,7 @@ function buildSupplierAgentTools(context) {
         totalItems: items.length,
         confirmedCount: supplierProducts.length,
         shopifySynced: syncedResults.length,
-        shopifyDeferred: deferredResults.length,
+        shopifyDeferred: deferredTargets.length,
       };
     },
 
@@ -678,30 +685,10 @@ function numberOrNull(value) {
   return value == null ? null : Number(value);
 }
 
-// confirm_all_pending_items' bulk-apply helper — runs `fn` over `items`
-// with at most `limit` in flight at once. A plain Promise.all would fire
-// every item's setAvailability() (each its own DB transaction, and
-// sometimes several Shopify API calls) all at the same instant; bounded
-// concurrency keeps that from hammering Postgres/Shopify at real catalog
-// scale while still being far faster than a fully sequential loop.
-async function mapWithConcurrency(items, limit, fn) {
-  const results = [];
-  let cursor = 0;
-  async function worker() {
-    while (cursor < items.length) {
-      const index = cursor++;
-      results[index] = await fn(items[index]);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
-}
-
-// Used specifically for the subset of confirm_all_pending_items' work that
-// makes real Shopify Admin API calls — one at a time, with a real delay
-// between each, unlike mapWithConcurrency's overlapping workers. Shopify's
-// rate limit is per-request, not per-variant, and each variant sync here
-// is itself up to 3 sequential requests — bounded *concurrency* alone
+// confirm_all_pending_items' pacing helper for the small inline-Shopify
+// slice — one at a time, with a real delay between each. Shopify's rate
+// limit is per-request, not per-variant, and each variant sync here is
+// itself up to 3 sequential requests, so even bounded concurrency
 // (confirmed live, at 3) still bursts several times that in requests/sec.
 async function mapSequentialPaced(items, delayMs, fn) {
   const results = [];
