@@ -17,7 +17,11 @@ const tools = [
             properties: {
               skuOrName: {
                 type: "string",
-                description: "The SKU or product name exactly as it appears in the row.",
+                description: "The SKU or product name exactly as it appears in the row. Not required if supplierProductId is set.",
+              },
+              supplierProductId: {
+                type: "string",
+                description: "Only set this after an earlier reconcile_stock_list call came back ambiguous for this item AND the supplier has now picked one of the candidates — use that exact candidate's supplierProductId here to apply it directly. Never guess one; if the supplier hasn't picked yet, ask instead. Do not resend the same skuOrName text again hoping for a different match — it's deterministic and will return the same ambiguous result.",
               },
               status: {
                 type: "string",
@@ -37,7 +41,7 @@ const tools = [
                 description: "Only if the row/supplier states one and it isn't already on file for this item.",
               },
             },
-            required: ["skuOrName", "status"],
+            required: ["status"],
           },
         },
       },
@@ -113,23 +117,23 @@ const tools = [
         specs: {
           type: "string",
           description:
-            "Becomes the product's actual Shopify description — prose only (materials, construction, features, condition), NOT brand/SKU/size which have their own fields above. If the supplier gave no description at all, use web_search to find one for this specific product rather than leaving it empty.",
+            "Becomes the product's actual Shopify description — prose only (materials, construction, features, condition), NOT brand/SKU/size which have their own fields above. If the supplier gave no description at all, call research_product_specs first for this product rather than leaving it empty.",
         },
         sourceType: {
           type: "string",
           enum: ["SUPPLIER_PROVIDED", "WEB_SCRAPED"],
           description:
-            "WEB_SCRAPED if ANY part of what you're submitting — even just the image or the description — came from web_search rather than the supplier. SUPPLIER_PROVIDED only if everything came from the supplier directly.",
+            "WEB_SCRAPED if ANY part of what you're submitting — even just the image or the description — came from research_product_specs rather than the supplier. SUPPLIER_PROVIDED only if everything came from the supplier directly.",
         },
         sourceNotes: {
           type: "string",
           description:
-            "Required whenever sourceType is WEB_SCRAPED — say exactly which parts were scraped (e.g. \"image and description from manufacturer's site; price and SKU from supplier\") and cite where, so a reviewer knows what to double-check.",
+            "Required whenever sourceType is WEB_SCRAPED — say exactly which parts were scraped (e.g. \"image and description from manufacturer's site; price and SKU from supplier\") and cite where, so a reviewer knows what to double-check. research_product_specs's sourceNotes output already says this for you — just pass it through.",
         },
         imageUrl: {
           type: "string",
           description:
-            "A real, direct image URL (ending in .jpg/.png/.webp etc, or otherwise clearly an image resource) — not a product page URL. web_search alone won't give you this (it only returns page text/snippets); use web_fetch on a promising product page from your search results and read its content for an actual image link (an og:image meta tag or a product image src) before setting this. Only set it when you found one this way — including when the supplier gave you everything else but no photo, still search for a matching image rather than submitting with none. Leave it out entirely when the supplier DID send a photo — that's picked up automatically from their most recent actual photo in this conversation (not a sheet/document they sent), don't try to pass its URL yourself. If you can't confirm a real image URL, it's fine to submit without one — never guess or construct a URL that might not exist.",
+            "A real, direct image URL — set this to whatever research_product_specs returned as imageUrl, if anything. Leave it out entirely when the supplier DID send a photo instead — that's picked up automatically from their most recent actual photo in this conversation (not a sheet/document they sent), don't try to pass its URL yourself. Never guess or construct a URL yourself.",
         },
       },
       required: ["title", "price", "marginPercent", "gstPercent", "sourceType"],
@@ -148,16 +152,19 @@ const tools = [
       required: ["reason", "urgency"],
     },
   },
-  // Server-side tools — Anthropic executes them, nothing for
-  // toolLoop.js's handler map to do; it already forwards their response
-  // blocks untouched (only ever looks for `type === "tool_use"`) and now
-  // also logs them read-only for observability (toolLoop.js). web_search
-  // alone only returns page titles/URLs/text snippets — no structured
-  // image data — so finding an actual hotlinkable product image needs
-  // web_fetch too: fetch a promising product page and read its content
-  // for a real image URL (an og:image meta tag, a product image src).
-  { type: "web_search_20250305", name: "web_search", max_uses: 3 },
-  { type: "web_fetch_20250910", name: "web_fetch", max_uses: 3 },
+  {
+    name: "research_product_specs",
+    description:
+      "Look up real specs/description and a real product image for a new product, when the supplier didn't give you a full description or photo. Runs its own search internally — you never call web_search/web_fetch yourself for this, and you don't need to ask the supplier's permission first, just use it. Returns {specs, imageUrl, sourceNotes} — pass specs/imageUrl straight into create_product_draft's own fields, and sourceNotes straight into create_product_draft's sourceNotes. If it comes back with specs/imageUrl both null, it couldn't find anything usable — proceed without them rather than retrying (calling this again for the same product won't find something new).",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "The product's name/title, as specific as you have it." },
+        brand: { type: "string", description: "The manufacturer/brand, if known — improves search accuracy." },
+      },
+      required: ["title"],
+    },
+  },
 ];
 
 function buildSystemPrompt(context) {
@@ -191,12 +198,37 @@ function buildSystemPrompt(context) {
 Whichever path, use reconcile_stock_list for anything the supplier addresses by name/SKU (one item or several — matching is server-side, you never need an internal id) and confirm_all_pending_items only for a genuine blanket answer covering everything at once. Don't guess which item they mean if it's ambiguous — ask.`
       : "There is no open check-in for this supplier right now (any earlier one has already been fully recorded). A bare acknowledgment like \"okay\", \"thanks\", or \"got it\" needs no tool call at all — just reply naturally, don't re-confirm anything. If they're volunteering a genuinely new stock update, that's fine to record via reconcile_stock_list, but there's nothing pending to confirm against otherwise.";
 
+  // Confirmed live, twice, in one real conversation: the model told a
+  // supplier four different new products were "created and live" —
+  // checkmarks and all — without ever once calling create_product_draft
+  // for any of them. This section exists so the model has an explicit,
+  // reliable record of what's actually still outstanding (not just its
+  // own memory of the conversation, which is exactly what failed), and a
+  // backend guardrail (supplierGuardrails.js) independently blocks any
+  // reply that claims one of these is done without the matching tool call
+  // actually happening in the same turn — this note alone isn't trusted
+  // to be enough.
+  const leads = context.pendingProductLeads || [];
+  const pendingProductLeadsSection =
+    leads.length > 0
+      ? `New products still being set up, NOT yet created (no Shopify draft exists for these — don't say "created," "live," "added," or similar about them until you've just called create_product_draft for it in this exact reply):\n${leads
+          .map((l) => {
+            const missing = [];
+            if (l.mrp == null) missing.push("price");
+            if (l.marginPercent == null) missing.push("margin%");
+            if (l.gstPercent == null) missing.push("GST%");
+            return `- ${l.title}${missing.length ? ` — still need: ${missing.join(", ")}` : " — have enough info, call create_product_draft now"}`;
+          })
+          .join("\n")}`
+      : "";
+
   return `You are Golf Care's WhatsApp assistant for supplier stock check-ins (golfcare.in, a
 20-year-old golf retail dropship business — Golf Care holds no stock itself, so these
 confirmations are what the storefront's availability is based on).
 
 ${supplierCard}
 ${pendingSection}
+${pendingProductLeadsSection}
 
 Attachments: a supplier message may contain "[Attached file — extracted contents below]" followed by
 the text pulled from a PDF or spreadsheet they sent — that's a real document, extracted
@@ -206,7 +238,11 @@ clear status, submitted in one call — never call it once per row for a list li
 reconcile_stock_list's result has three parts:
 - applied — already recorded, just mention what changed.
 - ambiguous — matched more than one plausible product; tell the supplier which item and list
-  the candidate names, ask them to pick one. Don't guess.
+  the candidate names, ask them to pick one. Don't guess. Once they pick one, call
+  reconcile_stock_list again for that item with supplierProductId set to that exact
+  candidate's supplierProductId from the earlier result — do NOT resend the same skuOrName
+  text again; matching is deterministic and will return the same ambiguous candidates every
+  time, not a different one.
 - unmatched — no product in their catalog looked like a match. Treat each one as a possible
   new product — see "New products" below. EXCEPT: if the result also has tooManyNewProducts:
   true, unmatched comes back empty on purpose — there were too many to onboard one by one (see
@@ -243,34 +279,48 @@ it:
    file yet. Also ask for a brand, category, SKU, size/variant details, stock quantity, and a
    photo (a photo they send arrives as a separate message — you don't need to do anything
    special, it's picked up automatically when you create the draft).
-2. Use web_search to fill in whatever's still missing once they've answered — this is
-   per-field, not all-or-nothing: even when the supplier gave you the price and everything
-   else but no photo, still search for a matching product image rather than submitting with
-   none; same for a missing description. You only truly need the supplier for price (search
-   can't be trusted for that) — everything else search can supplement. For an image
-   specifically: web_search only returns page text/snippets, not image links — after finding
-   a promising product page, use web_fetch on it and read the content for a real image URL
-   (og:image meta tag, product image src). If you can't find a genuine one this way, leave
-   imageUrl unset rather than guessing at a URL.
+2. Call research_product_specs to fill in whatever's still missing once they've answered —
+   this is per-field, not all-or-nothing: even when the supplier gave you the price and
+   everything else but no photo, still call it for a matching product image rather than
+   submitting with none; same for a missing description. You only truly need the supplier for
+   price (research can't be trusted for that) — everything else it can supplement. Pass its
+   specs/imageUrl straight into create_product_draft's own fields. If it comes back with both
+   null, leave those fields unset in create_product_draft rather than guessing.
 3. If they can't give a price, margin, or GST and there's no way to responsibly determine them
-   (web_search can plausibly find missing specs/images, but never trust it for a supplier's
-   actual margin or applicable GST rate — those must come from the supplier), use
+   (research_product_specs can plausibly find missing specs/images, but never trust it for a
+   supplier's actual margin or applicable GST rate — those must come from the supplier), use
    escalate_to_human instead of guessing or drafting with fabricated numbers.
-4. sourceType is WEB_SCRAPED if you used search for ANY part of what you're submitting (even
-   just the image or description) — SUPPLIER_PROVIDED only if literally everything came from
-   the supplier. Either way, put sourceNotes explaining exactly what came from where.
+4. sourceType is WEB_SCRAPED if you used research_product_specs for ANY part of what you're
+   submitting (even just the image or description) — SUPPLIER_PROVIDED only if literally
+   everything came from the supplier. Either way, put sourceNotes explaining exactly what came
+   from where (research_product_specs's own sourceNotes output already says this — just pass
+   it through).
 5. Put each piece of information in its proper field — brand, sku, quantity, and
    variantOptions (Size/Color/Hand/Flex etc.) are their own fields, NOT part of specs. specs
    is prose only (materials, construction, features) — restating "Brand: X, SKU: Y, Size: Z"
    in specs when those have dedicated fields is wrong, don't do it.
 6. Tell the supplier a draft listing has been created and Golf Care will review it before it
-   goes live — that's now true, not just something to say.
+   goes live — ONLY after create_product_draft (or escalate_to_human) has actually been called
+   in this exact same reply, never before. Confirmed live: this went wrong for real — a
+   supplier was told four different new products were "created and live," checkmarks and all,
+   when none of the four had actually been submitted. If you're not calling one of those tools
+   in this reply, don't say a product is created, live, added, or set up — say what's still
+   needed instead (price/margin/GST, or a clarifying question).
 7. Call create_product_draft at most once per product. If it comes back with
    draft_already_exists, that one's done — move on, don't retry it.
+8. Check imageIncluded in the result — some external sources block Shopify's own image fetch
+   even when a real imageUrl was found and sent (confirmed live: Titleist's own product CDN
+   did this silently, no error, just an empty result). If it comes back false, don't tell the
+   supplier a photo was added — mention the listing is missing a photo so a human can add one
+   during review, or ask the supplier for one directly.
 
 Rules:
 - Never mark an item confirmed unless the supplier actually said something about it this
   conversation — don't assume silence means in stock.
+- Never tell a supplier a new product is created/live/added unless create_product_draft (or
+  escalate_to_human, for the too-many-new-products case) was actually called in this same
+  reply — see "New products" step 6 above. This is enforced server-side too (a blocked reply
+  gets one retry with the exact reason), but don't rely on that — get it right the first time.
 - If anything is ambiguous, a pricing/commercial question, or you're unsure, call
   escalate_to_human rather than guessing.
 - This is a WhatsApp message, not a document. Use WhatsApp's own formatting only: *bold*

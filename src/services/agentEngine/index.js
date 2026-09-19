@@ -21,29 +21,27 @@ const { assembleContext } = require("./contextAssembler");
 const { runToolLoop } = require("./toolLoop");
 const { runGuardrails: runDefaultGuardrails } = require("./guardrails");
 const { logMessage, logAudit, logUsage } = require("./logger");
+const { computeCost } = require("./modelPricing");
 
-// Cost-estimate constants — ONLY used to print an approximate $/₹ figure
-// next to the real, exact token counts in the log line below. The token
-// counts themselves (from toolLoop.js's usage tracking, which reads the
-// actual response.usage the Anthropic API returns on every call) are the
-// real, authoritative numbers; this conversion is just a convenience so
-// nobody has to do the math by hand from the logs every time. Update
-// these two rates if the model changes or Anthropic's pricing changes —
-// current as of Sept 2026 for Claude Sonnet 4.6 ($3/$15 per million
-// input/output tokens). USD_TO_INR is a rough static rate, not fetched
-// live — good enough for a ballpark next to real token counts, not
-// intended as a billing-accurate conversion.
-const COST_INPUT_USD_PER_MTOK = 3;
-const COST_OUTPUT_USD_PER_MTOK = 15;
-const USD_TO_INR = 95;
-
-function estimateCostInr(usage) {
+// Cost estimate — priced via modelPricing.js's shared rate table, keyed
+// by whichever model actually ran (env.anthropicModel for the main
+// conversation). NOT just `computeCost(env.anthropicModel, totalUsage)`
+// directly, though — totalUsage can include real tokens from a tool
+// handler's OWN separate Anthropic call at a DIFFERENT, deliberately
+// pinned model (context.extraUsage — see productResearch.js, pinned to
+// Sonnet regardless of the main conversation's model). Blending those
+// tokens into one rate would reintroduce exactly the bug just fixed
+// (silently mispricing real spend after a model switch) — extraCost is
+// already correctly priced at ITS OWN model when it was recorded, so it's
+// added on top of the main loop's own cost, never re-derived from merged
+// token counts at a single blended rate.
+function estimateCostInr(usage, extraCost) {
   if (!usage) return null;
-  const inputCost = (usage.inputTokens / 1_000_000) * COST_INPUT_USD_PER_MTOK;
-  const outputCost =
-    (usage.outputTokens / 1_000_000) * COST_OUTPUT_USD_PER_MTOK;
-  const usd = inputCost + outputCost;
-  return { usd, inr: usd * USD_TO_INR };
+  const mainCost = computeCost(env.anthropicModel, usage);
+  return {
+    usd: mainCost.usd + (extraCost?.usd || 0),
+    inr: mainCost.inr + (extraCost?.inr || 0),
+  };
 }
 
 // Sums usage across every attempt() call made for a single runAgent()
@@ -207,9 +205,37 @@ async function runAgent({ conversationId, config, sendFn }) {
 
     let { finalText, toolCallLog, hitIterationCap, usage } = await attempt();
     let totalUsage = usage;
+    // Real bug, caught live: mainUsage tracks ONLY the main loop's own
+    // tokens (this model, priced at env.anthropicModel below) — kept
+    // deliberately separate from totalUsage, which mixes in extraUsage's
+    // tokens for accurate total-spend display/logging. estimateCostInr
+    // must be given mainUsage, never totalUsage — passing totalUsage
+    // priced the isolated research call's tokens a SECOND time (once
+    // correctly via extraCost, once more by folding them into totalUsage
+    // and pricing that whole blend at the main model's rate), silently
+    // inflating every turn that used an isolated call by exactly that
+    // call's cost. Confirmed live: two real turns both matched this
+    // double-counted total to the cent once reproduced (₹32.09 and
+    // ₹11.26), not the correct ₹24.95 / ₹8.81.
+    let mainUsage = usage;
+    // Merge in any out-of-band API calls a tool handler made during this
+    // attempt (e.g. an isolated research call — see contextAssembler.js's
+    // extraUsage comment) — token counts go straight into totalUsage
+    // (real tokens spent either way, for the DB's own record), but the
+    // COST is tracked separately (extraCost) since that call may have run
+    // at a different, deliberately pinned model/rate than the main
+    // conversation — see estimateCostInr's own comment for why blending
+    // it into one rate would be wrong. Reset both so a retry below
+    // doesn't double either.
+    totalUsage = addUsage(totalUsage, context.extraUsage);
+    let extraCost = { usd: context.extraUsage.costUsd, inr: context.extraUsage.costInr };
+    context.extraUsage.inputTokens = 0;
+    context.extraUsage.outputTokens = 0;
+    context.extraUsage.costUsd = 0;
+    context.extraUsage.costInr = 0;
 
     if (hitIterationCap) {
-      const cost = estimateCostInr(totalUsage);
+      const cost = estimateCostInr(mainUsage, extraCost);
       console.log(
         `[agentEngine] ${conversationId} escalated (iteration_cap). ` +
           `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
@@ -273,10 +299,20 @@ async function runAgent({ conversationId, config, sendFn }) {
       // usage to the running total rather than replacing it, so the
       // final logged cost reflects BOTH attempts, not just whichever one
       // happened to end the turn.
+      mainUsage = addUsage(mainUsage, retry.usage);
       totalUsage = addUsage(totalUsage, retry.usage);
+      totalUsage = addUsage(totalUsage, context.extraUsage);
+      extraCost = {
+        usd: extraCost.usd + context.extraUsage.costUsd,
+        inr: extraCost.inr + context.extraUsage.costInr,
+      };
+      context.extraUsage.inputTokens = 0;
+      context.extraUsage.outputTokens = 0;
+      context.extraUsage.costUsd = 0;
+      context.extraUsage.costInr = 0;
 
       if (retry.hitIterationCap) {
-        const cost = estimateCostInr(totalUsage);
+        const cost = estimateCostInr(mainUsage, extraCost);
         console.log(
           `[agentEngine] ${conversationId} escalated (iteration_cap_after_retry). ` +
             `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
@@ -315,7 +351,7 @@ async function runAgent({ conversationId, config, sendFn }) {
       // Still blocked after one genuine retry — this is a real escalation
       // now, not a phrasing hiccup. Customer still gets a warm message,
       // never silence.
-      const cost = estimateCostInr(totalUsage);
+      const cost = estimateCostInr(mainUsage, extraCost);
       console.log(
         `[agentEngine] ${conversationId} escalated (${guardrailResult.reason}). ` +
           `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
@@ -368,7 +404,7 @@ async function runAgent({ conversationId, config, sendFn }) {
     // estimate. The $/₹ figure next to it IS an estimate (see
     // COST_INPUT_USD_PER_MTOK etc. above) — a fixed conversion applied
     // to a real number, not a guess about the number itself.
-    const cost = estimateCostInr(totalUsage);
+    const cost = estimateCostInr(mainUsage, extraCost);
     console.log(
       `[agentEngine] ${conversationId} sent reply (${toolCallLog.length} tool call(s)). ` +
         `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +

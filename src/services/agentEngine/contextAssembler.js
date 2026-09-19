@@ -45,6 +45,22 @@ async function assembleContext({ conversationId }) {
   let enrolmentPending = false;
   let enrolmentMissingFields = [];
   let pendingCheck = null; // populated below only if participant is a supplier
+  let pendingProductLeads = []; // populated below only if participant is a supplier
+  // Generic hook, not supplier-specific: any tool handler that makes its
+  // OWN separate Anthropic API call (real billed usage outside the main
+  // toolLoop) mutates this in place to report it — agentEngine/index.js
+  // merges it into the logged total after each attempt. Exists because a
+  // tool handler making an isolated call (see supplierAgent/
+  // productResearch.js) is real spend that would otherwise silently never
+  // reach AgentUsage, understating true cost. costUsd/costInr are tracked
+  // separately from inputTokens/outputTokens (not re-derived from them
+  // later) because an isolated call can run at a DIFFERENT, deliberately
+  // pinned model than the main conversation — the tool handler that
+  // mutates this already knows the right rate for its own call and
+  // computes cost at that rate; agentEngine/index.js only ever adds this
+  // pre-computed cost on top of the main loop's own, never blends the
+  // token counts into one rate (see index.js's estimateCostInr comment).
+  const extraUsage = { inputTokens: 0, outputTokens: 0, costUsd: 0, costInr: 0 };
 
   if (participantType === "CUSTOMER" && conversation.customerId) {
     const [allQuestions, answered] = await Promise.all([
@@ -117,6 +133,14 @@ async function assembleContext({ conversationId }) {
       where: { supplierId: conversation.supplierId, status: "SENT" },
       orderBy: { sentAt: "desc" },
     });
+    // New products the supplier mentioned that aren't a real ProductDraft
+    // yet — see PendingProductLead's schema comment for why this exists.
+    // Scoped to THIS conversation, not the whole supplier, since it's
+    // about "what's still being negotiated in this chat right now."
+    pendingProductLeads = await prisma.pendingProductLead.findMany({
+      where: { conversationId, status: "PENDING" },
+      orderBy: { createdAt: "asc" },
+    });
   }
 
   return {
@@ -131,6 +155,8 @@ async function assembleContext({ conversationId }) {
     enrolmentPending,
     enrolmentMissingFields,
     pendingCheck,
+    pendingProductLeads,
+    extraUsage,
     recentMessages,
     priorSummary: conversation.summary || null,
   };

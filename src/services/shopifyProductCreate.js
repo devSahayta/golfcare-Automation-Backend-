@@ -140,7 +140,6 @@ async function createDraftProduct({
   });
 
   let product;
-  let imageIncluded = Boolean(imageUrl);
   try {
     const res = await client.post("/products.json", buildPayload(true));
     product = res.data.product;
@@ -156,8 +155,18 @@ async function createDraftProduct({
     );
     const res = await client.post("/products.json", buildPayload(false));
     product = res.data.product;
-    imageIncluded = false;
   }
+
+  // Confirmed live: some sources (Titleist's Demandware/Salesforce
+  // Commerce CDN, at least) reject Shopify's server-side image fetch
+  // (hotlink protection) WITHOUT the create call itself throwing — the
+  // product gets created successfully, just with images: [] in the
+  // response, no exception to land in the catch block above. Reporting
+  // success from "we sent an imageUrl" rather than "Shopify's response
+  // actually confirms one" silently told the supplier/model the image
+  // was live when the product had none. Check the real response, not the
+  // input.
+  const imageIncluded = Boolean(product.images && product.images.length > 0);
 
   return {
     shopifyProductId: String(product.id),

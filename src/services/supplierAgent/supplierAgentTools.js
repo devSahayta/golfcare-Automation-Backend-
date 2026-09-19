@@ -7,6 +7,7 @@ const { createDraftProduct } = require("../shopifyProductCreate");
 const { sendProductDraftApprovalEmail } = require("../emailService");
 const { updateVariantPrice, updateInventoryItemCost } = require("../shopifyInventory");
 const { computeCostPrice } = require("../pricingCalculator");
+const { researchProductSpecs } = require("./productResearch");
 
 function buildSupplierAgentTools(context) {
   const supplier = context.supplier;
@@ -41,11 +42,13 @@ function buildSupplierAgentTools(context) {
       const ambiguous = [];
       const unmatched = [];
       const needsPricingInfo = [];
+      const newProductCandidates = []; // full item data, for the lead upsert below — see there for why
 
       for (const item of items) {
         const skuOrName = (item?.skuOrName || "").trim();
         const status = item?.status;
-        if (!skuOrName || !status) {
+        const explicitSupplierProductId = item?.supplierProductId || null;
+        if (!status || (!skuOrName && !explicitSupplierProductId)) {
           unmatched.push({
             skuOrName: skuOrName || "(blank)",
             reason: "missing_sku_or_status",
@@ -53,7 +56,21 @@ function buildSupplierAgentTools(context) {
           continue;
         }
 
-        const match = matchSupplierProduct(catalog, skuOrName);
+        // Set once the supplier has actually picked a candidate off an
+        // earlier ambiguous result — bypasses fuzzy matching entirely
+        // instead of resending free text, which (confirmed live) just
+        // reproduces the same ambiguous set forever for two catalog items
+        // in the same brand/model family, with no way for the model to
+        // ever actually apply the update.
+        let match;
+        if (explicitSupplierProductId) {
+          const sp = catalog.find((c) => c.id === explicitSupplierProductId);
+          match = sp
+            ? { kind: "confident", supplierProduct: sp, label: candidateLabel(sp) }
+            : { kind: "unmatched" };
+        } else {
+          match = matchSupplierProduct(catalog, skuOrName);
+        }
 
         if (match.kind === "confident") {
           const result = await applyConfirmation({
@@ -66,18 +83,27 @@ function buildSupplierAgentTools(context) {
             gstPercent: item.gstPercent ?? null,
           });
           applied.push({
-            skuOrName,
+            skuOrName: skuOrName || match.label,
             matchedProductTitle: match.label,
             status,
             ...result,
           });
           if (result.needsPricingInfo) {
-            needsPricingInfo.push({ skuOrName, matchedProductTitle: match.label });
+            needsPricingInfo.push({ skuOrName: skuOrName || match.label, matchedProductTitle: match.label });
           }
         } else if (match.kind === "ambiguous") {
           ambiguous.push({ skuOrName, candidates: match.candidates });
+        } else if (explicitSupplierProductId) {
+          // An invalid/stale id, not a genuinely new product — don't spawn
+          // a PendingProductLead for it, that's for real unmatched rows.
+          unmatched.push({
+            skuOrName: skuOrName || "(blank)",
+            status,
+            reason: "supplierProductId_not_found",
+          });
         } else {
           unmatched.push({ skuOrName, status });
+          newProductCandidates.push(item);
         }
       }
 
@@ -89,6 +115,28 @@ function buildSupplierAgentTools(context) {
       // emails) in one turn. Above the cap, the model is told to escalate
       // the whole batch instead of attempting each one.
       const tooManyNewProducts = unmatched.length > env.supplierBulkNewProductLimit;
+
+      // Record each genuinely-new item as a PendingProductLead — NOT a
+      // ProductDraft yet, just a marker that this conversation still has
+      // something outstanding. This is what lets the guardrail actually
+      // catch the model claiming a new product is "live" without ever
+      // calling create_product_draft (confirmed live: it did exactly
+      // that, four times, across two replies). Skipped for the
+      // too-many-to-onboard-individually case — that's handled as one
+      // escalation, not per-item leads.
+      if (!tooManyNewProducts) {
+        for (const item of newProductCandidates) {
+          await upsertPendingProductLead({
+            conversationId: context.conversation.id,
+            supplierId: supplier.id,
+            title: item.skuOrName,
+            mrp: item.mrp ?? null,
+            marginPercent: item.marginPercent ?? null,
+            gstPercent: item.gstPercent ?? null,
+            leadTimeDays: item.leadTimeDays ?? null,
+          });
+        }
+      }
 
       return {
         applied,
@@ -263,12 +311,32 @@ function buildSupplierAgentTools(context) {
       };
     },
 
+    // Runs the actual web research in its OWN isolated Anthropic call (see
+    // productResearch.js's header for the full reasoning) instead of the
+    // model calling web_search/web_fetch directly in this conversation —
+    // confirmed live that doing it inline cost 107K input tokens for one
+    // product, because the raw scraped page got pulled into the same
+    // context as the whole supplier conversation and resent on every
+    // later iteration of that turn. Real token cost from the isolated
+    // call still gets tracked (context.extraUsage — see
+    // contextAssembler.js), just not paid for inside THIS conversation's
+    // context.
+    async research_product_specs({ title, brand }) {
+      if (!title) return { error: "title_required" };
+      const result = await researchProductSpecs({ title, brand });
+      context.extraUsage.inputTokens += result.usage.inputTokens;
+      context.extraUsage.outputTokens += result.usage.outputTokens;
+      context.extraUsage.costUsd += result.cost.usd;
+      context.extraUsage.costInr += result.cost.inr;
+      return { specs: result.specs, imageUrl: result.imageUrl, sourceNotes: result.sourceNotes };
+    },
+
     // Module 5.2 — a product the supplier mentioned that isn't in the
     // catalog. Creates it in Shopify as an unpublished draft immediately
     // (status: "draft"), records a ProductDraft with a single-use
     // approval token, and emails a human — never goes live on its own.
     // sourceType: "SUPPLIER_PROVIDED" (details came from the supplier) or
-    // "WEB_SCRAPED" (the model used the web_search tool because the
+    // "WEB_SCRAPED" (the model used research_product_specs because the
     // supplier couldn't provide them — sourceNotes should say what was
     // found and where, so a reviewer isn't just trusting it blind).
     async create_product_draft({
@@ -315,6 +383,7 @@ function buildSupplierAgentTools(context) {
       // time). Block on title, not on some upstream call being idempotent.
       const existingPending = await findExistingPendingDraft(supplier.id, title);
       if (existingPending) {
+        await resolvePendingProductLead({ conversationId: context.conversation.id, title, sku });
         return {
           error: "draft_already_exists",
           message:
@@ -357,6 +426,7 @@ function buildSupplierAgentTools(context) {
           marginPercent: marginPercent ?? null,
           gstPercent: gstPercent ?? null,
         });
+        await resolvePendingProductLead({ conversationId: context.conversation.id, title, sku });
         return {
           productAlreadyExisted: true,
           matchedProductTitle: catalogMatch.product.title,
@@ -369,6 +439,24 @@ function buildSupplierAgentTools(context) {
       let resolvedImageUrl = imageUrl || null;
       if (!resolvedImageUrl && sourceType === "SUPPLIER_PROVIDED") {
         resolvedImageUrl = await getLatestInboundImageUrl(context.conversation.id);
+      }
+
+      // Safety net, not the primary path — confirmed live that the model
+      // (Haiku especially) sometimes just skips the system prompt's
+      // "call research_product_specs first" instruction and drafts with
+      // whatever it has (real case: PXG 0211 Iron Set got no research at
+      // all). Only fires for what's actually still missing after the
+      // supplier's own message and any photo — if the model already
+      // researched and both specs and an image came back, this is a
+      // no-op, so a model that does the right thing pays no extra cost.
+      if (!specs || !resolvedImageUrl) {
+        const research = await researchProductSpecs({ title, brand });
+        context.extraUsage.inputTokens += research.usage.inputTokens;
+        context.extraUsage.outputTokens += research.usage.outputTokens;
+        context.extraUsage.costUsd += research.cost.usd;
+        context.extraUsage.costInr += research.cost.inr;
+        if (!specs) specs = research.specs || specs;
+        if (!resolvedImageUrl) resolvedImageUrl = research.imageUrl || resolvedImageUrl;
       }
 
       const cleanVariantOptions = Array.isArray(variantOptions)
@@ -480,6 +568,7 @@ function buildSupplierAgentTools(context) {
         );
       }
 
+      await resolvePendingProductLead({ conversationId: context.conversation.id, title, sku });
       return {
         draftCreated: true,
         shopifyProductId: shopifyResult.shopifyProductId,
@@ -509,6 +598,15 @@ function buildSupplierAgentTools(context) {
           data: { status: "ESCALATED" },
         });
       }
+
+      // Same reasoning as the SupplierCheck close-out above — a human now
+      // owns any new-product leads still open in this conversation, so
+      // they shouldn't keep showing up as "still outstanding" to the
+      // agent (or blocking the false-success guardrail) once escalated.
+      await prisma.pendingProductLead.updateMany({
+        where: { conversationId: context.conversation.id, status: "PENDING" },
+        data: { status: "RESOLVED", resolvedAt: new Date() },
+      });
 
       await prisma.auditLog.create({
         data: {
@@ -770,7 +868,22 @@ function matchSupplierProduct(catalog, query) {
     .sort((a, b) => b.score - a.score);
 
   if (scored.length === 0) return { kind: "unmatched" };
-  if (scored.length === 1 && scored[0].score >= 0.75) {
+  // A lone candidate at >=0.75 was always confident. Confirmed live this
+  // wasn't enough: a query resent as the EXACT title of one catalog entry
+  // (score 1.0) still got forced into "ambiguous" purely because a second,
+  // much weaker candidate (score ~0.4-0.6, same brand/model family — e.g.
+  // "Ping G430 Iron Set (6-PW)" vs. "G430 ... Steel Irons ... Stiff") also
+  // cleared the 0.5 floor. The model had no way to escape that: its only
+  // lever was resending the same text, which deterministically reproduced
+  // the same ambiguous set every time — a real dead-end loop that, live,
+  // ended with the model just fabricating a "recorded" reply instead of
+  // ever actually applying the update. A decisive top score with clear
+  // separation from the runner-up is exactly the "not actually ambiguous"
+  // case this was meant to allow through.
+  const decisiveTop =
+    scored[0].score >= 0.75 &&
+    (scored.length === 1 || scored[0].score - scored[1].score >= 0.25);
+  if (decisiveTop) {
     return {
       kind: "confident",
       supplierProduct: scored[0].sp,
@@ -908,6 +1021,87 @@ async function recordConfirmationOnOpenCheck({
       parsedBy: "supplier_agent",
       ...(allConfirmed && { status: "ANSWERED", respondedAt: new Date() }),
     },
+  });
+}
+
+// PendingProductLead upsert/resolve — see the model's schema comment for
+// why this exists (the guardrail that catches a false "created" claim
+// needs to know, reliably, what's genuinely still outstanding).
+//
+// Exact SKU match wins outright when available — confirmed live this
+// matters, not just in theory: a lead first surfaced from a supplier's
+// raw sheet as skuOrName "CLV-RTX6-56" never resolved after the real
+// create_product_draft call (title "Cleveland RTX 6 ZipCore Wedge 56°",
+// sku "CLV-RTX6-56") succeeded, because fuzzy token overlap between "CLV"/
+// "RTX6" and "Cleveland"/"RTX"/"6" as separate tokens landed under the
+// 0.5 threshold — real naming variation a token-overlap heuristic alone
+// doesn't handle. Falls back to fuzzy title-token overlap only when no
+// exact match is available on either side.
+function findLeadMatch(leads, { title, sku }) {
+  const normalizedSku = (sku || "").trim().toLowerCase();
+  if (normalizedSku) {
+    const exact = leads.find(
+      (lead) =>
+        (lead.sku || "").trim().toLowerCase() === normalizedSku ||
+        (lead.title || "").trim().toLowerCase() === normalizedSku,
+    );
+    if (exact) return exact;
+  }
+
+  const queryTokens = new Set(tokenize(title));
+  if (queryTokens.size === 0) return null;
+  return (
+    leads.find((lead) => {
+      const leadTokens = tokenize(lead.title);
+      const overlap = leadTokens.filter((t) => queryTokens.has(t)).length;
+      return overlap / Math.max(leadTokens.length, 1) >= 0.5;
+    }) || null
+  );
+}
+
+async function upsertPendingProductLead({
+  conversationId,
+  supplierId,
+  title,
+  mrp,
+  marginPercent,
+  gstPercent,
+  leadTimeDays,
+}) {
+  const openLeads = await prisma.pendingProductLead.findMany({
+    where: { conversationId, status: "PENDING" },
+  });
+  const existing = findLeadMatch(openLeads, { title });
+
+  const data = {
+    ...(mrp != null && { mrp }),
+    ...(marginPercent != null && { marginPercent }),
+    ...(gstPercent != null && { gstPercent }),
+    ...(leadTimeDays != null && { leadTimeDays }),
+  };
+
+  if (existing) {
+    await prisma.pendingProductLead.update({ where: { id: existing.id }, data });
+  } else {
+    // skuOrName from reconcile_stock_list is genuinely ambiguous at
+    // ingestion time — could be a real name or a bare SKU (as it was
+    // here) — stored as both so resolution can match on whichever one
+    // create_product_draft ends up using later.
+    await prisma.pendingProductLead.create({
+      data: { conversationId, supplierId, title, sku: title, ...data },
+    });
+  }
+}
+
+async function resolvePendingProductLead({ conversationId, title, sku }) {
+  const openLeads = await prisma.pendingProductLead.findMany({
+    where: { conversationId, status: "PENDING" },
+  });
+  const match = findLeadMatch(openLeads, { title, sku });
+  if (!match) return;
+  await prisma.pendingProductLead.update({
+    where: { id: match.id },
+    data: { status: "RESOLVED", resolvedAt: new Date() },
   });
 }
 

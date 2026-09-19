@@ -27,6 +27,12 @@ const anthropic = new Anthropic({
  * @param {Object.<string, Function>} input.toolHandlers - name -> async (input) => output
  * @param {Array} input.history - [{role: "user"|"assistant", content: string}]
  * @param {number} input.maxIterations
+ * @param {string} [input.model] - overrides env.anthropicModel for this call. Exists for
+ *   callers that need a specific model's reliability regardless of what the main
+ *   conversation is configured to use — see supplierAgent/productResearch.js, which
+ *   pins its isolated research call to Sonnet even when the main agent is on Haiku
+ *   (confirmed live: Haiku unreliably followed the "always return valid JSON"
+ *   instruction that call depends on).
  * @returns {Promise<{finalText: string|null, toolCallLog: Array, hitIterationCap: boolean, stopReason: string, usage: {inputTokens: number, outputTokens: number}}>}
  *   `usage` is the REAL token count summed across every Anthropic API call this
  *   invocation made (every loop iteration is a separate billed call) — not an
@@ -38,6 +44,7 @@ async function runToolLoop({
   toolHandlers,
   history,
   maxIterations,
+  model,
 }) {
   const messages = history.map((m) => ({ role: m.role, content: m.content }));
   const toolCallLog = [];
@@ -76,7 +83,7 @@ async function runToolLoop({
     // time after the fact with no visibility into which part was slow.
     const apiCallStartedAt = Date.now();
     const response = await anthropic.messages.create({
-      model: env.anthropicModel,
+      model: model || env.anthropicModel,
       max_tokens: 1024,
       system: systemPrompt,
       tools,
@@ -84,6 +91,10 @@ async function runToolLoop({
     });
     console.log(
       `[toolLoop] iteration ${iterations}: anthropic.messages.create took ${Date.now() - apiCallStartedAt}ms`,
+    );
+
+    console.log(
+      `model=${model || env.anthropicModel} stop_reason=${response?.stop_reason}`,
     );
 
     totalInputTokens += response.usage?.input_tokens || 0;

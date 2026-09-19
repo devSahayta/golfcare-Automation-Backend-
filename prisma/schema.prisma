@@ -362,6 +362,36 @@ model Product {
   @@index([shopifyProductId], map: "idx_product_shopify_id")
 }
 
+/// Tracks a new product the supplier mentioned that hasn't been turned
+/// into a real ProductDraft yet — usually because required info (margin/
+/// GST) is still being gathered across a couple of WhatsApp turns. Exists
+/// so the agent (and a guardrail) can reliably know "is something still
+/// outstanding here" instead of relying on its own memory of the
+/// conversation — confirmed live, that trust was misplaced: the agent
+/// told a supplier four different new products were "created and live"
+/// across two separate replies without ever once calling
+/// create_product_draft for any of them. Deliberately separate from
+/// ProductDraft (which requires a real approvalToken/tokenExpiresAt and
+/// represents something that actually exists in Shopify) rather than
+/// overloading that table with a pre-creation "still gathering info" state.
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model PendingProductLead {
+  id             String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  conversationId String
+  supplierId     String
+  title          String
+  sku            String?
+  mrp            Decimal?  @db.Decimal
+  marginPercent  Decimal?  @db.Decimal
+  gstPercent     Decimal?  @db.Decimal
+  leadTimeDays   Int?
+  status         String    @default("PENDING")
+  createdAt      DateTime  @default(now()) @db.Timestamptz(6)
+  resolvedAt     DateTime? @db.Timestamptz(6)
+
+  @@index([conversationId, status], map: "idx_pendingproductlead_conversation_status")
+}
+
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model ProductDraft {
   id                    String              @id @default(dbgenerated("(gen_random_uuid())::text"))
