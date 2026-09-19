@@ -42,6 +42,53 @@ const env = {
     process.env.HANDOVER_VALUE_THRESHOLD_INR || 75000,
   ),
   agentMaxToolIterations: Number(process.env.AGENT_MAX_TOOL_ITERATIONS || 6),
+  // Hard backend cap (not just a prompt suggestion — confirmed live that
+  // instruction alone doesn't reliably stop the model) on how many pending
+  // check-in items list_pending_items will ever return in one call. Above
+  // this, a supplier's catalog is too large to read out in a WhatsApp
+  // message anyway; the agent is told to ask for a stock sheet or a
+  // blanket status instead of enumerating.
+  supplierListableItemLimit: Number(
+    process.env.SUPPLIER_LISTABLE_ITEM_LIMIT || 40,
+  ),
+  // confirm_all_pending_items (supplierAgentTools.js) always updates every
+  // item's DB record (the real source of truth), but each Shopify
+  // inventory write is itself 2-3 Admin API calls — doing that inline for
+  // thousands of items in one webhook request risks a serverless timeout
+  // and hammers Shopify's rate limit (confirmed live: 100 inline at
+  // concurrency 3 hit "Exceeded 2 calls per second" repeatedly). Only the
+  // first N (by this cap) get an inline Shopify sync per bulk-confirm
+  // call, paced at roughly Shopify's own real limit (see
+  // SHOPIFY_SYNC_CONCURRENCY_DELAY_MS below); the rest — and anything
+  // among the first N that still fails — land in ShopifySyncQueue for the
+  // scheduler to catch up on its own schedule. Lowered from 100: at a
+  // rate-limit-safe pace, 100 inline would take ~2.5 minutes in one
+  // request — fine for local testing, not for a real Vercel deploy.
+  bulkConfirmShopifySyncCap: Number(
+    process.env.BULK_CONFIRM_SHOPIFY_SYNC_CAP || 20,
+  ),
+  // Applies to any code pacing multiple Shopify Admin API writes in a
+  // loop (confirm_all_pending_items here; shopifySyncQueueDrain.js in the
+  // scheduler repo has its own copy of this same constant). Shopify's
+  // real sustained limit is ~2 requests/second, and each variant sync is
+  // itself up to 3 sequential requests (resolve inventory item, ensure
+  // tracked, set level) — so pacing by variant, not by raw request, needs
+  // real headroom. 1500ms between variants keeps sustained throughput
+  // comfortably under the limit even on a cold cache (no request memoized
+  // yet from a prior call in this process).
+  shopifySyncPaceMs: Number(process.env.SHOPIFY_SYNC_PACE_MS || 1500),
+  // reconcile_stock_list's unmatched rows are the "maybe a new product"
+  // path — each one the model tries to actively onboard costs a real
+  // Shopify product-creation call, an approval email, and potentially a
+  // web_search/web_fetch round trip. A sheet with dozens of genuinely new
+  // (unmatched) rows would try to onboard all of them one by one in the
+  // same turn — expensive, slow, and floods the approval inbox with one
+  // email per product. Above this count, unmatched rows are capped and
+  // the model is told to escalate the whole batch to a human instead of
+  // attempting each one individually.
+  supplierBulkNewProductLimit: Number(
+    process.env.SUPPLIER_BULK_NEW_PRODUCT_LIMIT || 5,
+  ),
   agentHistoryMessageLimit: Number(
     process.env.AGENT_HISTORY_MESSAGE_LIMIT || 20,
   ),
