@@ -1,15 +1,18 @@
 // src/services/agentEngine/modelRouter.js
 //
-// Hybrid model routing for the Sales Agent. Picks which Claude model
-// serves THIS turn, using signals already computed for free (context
-// phase from contextAssembler.js + a keyword scan of the customer's
-// latest message) — never an extra LLM call, so routing adds zero cost
-// or latency.
+// Hybrid model routing. Picks which Claude model serves THIS turn, using
+// signals already computed for free (context phase from
+// contextAssembler.js + a keyword scan of the customer's latest message)
+// — never an extra LLM call, so routing adds zero cost or latency.
 //
-// Philosophy: default to the safer model (Sonnet) whenever a turn is
-// ambiguous or could plausibly need a precise tool call. Only route to
-// Haiku for turns provably low-risk — a fixed onboarding answer, or a
-// plain conversational turn before any membership pitch has started.
+// Two independent strategies live here:
+// - Supplier Agent: a fixed, separately-tested rule (Haiku always, see
+//   the participantType check below) — nothing heuristic.
+// - Sales Agent: default to the safer model (Sonnet) whenever a turn is
+//   ambiguous or could plausibly need a precise tool call, and only
+//   route to Haiku for turns provably low-risk — a fixed onboarding
+//   answer, or a plain conversational turn before any membership pitch
+//   has started.
 
 const { env } = require("../../config/env");
 
@@ -20,6 +23,18 @@ function pickModel({ context, lastUserMessage, forceStrong = false }) {
   // Guardrail-retry turns always get the stronger model — a draft was
   // already rejected once, don't risk repeating the same mistake.
   if (forceStrong) return env.anthropicModelSonnet;
+
+  // Supplier Agent has its own, separately-tested cost strategy: Haiku
+  // for the main conversation always, Sonnet only for the isolated
+  // product-research call (pinned directly in productResearch.js,
+  // unaffected by this router) and a guardrail retry (forceStrong,
+  // above). The heuristics below this point are Sales-specific
+  // (membership/enrolment/product-browsing signals) and would otherwise
+  // route most supplier turns to Sonnet anyway — confirmed live,
+  // PRODUCT_INTENT_RE matches ordinary check-in language like
+  // "stock"/"price"/"available" constantly, silently defeating the whole
+  // point of the hybrid-cost work done for Supplier Agent.
+  if (context.participantType === "SUPPLIER") return env.anthropicModelHaiku;
 
   const text = (lastUserMessage || "").toLowerCase();
 
