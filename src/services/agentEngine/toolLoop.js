@@ -27,12 +27,13 @@ const anthropic = new Anthropic({
  * @param {Object.<string, Function>} input.toolHandlers - name -> async (input) => output
  * @param {Array} input.history - [{role: "user"|"assistant", content: string}]
  * @param {number} input.maxIterations
- * @param {string} [input.model] - overrides env.anthropicModel for this call. Exists for
- *   callers that need a specific model's reliability regardless of what the main
- *   conversation is configured to use — see supplierAgent/productResearch.js, which
- *   pins its isolated research call to Sonnet even when the main agent is on Haiku
- *   (confirmed live: Haiku unreliably followed the "always return valid JSON"
- *   instruction that call depends on).
+ * @param {string} [input.model] - which model this call uses. Normally always passed
+ *   explicitly (agentEngine/modelRouter.js's per-turn pick, or a caller pinning a
+ *   specific model's reliability regardless of what the main conversation would
+ *   otherwise use — see supplierAgent/productResearch.js, which pins its isolated
+ *   research call to Sonnet even when the main agent is on Haiku; confirmed live:
+ *   Haiku unreliably followed the "always return valid JSON" instruction that call
+ *   depends on). Falls back to env.anthropicModelSonnet if omitted.
  * @returns {Promise<{finalText: string|null, toolCallLog: Array, hitIterationCap: boolean, stopReason: string, usage: {inputTokens: number, outputTokens: number}}>}
  *   `usage` is the REAL token count summed across every Anthropic API call this
  *   invocation made (every loop iteration is a separate billed call) — not an
@@ -44,20 +45,18 @@ async function runToolLoop({
   toolHandlers,
   history,
   maxIterations,
-  model,
+  model, // which Claude model this loop's calls use — either an explicit pin
+  // (see supplierAgent/productResearch.js, always Sonnet) or chosen per-turn
+  // by modelRouter.js; falls back to env.anthropicModel if unset.
 }) {
   const messages = history.map((m) => ({ role: m.role, content: m.content }));
   const toolCallLog = [];
   let iterations = 0;
 
-  // Real token usage, accumulated across every Anthropic call this loop
-  // makes (every iteration is a separate billed API call — see the
-  // per-iteration timing logs below). This is the ACTUAL data
-  // response.usage gives back on every call, not an estimate — summing
-  // it here is what lets a caller compute real, exact per-conversation
-  // cost afterward instead of guessing from typical token counts.
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let totalCacheCreationTokens = 0; // NEW
+  let totalCacheReadTokens = 0; // NEW
 
   while (true) {
     iterations += 1;
@@ -74,31 +73,51 @@ async function runToolLoop({
       };
     }
 
-    // Timing — diagnostic only, doesn't change any behavior. Added so
-    // slow turns (customers have seen replies take 20-30+ seconds even
-    // when the message reached the server promptly) can actually be
-    // traced to a specific cause — Anthropic API latency vs. tool
-    // handler latency (DB/Shopify calls) vs. genuinely needing many
-    // sequential iterations — instead of only knowing the total elapsed
-    // time after the fact with no visibility into which part was slow.
     const apiCallStartedAt = Date.now();
     const response = await anthropic.messages.create({
-      model: model || env.anthropicModel,
+      // env.anthropicModel (a single static model for the whole app) no
+      // longer exists — replaced by per-turn dynamic routing (see
+      // agentEngine/modelRouter.js). Every real caller today always
+      // passes an explicit model (modelRouter's pick, or
+      // productResearch.js's pinned Sonnet), so this is just a safety
+      // net, not the normal path.
+      model: model || env.anthropicModelSonnet,
       max_tokens: 1024,
-      system: systemPrompt,
-      tools,
+      // Prompt caching — system prompt + tool schemas are identical
+      // across every iteration of this loop within a turn, and often
+      // across consecutive turns too. Marking them cacheable means only
+      // the first call in a burst pays full input price; subsequent
+      // calls hitting the cache pay ~90% less for this portion. Biggest
+      // win on exactly the multi-tool-call turns that were costing the
+      // most (each iteration previously resent this whole block at full
+      // price).
+      system: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      tools: tools.map((t, i) =>
+        i === tools.length - 1
+          ? { ...t, cache_control: { type: "ephemeral" } }
+          : t,
+      ),
       messages,
     });
     console.log(
-      `[toolLoop] iteration ${iterations}: anthropic.messages.create took ${Date.now() - apiCallStartedAt}ms`,
+      `[toolLoop] iteration ${iterations}: model=${model || env.anthropicModelSonnet} anthropic.messages.create took ${Date.now() - apiCallStartedAt}ms`,
     );
 
     console.log(
-      `model=${model || env.anthropicModel} stop_reason=${response?.stop_reason}`,
+      `model=${model || env.anthropicModelSonnet} stop_reason=${response?.stop_reason}`,
     );
 
     totalInputTokens += response.usage?.input_tokens || 0;
     totalOutputTokens += response.usage?.output_tokens || 0;
+    totalCacheCreationTokens +=
+      response.usage?.cache_creation_input_tokens || 0; // NEW
+    totalCacheReadTokens += response.usage?.cache_read_input_tokens || 0; // NEW
     console.log(
       `[toolLoop] iteration ${iterations}: input_tokens=${response.usage?.input_tokens ?? "n/a"} output_tokens=${response.usage?.output_tokens ?? "n/a"} (running total: ${totalInputTokens} in / ${totalOutputTokens} out)`,
     );
@@ -142,6 +161,8 @@ async function runToolLoop({
         usage: {
           inputTokens: totalInputTokens,
           outputTokens: totalOutputTokens,
+          cacheCreationTokens: totalCacheCreationTokens, // NEW
+          cacheReadTokens: totalCacheReadTokens, // NEW
         },
       };
     }

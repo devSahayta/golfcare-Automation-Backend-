@@ -452,13 +452,19 @@ function buildSalesAgentTools(context) {
     },
 
     async get_product({ productId, variantId }) {
+      // Strips descriptionHtml before returning to the model — raw HTML
+      // markup the model never needs, and since this result gets resent
+      // on every subsequent tool-loop iteration + every later turn in
+      // the conversation, keeping it in was compounding cost for zero
+      // benefit.
       if (variantId) {
         const variant = await prisma.variant.findUnique({
           where: { id: variantId },
           include: { Product: true },
         });
         if (!variant) return { error: "variant_not_found" };
-        return { variant, product: variant.Product };
+        const { descriptionHtml, ...productWithoutHtml } = variant.Product;
+        return { variant, product: productWithoutHtml };
       }
       if (productId) {
         const product = await prisma.product.findUnique({
@@ -466,7 +472,8 @@ function buildSalesAgentTools(context) {
           include: { Variant: true },
         });
         if (!product) return { error: "product_not_found" };
-        return { product };
+        const { descriptionHtml, ...productWithoutHtml } = product;
+        return { product: productWithoutHtml };
       }
       return { error: "productId_or_variantId_required" };
     },

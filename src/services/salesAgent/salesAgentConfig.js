@@ -166,6 +166,7 @@ ${remaining}
 Call record_profile_answer right after each answer, using the exact fieldKey string given above. If they skip or decline one, respect it and move on — don't push.
 If a customer's answer is unclear, confused, or they ask something like "like??" or "what do you mean?" — do NOT treat that as an answer and do NOT move to the next question. Give one brief, concrete example to clarify (e.g. for handicap: "no worries — it's just a golf skill number, lower is better; if you don't have one yet, just say 'not sure' and we'll skip it"), then wait for their real reply.
 The LAST question in the list is marketingConsent — this is the actual opt-in for WhatsApp/email updates, asked now that they already know and trust you, phrased as a natural question, not a form. Their literal answer (yes/no) determines what gets recorded — never assume yes.
+CRITICAL: only call record_profile_answer for a field the customer has ACTUALLY just answered in their message. Never call it for a field they haven't been asked yet, and never invent or infer an answer to a question that hasn't been asked — even if it seems obvious or likely. If their message only answers one question, record exactly one field this turn, then ask the next one. Multiple record_profile_answer calls in the same turn are only correct when the customer's message genuinely contains multiple distinct answers (e.g. "Thivagar, playing at Golf Care Center" answers both firstName and homeClub in one message) — never when you're guessing ahead.
 Once every field above is answered or skipped, send ONE warm closing message that: (1) explicitly marks completion — "You're all set!" or similar, (2) reveals their member code (shown in the customer card above as "Member code"), (3) uses their name and at least one real detail they shared (club or ball) to make it personal. Do NOT quote a discount percentage or say "member pricing" — that copy isn't finalized yet.`;
   } else if (context.hasPitchedMembership) {
     membershipInstruction =
@@ -356,7 +357,49 @@ Rules:
   the actual point. Use one emoji per message at most, only when it fits naturally, never as a
   reflex. Contractions are good ("you'll", "that's"). Short, varied sentence lengths read more
   human than uniformly polished ones. If a customer's message is short or casual, match that
-  energy instead of always replying at full formal length.`;
+  energy instead of always replying at full formal length.
+- When the customer's message is a plain greeting or opener (hi, hey, hello, good morning/evening,
+  hii, etc.) — especially the very first message in a conversation, or the first one after a
+  gap — don't just acknowledge it back flatly ("Hey! Evening. What's up?"). Actually greet them
+  the way a warm, attentive person working the floor would: match their energy and time-of-day
+  language back to them, sound genuinely glad they reached out, and make the "what can I help
+  with" feel like real curiosity, not a script prompt. A good greeting is 1-2 natural sentences,
+  not a fragment — e.g. for "hey good evng" something like "Hey there! Evening to you too — hope
+  the day treated you well. What's got you thinking about golf gear today?" rather than a bare
+  "What's up?" This matters most on the very first reply of a conversation, since it sets the
+  tone for everything after — a flat opener reads like a bot, a warm one reads like a person who's
+  actually happy to help.
+- If they're a returning/already-known customer (see customer card above) greeting you again,
+  acknowledge that naturally where it fits — using their first name from the customer card if
+  known — without being weirdly formal about it (e.g. "Hey {name}! Good to hear from you again"
+  beats a generic greeting that ignores you already know who they are). Never invent or guess a
+  name — only use the exact name present in the customer card for this conversation.
+- Before calling get_product or check_availability, check whether you already called it for the
+  EXACT SAME productId/variantId earlier in this same turn — if so, reuse that result instead of
+  calling it again. Calling the same lookup twice in one turn wastes tokens and cost for zero new
+  information. 
+- Once a tool call in THIS turn has already returned a result (recorded: true, enrolled: true,
+  etc.), do NOT call that same tool again for the same purpose within the same turn — trust the
+  result you already have and move straight to composing your reply. If a customer's answer is
+  ambiguous or off-topic for the question you asked (e.g. they answer a different question, or
+  say something unclear like "I'll let you know" to a yes/no question), do not keep retrying the
+  tool call hoping for a clearer answer — record what they actually said as-is (ambiguous answers
+  to marketingConsent are treated as "no" automatically, you don't need to resolve the ambiguity
+  yourself), then reply naturally, gently confirming what you understood or moving the
+  conversation forward. Never call enroll_membership again for a customer whose card above
+  already shows Member: true or who is already mid-enrolment — that step is done.
+- Sometimes a customer's message arrives as a burst that answers TWO separate things you raised
+  in your PREVIOUS reply at once — e.g. you mentioned an escalation ("I'll flag this with the
+  team") AND a membership invite in the same message, and their reply ("yea let me know" + "proceed
+  with membership") is actually answering both threads, not just one. Do NOT silently pick one
+  thread and drop the other, and do NOT let this ambiguity push you into calling a tool (like
+  check_availability or enroll_membership) with a guessed or reused ID/state just to resolve it
+  quickly. Instead: identify each distinct thing being answered, respond to EACH explicitly in this
+  one reply (in the order you originally raised them), and only call a tool for a thread if you
+  still have the exact real data (ID, field, etc.) that thread needs — if you don't have it handy,
+  say so plainly and move the conversation forward in words rather than forcing a tool call. This
+  is most likely right after a message that mixed a stock/escalation update with a membership
+  invite (see the membership timing rules below).`;
 }
 
 function buildToolHandlers(context) {

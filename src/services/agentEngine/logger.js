@@ -49,6 +49,7 @@ async function logAudit({ action, conversationId, before, after }) {
 async function logUsage({
   conversationId,
   agentName,
+  model, // NEW
   inputTokens,
   outputTokens,
   costUsd,
@@ -61,6 +62,7 @@ async function logUsage({
       data: {
         conversationId,
         agentName: agentName || "unknown",
+        model: model || null, // NEW
         inputTokens: inputTokens || 0,
         outputTokens: outputTokens || 0,
         costUsd: costUsd || 0,

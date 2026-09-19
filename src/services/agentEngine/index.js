@@ -1,61 +1,97 @@
-// src/services/agentEngine/index.js
-//
-// The one function every entry point calls: runAgent({ conversationId,
-// config, sendFn }). This file should never need to change when a new
-// agent type (Supplier, Lifecycle, Insights) is added — only `config`
-// (systemPrompt/tools/handlers) and the entry point calling this differ.
-//
-// Locking: WhatsApp can deliver two quick messages before the first
-// response finishes. processingLockedAt on Conversation prevents two
-// runAgent() calls racing on the same conversation — same bug class as
-// Module 1's "finish all DB writes before res.send()" issue. If the lock
-// is stale (a prior run crashed mid-way without releasing it), it's
-// treated as free after AGENT_PROCESSING_LOCK_STALE_MINUTES.
-//
-// Requires a schema change: Conversation.processingLockedAt DateTime?
-// — see INTEGRATION.md.
-
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
 const { assembleContext } = require("./contextAssembler");
 const { runToolLoop } = require("./toolLoop");
 const { runGuardrails: runDefaultGuardrails } = require("./guardrails");
 const { logMessage, logAudit, logUsage } = require("./logger");
-const { computeCost } = require("./modelPricing");
+const { pickModel } = require("./modelRouter");
 
-// Cost estimate — priced via modelPricing.js's shared rate table, keyed
-// by whichever model actually ran (env.anthropicModel for the main
-// conversation). NOT just `computeCost(env.anthropicModel, totalUsage)`
-// directly, though — totalUsage can include real tokens from a tool
-// handler's OWN separate Anthropic call at a DIFFERENT, deliberately
-// pinned model (context.extraUsage — see productResearch.js, pinned to
-// Sonnet regardless of the main conversation's model). Blending those
-// tokens into one rate would reintroduce exactly the bug just fixed
-// (silently mispricing real spend after a model switch) — extraCost is
-// already correctly priced at ITS OWN model when it was recorded, so it's
-// added on top of the main loop's own cost, never re-derived from merged
-// token counts at a single blended rate.
-function estimateCostInr(usage, extraCost) {
+// Kept exactly as before — still the fallback rate for any model not
+// found in MODEL_RATES below (e.g. if env.anthropicModel is set to
+// something not equal to either Sonnet or Haiku's configured string).
+const COST_INPUT_USD_PER_MTOK = 3;
+const COST_OUTPUT_USD_PER_MTOK = 15;
+const USD_TO_INR = 95;
+
+// NEW — per-model rates, needed because a single conversation can now
+// mix Sonnet and Haiku calls (initial attempt on one model, guardrail
+// retry forced onto Sonnet). Keyed by the actual model string so it
+// stays correct even if env vars change which literal model name each
+// tier points to.
+const MODEL_RATES = {
+  "claude-sonnet-4-6": { input: 3, output: 15 },
+  "claude-haiku-4-5-20251001": { input: 1, output: 5 },
+  [env.anthropicModelSonnet]: { input: 3, output: 15 },
+  [env.anthropicModelHaiku]: { input: 1, output: 5 },
+};
+
+function estimateCostForModel(usage, model) {
   if (!usage) return null;
-  const mainCost = computeCost(env.anthropicModel, usage);
-  return {
-    usd: mainCost.usd + (extraCost?.usd || 0),
-    inr: mainCost.inr + (extraCost?.inr || 0),
+  const rates = MODEL_RATES[model] || {
+    input: COST_INPUT_USD_PER_MTOK,
+    output: COST_OUTPUT_USD_PER_MTOK,
   };
+  const inputCost = (usage.inputTokens / 1_000_000) * rates.input;
+  const outputCost = (usage.outputTokens / 1_000_000) * rates.output;
+  // NEW — cache writes cost 1.25x normal input rate, cache reads cost
+  // 0.1x normal input rate. Both were previously untracked entirely,
+  // meaning logged cost understated the real Anthropic bill.
+  const cacheWriteCost =
+    ((usage.cacheCreationTokens || 0) / 1_000_000) * rates.input * 1.25;
+  const cacheReadCost =
+    ((usage.cacheReadTokens || 0) / 1_000_000) * rates.input * 0.1;
+  const usd = inputCost + outputCost + cacheWriteCost + cacheReadCost;
+  return { usd, inr: usd * USD_TO_INR };
 }
 
-// Sums usage across every attempt() call made for a single runAgent()
-// invocation — the initial attempt PLUS a guardrail self-heal retry if
-// one happened. A retry is a real, separately-billed Anthropic call (it
-// re-sends the system prompt + full history again, same as any other
-// iteration), so it must be counted too — logging only the final
-// attempt's usage would understate the true cost of any conversation
-// that needed a retry.
 function addUsage(a, b) {
   return {
     inputTokens: (a?.inputTokens || 0) + (b?.inputTokens || 0),
     outputTokens: (a?.outputTokens || 0) + (b?.outputTokens || 0),
   };
+}
+
+// NEW — sums two cost objects, same spirit as addUsage above. Needed
+// because Sonnet and Haiku costs must be added at THEIR OWN rates, not
+// summed as raw tokens and priced once at the end (that would silently
+// mis-price whichever model didn't match). Also reused below to fold in
+// context.extraUsage's own pre-computed cost (an isolated tool-handler
+// API call, e.g. Supplier Agent's product research — see
+// contextAssembler.js's extraUsage comment and productResearch.js) —
+// that cost is already correctly priced at ITS OWN pinned model when it
+// was recorded, so it's added on top here rather than re-derived from
+// merged token counts at a single blended rate.
+function addCost(a, b) {
+  return {
+    usd: (a?.usd || 0) + (b?.usd || 0),
+    inr: (a?.inr || 0) + (b?.inr || 0),
+  };
+}
+
+// Merges context.extraUsage (tokens + pre-priced cost from an isolated
+// tool-handler API call this attempt made) into the running totals, then
+// resets it so a later attempt() in the same turn (missedProfileAnswer
+// repair, guardrail retry) doesn't double-count it. Real bug, caught
+// live: folding extraUsage's tokens into totalUsage and THEN pricing
+// that whole blend at the main model's rate double-counted the isolated
+// call's cost (once correctly via its own pre-computed cost, once more
+// by re-pricing its tokens at the main model's rate). Keeping cost
+// addition strictly cost-to-cost (addCost) rather than tokens-then-price
+// avoids that regardless of how many different models are mixed into one
+// turn.
+function mergeExtraUsage(context, totalUsage, totalCost) {
+  const merged = {
+    totalUsage: addUsage(totalUsage, context.extraUsage),
+    totalCost: addCost(totalCost, {
+      usd: context.extraUsage.costUsd,
+      inr: context.extraUsage.costInr,
+    }),
+  };
+  context.extraUsage.inputTokens = 0;
+  context.extraUsage.outputTokens = 0;
+  context.extraUsage.costUsd = 0;
+  context.extraUsage.costInr = 0;
+  return merged;
 }
 
 async function acquireLock(conversationId) {
@@ -81,14 +117,32 @@ async function releaseLock(conversationId) {
       where: { id: conversationId },
       data: { processingLockedAt: null },
     })
-    .catch(() => {}); // best-effort — don't let lock release itself throw past a finally
+    .catch(() => {});
 }
 
-// Every path that ends the conversation in AWAITING_HUMAN goes through
-// this one place, so the customer is NEVER left in total silence — a
-// real, recurring UX problem where guardrail blocks or iteration caps
-// would flip state with zero message sent, leaving a long, otherwise-good
-// conversation dead-ending with no explanation at all.
+// NEW — increments Conversation.totalCostUsd/totalCostInr atomically via
+// Prisma's `increment`, so concurrent turns (shouldn't happen thanks to
+// the lock, but defensive anyway) never clobber each other's totals.
+// Best-effort like releaseLock — never let this throw past the turn
+// that already succeeded and already sent a reply to the customer.
+async function addToConversationTotal(conversationId, cost) {
+  if (!cost) return;
+  await prisma.conversation
+    .update({
+      where: { id: conversationId },
+      data: {
+        totalCostUsd: { increment: cost.usd },
+        totalCostInr: { increment: cost.inr },
+      },
+    })
+    .catch((err) => {
+      console.error(
+        "[agentEngine] failed to update conversation totalCost:",
+        err.message,
+      );
+    });
+}
+
 async function escalateWithMessage({
   conversationId,
   conversation,
@@ -103,20 +157,33 @@ async function escalateWithMessage({
     data: { state: "AWAITING_HUMAN" },
   });
   await logAudit({ action, conversationId, before, after });
-  await sendFn({
-    conversation,
-    text:
-      customerMessage ||
-      "One sec — let me get someone from our team to jump in here and make sure you're looked after properly. They'll be with you shortly! 🙌",
-  }).catch(() => {});
+
+  const fallbackText =
+    customerMessage ||
+    "One sec — let me get someone from our team to jump in here and make sure you're looked after properly. They'll be with you shortly! 🙌";
+
+  await sendFn({ conversation, text: fallbackText }).catch(() => {});
+
+  // NEW — this fallback message actually goes out to the customer on
+  // WhatsApp via sendFn above, but was never being written to Message,
+  // leaving a silent gap in the conversation history right where an
+  // escalation happened. Logged as its own OUTBOUND/AI_AGENT row, same
+  // shape as a normal sent reply, so the Message table stays a complete
+  // record of what the customer actually saw.
+  await logMessage({
+    conversationId,
+    direction: "OUTBOUND",
+    sender: "AI_AGENT",
+    body: fallbackText,
+    toolCalls: [],
+  }).catch((err) => {
+    console.error(
+      "[agentEngine] failed to log escalation fallback message:",
+      err.message,
+    );
+  });
 }
 
-/**
- * @param {object} input
- * @param {string} input.conversationId
- * @param {object} input.config - { tools, buildSystemPrompt, buildToolHandlers }
- * @param {(args: {conversation: object, text: string}) => Promise<void>} input.sendFn
- */
 async function runAgent({ conversationId, config, sendFn }) {
   const gotLock = await acquireLock(conversationId);
   if (!gotLock) {
@@ -127,14 +194,6 @@ async function runAgent({ conversationId, config, sendFn }) {
   try {
     const context = await assembleContext({ conversationId });
 
-    // AWAITING_HUMAN means "flagged for review" — it is NOT the same as
-    // HUMAN_HANDLING (a staff member has actually taken over). The AI
-    // should never go permanently silent just because something was
-    // flagged at some earlier point; the moment the customer sends
-    // anything new, resume automatically so they always get a live
-    // response. The flag itself is preserved in AuditLog for staff to
-    // review whenever they get to it — this doesn't lose that signal,
-    // it just stops it from freezing the conversation.
     if (context.conversation.state === "AWAITING_HUMAN") {
       await prisma.conversation.update({
         where: { id: conversationId },
@@ -145,8 +204,6 @@ async function runAgent({ conversationId, config, sendFn }) {
         `[agentEngine] ${conversationId} auto-resumed from AWAITING_HUMAN.`,
       );
     } else if (context.conversation.state !== "AI_HANDLING") {
-      // HUMAN_HANDLING or CLOSED — a real person is genuinely handling
-      // this, or the conversation is done. Never auto-override either.
       console.log(
         `[agentEngine] ${conversationId} state=${context.conversation.state}, agent not invoked.`,
       );
@@ -154,24 +211,22 @@ async function runAgent({ conversationId, config, sendFn }) {
     }
 
     const systemPrompt = config.buildSystemPrompt(context);
-    // Module 5's check-in dispatch logs the WhatsApp template send itself
-    // as a Message row (sender: "SYSTEM", body: null) purely for an audit
-    // trail — it was never meant to become a turn in the model's own
-    // conversation history. Left in, `m.body || ""` turns each one into an
-    // empty-content "assistant" turn; a run of those right before the
-    // supplier's reply gives the model nothing indicating a check-in went
-    // out at all (confirmed live: a bare "yes"/"Okay" reply got a generic
-    // reply instead of the itemized list — the pendingCheck system-prompt
-    // section was correct, but the empty turns immediately before it in
-    // history were pure noise). Filtered out here rather than given
-    // placeholder text, since the pendingCheck section already tells the
-    // model everything it needs about what was sent and what's pending.
-    const history = context.recentMessages
+    const rawHistory = context.recentMessages
       .filter((m) => m.sender !== "SYSTEM" || m.body)
       .map((m) => ({
         role: m.sender === "CUSTOMER" ? "user" : "assistant",
         content: m.body || "",
       }));
+
+    const history = [];
+    for (const turn of rawHistory) {
+      const last = history[history.length - 1];
+      if (last && last.role === turn.role) {
+        last.content = `${last.content}\n${turn.content}`.trim();
+      } else {
+        history.push({ ...turn });
+      }
+    }
 
     if (history.length === 0 || history[history.length - 1].role !== "user") {
       console.log(
@@ -181,16 +236,15 @@ async function runAgent({ conversationId, config, sendFn }) {
     }
 
     const toolHandlers = config.buildToolHandlers(context);
-
-    // Which agent ran this turn, for AgentUsage cost tracking. Prefers an
-    // explicit config.agentName (see salesAgentConfig.js) — falls back to
-    // context.participantType (CUSTOMER/SUPPLIER/UNKNOWN, already computed
-    // generically in contextAssembler.js for every conversation) so this
-    // still works correctly even for agent configs that haven't added
-    // their own agentName yet, e.g. the current supplierAgentConfig.js.
     const agentName = config.agentName || context.participantType || "unknown";
 
-    async function attempt(extraSystemNote) {
+    // NEW — decide which model handles this turn's initial attempt,
+    // using the context phase + the customer's latest message. Cheap,
+    // synchronous, no extra API call.
+    const lastUserMessage = history[history.length - 1].content;
+    const initialModel = pickModel({ context, lastUserMessage });
+
+    async function attempt(extraSystemNote, model) {
       const promptForThisAttempt = extraSystemNote
         ? `${systemPrompt}\n\n${extraSystemNote}`
         : systemPrompt;
@@ -200,77 +254,119 @@ async function runAgent({ conversationId, config, sendFn }) {
         toolHandlers,
         history,
         maxIterations: env.agentMaxToolIterations,
+        model, // NEW
       });
     }
 
-    let { finalText, toolCallLog, hitIterationCap, usage } = await attempt();
+    let { finalText, toolCallLog, hitIterationCap, usage } = await attempt(
+      undefined,
+      initialModel,
+    );
     let totalUsage = usage;
-    // Real bug, caught live: mainUsage tracks ONLY the main loop's own
-    // tokens (this model, priced at env.anthropicModel below) — kept
-    // deliberately separate from totalUsage, which mixes in extraUsage's
-    // tokens for accurate total-spend display/logging. estimateCostInr
-    // must be given mainUsage, never totalUsage — passing totalUsage
-    // priced the isolated research call's tokens a SECOND time (once
-    // correctly via extraCost, once more by folding them into totalUsage
-    // and pricing that whole blend at the main model's rate), silently
-    // inflating every turn that used an isolated call by exactly that
-    // call's cost. Confirmed live: two real turns both matched this
-    // double-counted total to the cent once reproduced (₹32.09 and
-    // ₹11.26), not the correct ₹24.95 / ₹8.81.
-    let mainUsage = usage;
+    let totalCost = estimateCostForModel(usage, initialModel);
+    let lastModelUsed = initialModel;
+
     // Merge in any out-of-band API calls a tool handler made during this
-    // attempt (e.g. an isolated research call — see contextAssembler.js's
-    // extraUsage comment) — token counts go straight into totalUsage
-    // (real tokens spent either way, for the DB's own record), but the
-    // COST is tracked separately (extraCost) since that call may have run
-    // at a different, deliberately pinned model/rate than the main
-    // conversation — see estimateCostInr's own comment for why blending
-    // it into one rate would be wrong. Reset both so a retry below
-    // doesn't double either.
-    totalUsage = addUsage(totalUsage, context.extraUsage);
-    let extraCost = { usd: context.extraUsage.costUsd, inr: context.extraUsage.costInr };
-    context.extraUsage.inputTokens = 0;
-    context.extraUsage.outputTokens = 0;
-    context.extraUsage.costUsd = 0;
-    context.extraUsage.costInr = 0;
+    // attempt (e.g. Supplier Agent's isolated product-research call —
+    // see contextAssembler.js's extraUsage comment, productResearch.js).
+    ({ totalUsage, totalCost } = mergeExtraUsage(context, totalUsage, totalCost));
+
+    // NEW — safety net for the specific gap found in testing: during
+    // Part A enrolment, Haiku sometimes replies conversationally to an
+    // onboarding answer ("Got it — weekly") WITHOUT actually calling
+    // record_profile_answer, even though the system prompt explicitly
+    // instructs "call record_profile_answer right after each answer."
+    // The customer sees a confirmation, but nothing gets written to
+    // OnboardingResponse — a silent, customer-facing false confirmation
+    // that stays invisible until someone checks the DB. If the customer
+    // goes quiet before the next guardrail-triggered retry happens to
+    // repair it (as it did in testing, only by coincidence), that
+    // answer is lost for good. This check catches it immediately
+    // instead of relying on luck.
+    const missedProfileAnswer =
+      initialModel === env.anthropicModelHaiku &&
+      context.enrolmentPending &&
+      !hitIterationCap &&
+      !toolCallLog.some((c) => c.tool === "record_profile_answer");
+
+    if (missedProfileAnswer) {
+      console.log(
+        `[agentEngine] ${conversationId} Haiku skipped record_profile_answer during enrolment — forcing Sonnet retry.`,
+      );
+      const repairNote = `IMPORTANT: the customer just answered an enrolment setup question, but your previous draft did not call record_profile_answer to save it. You MUST call record_profile_answer with the correct fieldKey for the question you just asked and the answer the customer just gave, THEN continue with your reply (asking the next question, or closing out if this was the last one). Do not skip the tool call again.`;
+      const repairModel = pickModel({
+        context,
+        lastUserMessage,
+        forceStrong: true, // always Sonnet for this repair pass
+      });
+      const repair = await attempt(repairNote, repairModel);
+      finalText = repair.finalText;
+      toolCallLog = repair.toolCallLog;
+      hitIterationCap = repair.hitIterationCap;
+      totalUsage = addUsage(totalUsage, repair.usage);
+      totalCost = addCost(
+        totalCost,
+        estimateCostForModel(repair.usage, repairModel),
+      );
+      lastModelUsed = repairModel;
+      ({ totalUsage, totalCost } = mergeExtraUsage(context, totalUsage, totalCost));
+    }
 
     if (hitIterationCap) {
-      const cost = estimateCostInr(mainUsage, extraCost);
+      // UPDATED — no longer flips the conversation to AWAITING_HUMAN.
+      // Hitting the iteration cap usually means the model got stuck
+      // retrying the same tool call rather than a case that genuinely
+      // needs a human (those still go through escalate_to_human, which
+      // is unaffected by this change). Handing off to a human for this
+      // is overkill: the customer just gets a slightly generic reply
+      // this one turn, and the conversation carries on normally in
+      // AI_HANDLING — no separate "someone will get back to you" message,
+      // no state change, no auto-resume dance needed on their next
+      // message.
       console.log(
-        `[agentEngine] ${conversationId} escalated (iteration_cap). ` +
-          `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
-          (cost
-            ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)}).`
-            : "."),
+        `[agentEngine] ${conversationId} hit iteration cap — sending a graceful fallback reply, staying in AI_HANDLING (not escalating to human).`,
       );
       await logUsage({
         conversationId,
         agentName,
+        model: lastModelUsed,
         inputTokens: totalUsage?.inputTokens,
         outputTokens: totalUsage?.outputTokens,
-        costUsd: cost?.usd,
-        costInr: cost?.inr,
+        costUsd: totalCost?.usd,
+        costInr: totalCost?.inr,
         toolCallCount: toolCallLog.length,
-        outcome: "escalated_iteration_cap",
+        outcome: "recovered_iteration_cap",
       });
-      await escalateWithMessage({
-        conversationId,
+      await addToConversationTotal(conversationId, totalCost);
+
+      const fallbackText =
+        "Sorry, got a bit tangled up there! Could you tell me that again in a slightly different way?";
+      await sendFn({
         conversation: context.conversation,
-        sendFn,
-        action: "agent_escalated_iteration_cap",
-        after: { toolCallLog },
+        text: fallbackText,
+      }).catch(() => {});
+      await logMessage({
+        conversationId,
+        direction: "OUTBOUND",
+        sender: "AI_AGENT",
+        body: fallbackText,
+        toolCalls: toolCallLog,
+      }).catch((err) => {
+        console.error(
+          "[agentEngine] failed to log iteration-cap fallback message:",
+          err.message,
+        );
       });
-      return { escalated: true, reason: "iteration_cap" };
+
+      return {
+        sent: true,
+        text: fallbackText,
+        toolCallLog,
+        usage: totalUsage,
+        recoveredFromCap: true,
+      };
     }
 
-    // Each agent config may register its own guardrail rules (Sales
-    // checks price/discount claims, Supplier's is intentionally lean —
-    // see their respective guardrails.js/supplierGuardrails.js). Configs
-    // that don't provide one fall back to the original Sales-shaped
-    // rules, so this stays backward compatible with configs written
-    // before runGuardrails was pluggable. Used for both the initial check
-    // and the post-retry recheck below, so a config's own rules apply
-    // consistently across both passes.
     const guardrailFn = config.runGuardrails || runDefaultGuardrails;
     let guardrailResult = guardrailFn({
       draftText: finalText,
@@ -278,58 +374,55 @@ async function runAgent({ conversationId, config, sendFn }) {
       context,
     });
 
-    // Self-heal: give the model ONE honest retry, telling it exactly why
-    // its draft was rejected, before ever escalating. Most guardrail
-    // blocks today have been false positives in specific phrasing (a
-    // generic "in stock" phrase, a clarifying question with bold text,
-    // revealing something a beat too early) — not genuine mistakes. A
-    // model told the precise reason can usually just rephrase and pass.
-    // This recovers automatically from that whole class of issue instead
-    // of needing a new hand-written rule every time a new phrasing trips
-    // the same underlying concern.
     if (guardrailResult.action === "block") {
       console.log(
         `[agentEngine] ${conversationId} guardrail blocked (${guardrailResult.reason}), retrying once.`,
       );
       const retryNote = `IMPORTANT: your previous draft reply was rejected by an internal check for this reason: "${guardrailResult.reason}". Do not repeat that exact issue — revise your response to avoid it while still genuinely answering the customer's last message. If it was about naming a product or price without a fresh lookup, call the right tool first. If it was about revealing something prematurely, hold off on that specific detail this turn.`;
-      const retry = await attempt(retryNote);
+
+      // NEW — the retry always forces the stronger model, regardless of
+      // what the initial attempt used. A draft was already rejected
+      // once; don't risk the same mistake on the cheaper model.
+      const retryModel = pickModel({
+        context,
+        lastUserMessage,
+        forceStrong: true,
+      });
+      const retry = await attempt(retryNote, retryModel);
       finalText = retry.finalText;
       toolCallLog = retry.toolCallLog;
       // A retry is a real, separately-billed Anthropic call — add its
       // usage to the running total rather than replacing it, so the
-      // final logged cost reflects BOTH attempts, not just whichever one
+      // final logged cost reflects every attempt, not just whichever one
       // happened to end the turn.
-      mainUsage = addUsage(mainUsage, retry.usage);
       totalUsage = addUsage(totalUsage, retry.usage);
-      totalUsage = addUsage(totalUsage, context.extraUsage);
-      extraCost = {
-        usd: extraCost.usd + context.extraUsage.costUsd,
-        inr: extraCost.inr + context.extraUsage.costInr,
-      };
-      context.extraUsage.inputTokens = 0;
-      context.extraUsage.outputTokens = 0;
-      context.extraUsage.costUsd = 0;
-      context.extraUsage.costInr = 0;
+      totalCost = addCost(
+        totalCost,
+        estimateCostForModel(retry.usage, retryModel),
+      );
+      lastModelUsed = retryModel;
+      ({ totalUsage, totalCost } = mergeExtraUsage(context, totalUsage, totalCost));
 
       if (retry.hitIterationCap) {
-        const cost = estimateCostInr(mainUsage, extraCost);
         console.log(
           `[agentEngine] ${conversationId} escalated (iteration_cap_after_retry). ` +
             `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
-            (cost
-              ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)}).`
+            (totalCost
+              ? ` (~$${totalCost.usd.toFixed(4)} / ~₹${totalCost.inr.toFixed(2)}).`
               : "."),
         );
         await logUsage({
           conversationId,
           agentName,
+          model: lastModelUsed, // NEW
           inputTokens: totalUsage?.inputTokens,
           outputTokens: totalUsage?.outputTokens,
-          costUsd: cost?.usd,
-          costInr: cost?.inr,
+          costUsd: totalCost?.usd,
+          costInr: totalCost?.inr,
           toolCallCount: toolCallLog.length,
           outcome: "escalated_iteration_cap_after_retry",
         });
+        await addToConversationTotal(conversationId, totalCost); // NEW
         await escalateWithMessage({
           conversationId,
           conversation: context.conversation,
@@ -348,36 +441,69 @@ async function runAgent({ conversationId, config, sendFn }) {
     }
 
     if (guardrailResult.action === "block") {
-      // Still blocked after one genuine retry — this is a real escalation
-      // now, not a phrasing hiccup. Customer still gets a warm message,
-      // never silence.
-      const cost = estimateCostInr(mainUsage, extraCost);
+      // UPDATED — a guardrail block surviving the retry no longer flips
+      // the conversation to AWAITING_HUMAN. This was a defensive check
+      // catching something risky in the model's own draft (a
+      // hallucinated field, a leaked internal term, an unverified
+      // claim) — not a situation where a human genuinely needs to step
+      // in. The "someone will be in touch" message mid-conversation was
+      // reading to customers like the chat had died, right at
+      // sensitive moments (e.g. mid-onboarding) — exactly the kind of
+      // drop-off this is meant to prevent. Deliberate escalate_to_human
+      // TOOL calls the model makes on purpose (high-value orders, a
+      // genuinely upset customer) are UNCHANGED — those already don't
+      // touch conversation.state at all (see salesAgentTools.js's
+      // escalate_to_human handler). This block covers only the
+      // guardrail's own internal safety catches, which should never be
+      // a customer-facing dead end.
       console.log(
-        `[agentEngine] ${conversationId} escalated (${guardrailResult.reason}). ` +
-          `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
-          (cost
-            ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)}).`
-            : "."),
+        `[agentEngine] ${conversationId} guardrail still blocked after retry (${guardrailResult.reason}) — sending a graceful fallback reply, staying in AI_HANDLING.`,
       );
-      await logUsage({
+      await logAudit({
+        action: "agent_response_blocked_recovered",
         conversationId,
-        agentName,
-        inputTokens: totalUsage?.inputTokens,
-        outputTokens: totalUsage?.outputTokens,
-        costUsd: cost?.usd,
-        costInr: cost?.inr,
-        toolCallCount: toolCallLog.length,
-        outcome: `escalated_${guardrailResult.reason}`,
-      });
-      await escalateWithMessage({
-        conversationId,
-        conversation: context.conversation,
-        sendFn,
-        action: "agent_response_blocked",
         before: { draftText: finalText },
         after: { reason: guardrailResult.reason, toolCallLog, retried: true },
       });
-      return { escalated: true, reason: guardrailResult.reason };
+      await logUsage({
+        conversationId,
+        agentName,
+        model: lastModelUsed,
+        inputTokens: totalUsage?.inputTokens,
+        outputTokens: totalUsage?.outputTokens,
+        costUsd: totalCost?.usd,
+        costInr: totalCost?.inr,
+        toolCallCount: toolCallLog.length,
+        outcome: `recovered_${guardrailResult.reason}`,
+      });
+      await addToConversationTotal(conversationId, totalCost);
+
+      const fallbackText =
+        "Sorry, got a bit tangled up there! Could you tell me that again in a slightly different way?";
+      await sendFn({
+        conversation: context.conversation,
+        text: fallbackText,
+      }).catch(() => {});
+      await logMessage({
+        conversationId,
+        direction: "OUTBOUND",
+        sender: "AI_AGENT",
+        body: fallbackText,
+        toolCalls: toolCallLog,
+      }).catch((err) => {
+        console.error(
+          "[agentEngine] failed to log guardrail fallback message:",
+          err.message,
+        );
+      });
+
+      return {
+        sent: true,
+        text: fallbackText,
+        toolCallLog,
+        usage: totalUsage,
+        recoveredFromGuardrailBlock: true,
+      };
     }
 
     await sendFn({ conversation: context.conversation, text: finalText });
@@ -398,30 +524,32 @@ async function runAgent({ conversationId, config, sendFn }) {
     // Real cost for THIS turn (not the whole conversation — sum this
     // across every turn in a conversationId to get the true total, e.g.
     // by aggregating these log lines through whatever log pipeline
-    // you're already using). inputTokens/outputTokens come straight from
-    // toolLoop.js's usage tracking, which reads response.usage on every
-    // real Anthropic call this turn made — this is exact, not an
-    // estimate. The $/₹ figure next to it IS an estimate (see
-    // COST_INPUT_USD_PER_MTOK etc. above) — a fixed conversion applied
-    // to a real number, not a guess about the number itself.
-    const cost = estimateCostInr(mainUsage, extraCost);
+    // you're already using, or read Conversation.totalCostUsd/totalCostInr
+    // for the running total addToConversationTotal keeps below).
+    // totalCost is already fully assembled by this point — every attempt
+    // this turn made (initial, missedProfileAnswer repair, guardrail
+    // retry) added its own cost at its own model's rate as it happened,
+    // so there's nothing left to (re)compute here.
     console.log(
       `[agentEngine] ${conversationId} sent reply (${toolCallLog.length} tool call(s)). ` +
         `${totalUsage?.inputTokens ?? 0} in / ${totalUsage?.outputTokens ?? 0} out tokens` +
-        (cost
-          ? ` (~$${cost.usd.toFixed(4)} / ~₹${cost.inr.toFixed(2)} this turn).`
+        (totalCost
+          ? ` (~$${totalCost.usd.toFixed(4)} / ~₹${totalCost.inr.toFixed(2)} this turn, model=${lastModelUsed}).`
           : "."),
     );
     await logUsage({
       conversationId,
       agentName,
+      model: lastModelUsed, // NEW
       inputTokens: totalUsage?.inputTokens,
       outputTokens: totalUsage?.outputTokens,
-      costUsd: cost?.usd,
-      costInr: cost?.inr,
+      costUsd: totalCost?.usd,
+      costInr: totalCost?.inr,
       toolCallCount: toolCallLog.length,
       outcome: "sent",
     });
+    await addToConversationTotal(conversationId, totalCost); // NEW
+
     return { sent: true, text: finalText, toolCallLog, usage: totalUsage };
   } finally {
     await releaseLock(conversationId);
