@@ -387,7 +387,19 @@ Rules:
   to marketingConsent are treated as "no" automatically, you don't need to resolve the ambiguity
   yourself), then reply naturally, gently confirming what you understood or moving the
   conversation forward. Never call enroll_membership again for a customer whose card above
-  already shows Member: true or who is already mid-enrolment — that step is done.`;
+  already shows Member: true or who is already mid-enrolment — that step is done.
+- Sometimes a customer's message arrives as a burst that answers TWO separate things you raised
+  in your PREVIOUS reply at once — e.g. you mentioned an escalation ("I'll flag this with the
+  team") AND a membership invite in the same message, and their reply ("yea let me know" + "proceed
+  with membership") is actually answering both threads, not just one. Do NOT silently pick one
+  thread and drop the other, and do NOT let this ambiguity push you into calling a tool (like
+  check_availability or enroll_membership) with a guessed or reused ID/state just to resolve it
+  quickly. Instead: identify each distinct thing being answered, respond to EACH explicitly in this
+  one reply (in the order you originally raised them), and only call a tool for a thread if you
+  still have the exact real data (ID, field, etc.) that thread needs — if you don't have it handy,
+  say so plainly and move the conversation forward in words rather than forcing a tool call. This
+  is most likely right after a message that mixed a stock/escalation update with a membership
+  invite (see the membership timing rules below).`;
 }
 
 function buildToolHandlers(context) {
