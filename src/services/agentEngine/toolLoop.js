@@ -38,19 +38,16 @@ async function runToolLoop({
   toolHandlers,
   history,
   maxIterations,
+  model, // NEW — which Claude model this loop's calls use, chosen per-turn by modelRouter.js
 }) {
   const messages = history.map((m) => ({ role: m.role, content: m.content }));
   const toolCallLog = [];
   let iterations = 0;
 
-  // Real token usage, accumulated across every Anthropic call this loop
-  // makes (every iteration is a separate billed API call — see the
-  // per-iteration timing logs below). This is the ACTUAL data
-  // response.usage gives back on every call, not an estimate — summing
-  // it here is what lets a caller compute real, exact per-conversation
-  // cost afterward instead of guessing from typical token counts.
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let totalCacheCreationTokens = 0; // NEW
+  let totalCacheReadTokens = 0; // NEW
 
   while (true) {
     iterations += 1;
@@ -67,27 +64,41 @@ async function runToolLoop({
       };
     }
 
-    // Timing — diagnostic only, doesn't change any behavior. Added so
-    // slow turns (customers have seen replies take 20-30+ seconds even
-    // when the message reached the server promptly) can actually be
-    // traced to a specific cause — Anthropic API latency vs. tool
-    // handler latency (DB/Shopify calls) vs. genuinely needing many
-    // sequential iterations — instead of only knowing the total elapsed
-    // time after the fact with no visibility into which part was slow.
     const apiCallStartedAt = Date.now();
     const response = await anthropic.messages.create({
-      model: env.anthropicModel,
+      model: model || env.anthropicModel,
       max_tokens: 1024,
-      system: systemPrompt,
-      tools,
+      // Prompt caching — system prompt + tool schemas are identical
+      // across every iteration of this loop within a turn, and often
+      // across consecutive turns too. Marking them cacheable means only
+      // the first call in a burst pays full input price; subsequent
+      // calls hitting the cache pay ~90% less for this portion. Biggest
+      // win on exactly the multi-tool-call turns that were costing the
+      // most (each iteration previously resent this whole block at full
+      // price).
+      system: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      tools: tools.map((t, i) =>
+        i === tools.length - 1
+          ? { ...t, cache_control: { type: "ephemeral" } }
+          : t,
+      ),
       messages,
     });
     console.log(
-      `[toolLoop] iteration ${iterations}: anthropic.messages.create took ${Date.now() - apiCallStartedAt}ms`,
+      `[toolLoop] iteration ${iterations}: model=${model || env.anthropicModel} anthropic.messages.create took ${Date.now() - apiCallStartedAt}ms`,
     );
 
     totalInputTokens += response.usage?.input_tokens || 0;
     totalOutputTokens += response.usage?.output_tokens || 0;
+    totalCacheCreationTokens +=
+      response.usage?.cache_creation_input_tokens || 0; // NEW
+    totalCacheReadTokens += response.usage?.cache_read_input_tokens || 0; // NEW
     console.log(
       `[toolLoop] iteration ${iterations}: input_tokens=${response.usage?.input_tokens ?? "n/a"} output_tokens=${response.usage?.output_tokens ?? "n/a"} (running total: ${totalInputTokens} in / ${totalOutputTokens} out)`,
     );
@@ -131,6 +142,8 @@ async function runToolLoop({
         usage: {
           inputTokens: totalInputTokens,
           outputTokens: totalOutputTokens,
+          cacheCreationTokens: totalCacheCreationTokens, // NEW
+          cacheReadTokens: totalCacheReadTokens, // NEW
         },
       };
     }

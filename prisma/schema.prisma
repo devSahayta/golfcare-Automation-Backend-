@@ -107,7 +107,9 @@ model Conversation {
   Supplier           Supplier?            @relation(fields: [supplierId], references: [id], onUpdate: NoAction)
   Message            Message[]
   OnboardingResponse OnboardingResponse[]
-    AgentUsage     AgentUsage[]
+    AgentUsage       AgentUsage[]
+     totalCostUsd    Float                   @default(0)
+  totalCostInr        Float                          @default(0)
 
   @@index([customerId], map: "idx_conversation_customer")
   @@index([waPhone], map: "idx_conversation_wa_phone")
@@ -470,6 +472,7 @@ model AgentUsage {
   createdAt      DateTime @default(now()) @db.Timestamptz(6)
 
   conversation   Conversation @relation(fields: [conversationId], references: [id])
+  model String?
 
   @@index([conversationId])
   @@index([createdAt])

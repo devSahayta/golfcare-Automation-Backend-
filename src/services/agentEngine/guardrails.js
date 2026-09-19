@@ -48,6 +48,126 @@ function leaksInternalJargon(draftText) {
   return INTERNAL_JARGON_RE.test(draftText);
 }
 
+// NEW — catches a record_profile_answer call whose answer text has no
+// traceable connection to what the customer actually said this turn.
+// Confirmed in testing: during enrolment, the model recorded a fake
+// homeClub answer ("Bangalore Golf Club") the customer never mentioned,
+// one question ahead of what was actually asked — the customer had only
+// answered firstName. Since the tool call genuinely succeeds (it's not
+// a missing call), this needs its own check: for every
+// record_profile_answer call in the log, the answer text must appear
+// (loosely) in the customer's own most recent message. A field the
+// model invents whole-cloth won't have any overlap with what the
+// customer actually typed.
+function normalizeForOverlapCheck(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, "")
+    .trim();
+}
+
+// Only checked for genuinely free-text fields where a fabricated answer
+// is possible and would be a real, novel fact the model invented —
+// firstName and homeClub are the fields this was actually built to
+// catch (confirmed: a fabricated "Bangalore Golf Club" homeClub
+// answer). Fields with mapper functions in enrolmentQuestions.js
+// (skillLevel, playFrequency, gloveHand, marketingConsent) are
+// EXCLUDED — those are meant to be normalized/paraphrased from the
+// customer's raw words ("yea ok" -> "yes", "weekly once" -> "weekly"),
+// and applying literal word-overlap there produces false positives on
+// completely correct interpretations, which is what happened in
+// testing ("Yea ok" -> recorded "yes" got wrongly flagged as
+// hallucinated). gloveSize and currentBallModel are borderline free
+// text but low fabrication risk in practice, left out for now — add
+// back in if a real fabrication is observed there.
+const FREE_TEXT_FIELDS_TO_CHECK = new Set(["firstName", "homeClub"]);
+
+function hasHallucinatedProfileAnswer(toolCallLog, context) {
+  const recordCalls = toolCallLog.filter(
+    (c) =>
+      c.tool === "record_profile_answer" &&
+      !c.output?.error &&
+      FREE_TEXT_FIELDS_TO_CHECK.has(c.input?.fieldKey),
+  );
+  if (!recordCalls.length) return false;
+
+  const lastCustomerMsg = [...(context.recentMessages || [])]
+    .reverse()
+    .find((m) => m.sender === "CUSTOMER");
+  const customerText = normalizeForOverlapCheck(lastCustomerMsg?.body);
+  if (!customerText) return false;
+
+  return recordCalls.some((call) => {
+    const answer = normalizeForOverlapCheck(call.input?.answer);
+    if (!answer) return false;
+    const answerWords = answer.split(/\s+/).filter((w) => w.length > 1);
+    if (!answerWords.length) return false;
+    return !answerWords.some((w) => customerText.includes(w));
+  });
+}
+
+// NEW — catches a get_product/check_availability/create_checkout_link
+// call using a productId/variantId that was never actually returned by
+// a search_products or get_product call earlier in this turn or in
+// recent history. Confirmed in testing: Haiku called check_availability
+// with a fabricated variantId that appeared nowhere in the
+// conversation's real tool results — the real ID from a prior search
+// was available but not used. This is dangerous specifically because
+// check_availability doesn't error on an unknown ID, it just returns
+// UNKNOWN, making the mistake indistinguishable from a real
+// out-of-stock item to both the model and the customer.
+const ID_LOOKUP_TOOLS = [
+  "get_product",
+  "check_availability",
+  "create_checkout_link",
+];
+
+function collectKnownIds(toolCallLog, recentMessages) {
+  const ids = new Set();
+  const scanResult = (output) => {
+    if (!output) return;
+    if (Array.isArray(output.results)) {
+      output.results.forEach((r) => {
+        if (r.productId) ids.add(r.productId);
+        (r.variants || []).forEach((v) => v.variantId && ids.add(v.variantId));
+      });
+    }
+    if (output.product?.id) ids.add(output.product.id);
+    if (output.variant?.id) ids.add(output.variant.id);
+    if (Array.isArray(output.product?.Variant)) {
+      output.product.Variant.forEach((v) => v.id && ids.add(v.id));
+    }
+  };
+  toolCallLog.forEach((c) => {
+    if (["search_products", "get_product"].includes(c.tool))
+      scanResult(c.output);
+  });
+  (recentMessages || []).forEach((m) => {
+    (m.toolCalls || []).forEach((c) => {
+      if (["search_products", "get_product"].includes(c.tool))
+        scanResult(c.output);
+    });
+  });
+  return ids;
+}
+
+function hasFabricatedId(toolCallLog, context) {
+  const idLookupCalls = toolCallLog.filter(
+    (c) =>
+      ID_LOOKUP_TOOLS.includes(c.tool) &&
+      (c.input?.productId || c.input?.variantId),
+  );
+  if (!idLookupCalls.length) return false;
+
+  const knownIds = collectKnownIds(toolCallLog, context.recentMessages);
+  if (!knownIds.size) return false; // nothing to cross-check against yet, don't false-positive on turn 1
+
+  return idLookupCalls.some((c) => {
+    const usedId = c.input?.productId || c.input?.variantId;
+    return usedId && !knownIds.has(usedId);
+  });
+}
+
 const PRICE_CLAIM_RE = /₹\s?[\d,]+/;
 const DISCOUNT_RE = /(\d+)\s?%\s?(off|discount)/i;
 const MEMBERSHIP_CLAIM_RE =
@@ -167,6 +287,14 @@ function runGuardrails({ draftText, toolCallLog, context }) {
 
   if (leaksInternalJargon(draftText)) {
     return { action: "block", reason: "internal_jargon_leak" };
+  }
+
+  if (hasHallucinatedProfileAnswer(toolCallLog, context)) {
+    return { action: "block", reason: "hallucinated_profile_answer" };
+  }
+
+  if (hasFabricatedId(toolCallLog, context)) {
+    return { action: "block", reason: "fabricated_product_id" };
   }
 
   if (

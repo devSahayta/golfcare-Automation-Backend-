@@ -14,6 +14,9 @@ const {
   downloadMedia,
 } = require("../lib/samvaadik/adapter");
 const { extractTextFromDocument } = require("../services/documentExtractor");
+const {
+  scheduleAgentRun,
+} = require("../services/agentEngine/messageDebouncer");
 
 const router = Router();
 
@@ -26,13 +29,13 @@ router.use(express.json());
 
 async function handleInboundMessage(evt) {
   console.log(`[samvaadik webhook] inbound message from ${evt.from}:`, evt);
-  // const TESTING_ALLOWED_PHONE = "916382592767";
-  // if (evt.from !== TESTING_ALLOWED_PHONE) {
-  //   console.log(
-  //     `[samvaadik webhook] ignoring message from ${evt.from} (testing mode, only ${TESTING_ALLOWED_PHONE} allowed)`,
-  //   );
-  //   return;
-  // }
+  const TESTING_ALLOWED_PHONE = "916382592767" || "917479769111";
+  if (evt.from !== TESTING_ALLOWED_PHONE) {
+    console.log(
+      `[samvaadik webhook] ignoring message from ${evt.from} (testing mode, only ${TESTING_ALLOWED_PHONE} allowed)`,
+    );
+    return;
+  }
   // resolveConversation finds/links Customer or Supplier by phone, and
   // creates a bare Customer if neither exists yet (Scenario B — the
   // record needs to exist from message one so search/checkout are never
@@ -125,7 +128,7 @@ async function handleInboundMessage(evt) {
     }
   }
 
-  await prisma.message.create({
+  const savedMessage = await prisma.message.create({
     data: {
       conversationId: conversation.id,
       direction: "INBOUND",
@@ -166,13 +169,14 @@ async function handleInboundMessage(evt) {
   // longer blocks the response Samvaadik is waiting on.
 
   try {
-    await runAgent({
+    await scheduleAgentRun({
       conversationId: conversation.id,
+      messageId: savedMessage.id,
       config,
       sendFn: async ({ conversation: c, text }) => sendText(c.waPhone, text),
     });
   } catch (err) {
-    console.error("[samvaadik webhook] runAgent failed:", err);
+    console.error("[samvaadik webhook] scheduleAgentRun failed:", err);
   }
 }
 
