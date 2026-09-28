@@ -138,10 +138,32 @@ function parseWebhook(rawBody) {
   });
 }
 
-async function deleteTemplate(_templateId) {
-  throw new Error(
-    "deleteTemplate is blocked: Samvaadik's public API has no DELETE /v1/templates/:id endpoint.",
-  );
+/**
+ * Delete a WhatsApp template from Meta and Samvaadik.
+ *
+ * Confirmed against Samvaadik's real source (publicApiController.js,
+ * Sept 2026) — this stub used to throw "blocked, no DELETE endpoint,"
+ * which was true when it was written but is stale now; Samvaadik added
+ * DELETE /v1/templates/:wt_id since. Samvaadik itself refuses (409,
+ * code TEMPLATE_IN_USE) if any scheduled_messages/campaigns row still
+ * references this template — callers should only reach this once the
+ * template is genuinely done being used (e.g. Module 6's
+ * templateDeletionSweep gates on sendStatus === "SENT" before calling
+ * this), not rely on the 409 as the only guard.
+ *
+ * @param {string} wtId - Samvaadik's whatsapp_templates.wt_id
+ * @returns {Promise<{wtId: string, name: string, metaDeleted: boolean, localRecordRetained: boolean}>}
+ */
+async function deleteTemplate(wtId) {
+  return callSamvaadik(async (client) => {
+    const res = await client.delete(`/templates/${wtId}`);
+    return {
+      wtId: res.data.data.wt_id,
+      name: res.data.data.name,
+      metaDeleted: res.data.data.meta_deleted,
+      localRecordRetained: res.data.data.local_record_retained,
+    };
+  });
 }
 
 async function getProduct(_shopifyProductId) {
