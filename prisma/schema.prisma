@@ -433,6 +433,7 @@ model StaffUser {
   role      StaffRole @default(STAFF)
   isActive  Boolean   @default(true)
   createdAt DateTime  @default(now()) @db.Timestamptz(6)
+  InsightsUsage InsightsUsage[]
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -470,6 +471,7 @@ model SupplierCheck {
   Supplier    Supplier    @relation(fields: [supplierId], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@index([supplierId], map: "idx_suppliercheck_supplier")
+  @@index([status, sentAt])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -529,6 +531,25 @@ model AgentUsage {
   @@index([conversationId])
   @@index([createdAt])
   @@index([agentName])
+}
+
+model InsightsUsage {
+  id            String    @id @default(dbgenerated("(gen_random_uuid())::text"))
+  staffUserId   String?
+  question      String
+  model         String?
+  inputTokens   Int       @default(0)
+  outputTokens  Int       @default(0)
+  costUsd       Decimal   @default(0) @db.Decimal(10, 6)
+  costInr       Decimal   @default(0) @db.Decimal(10, 4)
+  toolCallCount Int       @default(0)
+  outcome       String
+  createdAt     DateTime  @default(now()) @db.Timestamptz(6)
+
+  StaffUser     StaffUser? @relation(fields: [staffUserId], references: [id])
+
+  @@index([staffUserId])
+  @@index([createdAt])
 }
 
 enum ActorType {

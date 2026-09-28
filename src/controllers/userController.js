@@ -22,12 +22,23 @@ async function addUser(req, res) {
   }
 }
 
-async function fetchUsers(_req, res) {
+async function fetchUsers(req, res) {
+  const { limit, offset } = req.query;
+
   try {
-    const staffUsers = await prisma.staffUser.findMany({
-      orderBy: { createdAt: "desc" },
-    });
-    res.json({ staffUsers });
+    const take = Math.min(Number(limit) || 50, 200);
+    const skip = Number(offset) || 0;
+
+    const [staffUsers, total] = await Promise.all([
+      prisma.staffUser.findMany({
+        take,
+        skip,
+        orderBy: { createdAt: "desc" },
+      }),
+      prisma.staffUser.count(),
+    ]);
+
+    res.json({ staffUsers, total, limit: take, offset: skip });
   } catch {
     res.status(500).json({ error: "Failed to fetch users" });
   }
