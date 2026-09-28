@@ -516,9 +516,22 @@ async function runAgent({ conversationId, config, sendFn }) {
       toolCalls: toolCallLog,
     });
 
+    // Module 6 — a "campaign_reply:SCENARIO" intent tag (set by the
+    // scheduler's Lifecycle jobs when a birthday/replenishment/cross-sell
+    // message goes out — see campaignTriggerEval.js/templateStatusPoll.js)
+    // exists to make Sales Agent's system prompt call out "why" on the
+    // customer's NEXT reply (see salesAgentConfig.js's campaignReplyNote).
+    // Cleared here, right after a real reply referencing it went out, so
+    // it doesn't keep getting surfaced turn after turn once it's already
+    // been acknowledged once. Harmless no-op for Supplier Agent turns or
+    // any conversation without this tag (intent stays whatever it was).
+    const clearedIntent = context.conversation.intent?.startsWith("campaign_reply:")
+      ? null
+      : context.conversation.intent;
+
     await prisma.conversation.update({
       where: { id: conversationId },
-      data: { lastMessageAt: new Date() },
+      data: { lastMessageAt: new Date(), intent: clearedIntent },
     });
 
     // Real cost for THIS turn (not the whole conversation — sum this

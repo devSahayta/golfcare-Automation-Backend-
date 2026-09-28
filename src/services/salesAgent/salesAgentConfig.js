@@ -138,6 +138,21 @@ function buildSystemPrompt(context) {
     ? `Earlier in this relationship: ${context.priorSummary}`
     : "";
 
+  // Module 6 — Lifecycle Agent is a compose-and-dispatch function, not a
+  // conversational agent (it has no tools for checkout/discount/handover,
+  // and shouldn't duplicate what this agent already owns) — so when a
+  // customer replies to a birthday/replenishment/cross-sell message, it
+  // lands here, not with Lifecycle Agent. The actual campaign message is
+  // already visible in the conversation history below (Lifecycle now logs
+  // a real body, not a blank placeholder), but this tag makes the "why"
+  // explicit rather than relying on the model to infer it from scrolling
+  // back — same principle as pendingCheck in supplierAgentConfig.js.
+  // agentEngine/index.js clears this after one reply so it doesn't keep
+  // getting mentioned turns later once it's no longer relevant.
+  const campaignReplyNote = context.conversation?.intent?.startsWith("campaign_reply:")
+    ? `\nThe customer's last message may be a reply to a ${context.conversation.intent.split(":")[1]} campaign message we just sent them (visible in the conversation history below) — open by naturally acknowledging it if their reply reads that way, rather than treating this as a cold, out-of-nowhere message.\n`
+    : "";
+
   let membershipInstruction;
   if (c?.isMember && c.onboardingState === "COMPLETED") {
     // Hard priority gate — checked FIRST, before enrolmentPending or
@@ -197,6 +212,7 @@ questions, suggest what fits their game.
 
 ${customerCard}
 ${priorSummary}
+${campaignReplyNote}
 Unanswered profiling questions available: ${unanswered}
 
 Rules:

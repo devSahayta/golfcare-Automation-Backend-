@@ -32,6 +32,43 @@ function computePriceRange(variants) {
   return { priceMin: Math.min(...prices), priceMax: Math.max(...prices) };
 }
 
+// Module 6 — category-based defaults for isConsumable/replenishDays/
+// upsellPath, applied ONLY on genuine creation (never in the update
+// block below — a human may deliberately change these away from the
+// default later, via a bulk script or eventually a dashboard, and an
+// update must never stomp that). Mirrors the one-time bulk
+// classification applied to the existing catalog on 2026-09-26 — same
+// categories, same target products — so a product that syncs in
+// tomorrow (via a real Shopify products/create webhook, or via Module
+// 5.2's supplier-onboarding approval flow, which calls this same
+// function) gets treated identically to one classified in that pass,
+// with no separate manual step needed.
+const CONSUMABLE_REPLENISH_DAYS = {
+  Balls: 50,
+  "Golf Balls": 50,
+  "High Visibility Balls": 50,
+  Tees: 30,
+  Gloves: 105,
+};
+const CLUB_UPSELL_TYPES = new Set([
+  "Drivers", "Fairway Woods", "Hybrids", "Irons", "Iron Sets", "Individual Irons",
+  "Utility Irons", "Wedges", "Putters", "Package Sets", "Individual Club",
+  "Junior Individual Club", "Chippers",
+]);
+const UPSELL_BALL_TARGET_ID = "3cb474b6-79c2-4976-b0f2-b577f07eabfd"; // Srixon Distance Golf Balls (Pack of 12)
+const UPSELL_GLOVE_TARGET_ID = "f4b8646d-8787-4aad-9227-69f8dc6771d3"; // Viper Golf Men's Tour Pro Cabretta Glove
+
+function classifyNewProduct(productType) {
+  const replenishDays = CONSUMABLE_REPLENISH_DAYS[productType];
+  if (replenishDays) {
+    return { isConsumable: true, replenishDays };
+  }
+  if (CLUB_UPSELL_TYPES.has(productType)) {
+    return { upsellPath: [UPSELL_BALL_TARGET_ID, UPSELL_GLOVE_TARGET_ID] };
+  }
+  return {};
+}
+
 /* ─── products/create, products/update ──────────────────────────────────── */
 
 async function handleProductUpsert(req, res) {
@@ -60,6 +97,7 @@ async function handleProductUpsert(req, res) {
         priceMax,
         status: product.status,
         syncedAt: new Date(),
+        ...classifyNewProduct(product.product_type || null),
       },
       update: {
         handle: product.handle,
@@ -225,6 +263,19 @@ async function handleOrderUpsert(req, res) {
         discountCodes: (order.discount_codes || []).map((d) => d.code),
       },
     });
+
+    // Module 6 — deliveredAt is really "first observed fulfilled," not a
+    // true carrier delivery-confirmation timestamp (we don't have carrier
+    // tracking integration) — an honest approximation, but the best
+    // signal available from this webhook alone. Only ever set once
+    // (deliveredAt: null in the WHERE guard) so a later orders/updated
+    // for the same order can't clobber the original transition time.
+    if (order.fulfillment_status === "fulfilled") {
+      await prisma.order.updateMany({
+        where: { shopifyOrderId: String(order.id), deliveredAt: null },
+        data: { deliveredAt: new Date() },
+      });
+    }
 
     res.status(200).send("ok");
   } catch (err) {
