@@ -1,3 +1,4 @@
+// controllers/userController.js
 const { prisma } = require("../lib/prisma");
 
 async function addUser(req, res) {
@@ -11,13 +12,32 @@ async function addUser(req, res) {
     name || [givenName, familyName].filter(Boolean).join(" ") || email;
 
   try {
-    const staffUser = await prisma.staffUser.upsert({
-      where: { id },
-      update: { email, name: resolvedName },
-      create: { id, email, name: resolvedName },
+    // Gate on email — the field an admin pre-provisions before anyone's
+    // first login. Never create a row here: an email with no existing
+    // StaffUser means no account was set up for them, and that must stay
+    // a rejection (403), not an auto-signup. StaffUser.id is our own
+    // primary key (referenced by InsightsUsage) — Kinde's id is never
+    // written into it.
+    const existing = await prisma.staffUser.findUnique({ where: { email } });
+
+    if (!existing) {
+      return res.status(403).json({ error: "No account found for this email" });
+    }
+
+    if (!existing.isActive) {
+      return res
+        .status(403)
+        .json({ error: "This account has been deactivated" });
+    }
+
+    const staffUser = await prisma.staffUser.update({
+      where: { email },
+      data: { name: resolvedName },
     });
+
     res.status(200).json({ staffUser });
-  } catch {
+  } catch (err) {
+    console.error("addUser error:", err);
     res.status(500).json({ error: "Failed to sync user" });
   }
 }
