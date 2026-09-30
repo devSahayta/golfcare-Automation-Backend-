@@ -32,7 +32,7 @@ async function addUser(req, res) {
 
     const staffUser = await prisma.staffUser.update({
       where: { email },
-      data: { name: resolvedName },
+      data: { name: resolvedName, kindeUserId: id },
     });
 
     res.status(200).json({ staffUser });

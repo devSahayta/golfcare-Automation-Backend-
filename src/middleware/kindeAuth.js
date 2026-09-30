@@ -1,3 +1,4 @@
+// middleware/kindeAuth.js
 const jwt = require("jsonwebtoken");
 const jwksClient = require("jwks-rsa");
 const { prisma } = require("../lib/prisma");
@@ -25,8 +26,13 @@ async function requireStaffAuth(req, res, next) {
   jwt.verify(token, getKey, {}, async (err, decoded) => {
     if (err) return res.status(401).json({ error: "Invalid token" });
 
+    // decoded.sub is Kinde's user id — matched against StaffUser.kindeUserId,
+    // NOT StaffUser.id (that's our own internal primary key, unrelated to
+    // Kinde and referenced by InsightsUsage — never overwritten with an
+    // external id). kindeUserId is populated by userController.addUser on
+    // every successful login sync.
     const staffUser = await prisma.staffUser.findUnique({
-      where: { id: decoded.sub },
+      where: { kindeUserId: decoded.sub },
     });
 
     if (!staffUser || !staffUser.isActive) {
