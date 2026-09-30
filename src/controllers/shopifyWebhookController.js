@@ -51,9 +51,19 @@ const CONSUMABLE_REPLENISH_DAYS = {
   Gloves: 105,
 };
 const CLUB_UPSELL_TYPES = new Set([
-  "Drivers", "Fairway Woods", "Hybrids", "Irons", "Iron Sets", "Individual Irons",
-  "Utility Irons", "Wedges", "Putters", "Package Sets", "Individual Club",
-  "Junior Individual Club", "Chippers",
+  "Drivers",
+  "Fairway Woods",
+  "Hybrids",
+  "Irons",
+  "Iron Sets",
+  "Individual Irons",
+  "Utility Irons",
+  "Wedges",
+  "Putters",
+  "Package Sets",
+  "Individual Club",
+  "Junior Individual Club",
+  "Chippers",
 ]);
 const UPSELL_BALL_TARGET_ID = "3cb474b6-79c2-4976-b0f2-b577f07eabfd"; // Srixon Distance Golf Balls (Pack of 12)
 const UPSELL_GLOVE_TARGET_ID = "f4b8646d-8787-4aad-9227-69f8dc6771d3"; // Viper Golf Men's Tour Pro Cabretta Glove
@@ -194,8 +204,12 @@ async function handleProductDelete(req, res) {
     await prisma.availabilityLog.deleteMany({
       where: { AvailabilityState: { productId: product.id } },
     });
-    await prisma.availabilityState.deleteMany({ where: { productId: product.id } });
-    await prisma.supplierProduct.deleteMany({ where: { productId: product.id } });
+    await prisma.availabilityState.deleteMany({
+      where: { productId: product.id },
+    });
+    await prisma.supplierProduct.deleteMany({
+      where: { productId: product.id },
+    });
     await prisma.variant.deleteMany({ where: { productId: product.id } });
     await prisma.product.delete({ where: { id: product.id } });
 
@@ -205,7 +219,10 @@ async function handleProductDelete(req, res) {
         action: "product_deleted_on_shopify",
         entityType: "Product",
         entityId: product.id,
-        beforeState: { title: product.title, shopifyProductId: String(shopifyProductId) },
+        beforeState: {
+          title: product.title,
+          shopifyProductId: String(shopifyProductId),
+        },
         source: "shopify_webhook",
       },
     });
@@ -228,6 +245,10 @@ async function handleInventoryLevelUpdate(req, res) {
 
 /* ─── orders/create, orders/updated ─────────────────────────────────────── */
 
+// REPLACE handleOrderUpsert in controllers/shopifyWebhookController.js with this.
+// Adds audit logging for order creation and status changes.
+// All DB work is awaited BEFORE res.send() (serverless constraint).
+
 async function handleOrderUpsert(req, res) {
   const order = req.body;
 
@@ -241,7 +262,14 @@ async function handleOrderUpsert(req, res) {
       customerId = matched?.id || null;
     }
 
-    await prisma.order.upsert({
+    // Read the previous state so we can tell create from update, and log
+    // only real changes (Shopify re-delivers webhooks).
+    const existing = await prisma.order.findUnique({
+      where: { shopifyOrderId: String(order.id) },
+      select: { id: true, financialStatus: true, fulfillmentStatus: true },
+    });
+
+    const saved = await prisma.order.upsert({
       where: { shopifyOrderId: String(order.id) },
       create: {
         shopifyOrderId: String(order.id),
@@ -264,12 +292,46 @@ async function handleOrderUpsert(req, res) {
       },
     });
 
-    // Module 6 — deliveredAt is really "first observed fulfilled," not a
-    // true carrier delivery-confirmation timestamp (we don't have carrier
-    // tracking integration) — an honest approximation, but the best
-    // signal available from this webhook alone. Only ever set once
-    // (deliveredAt: null in the WHERE guard) so a later orders/updated
-    // for the same order can't clobber the original transition time.
+    if (!existing) {
+      await prisma.auditLog.create({
+        data: {
+          actorType: "SYSTEM",
+          action: "order_created",
+          entityType: "Order",
+          entityId: saved.id,
+          afterState: {
+            orderNumber: saved.orderNumber,
+            financialStatus: saved.financialStatus,
+            fulfillmentStatus: saved.fulfillmentStatus,
+            totalPrice: saved.totalPrice,
+          },
+          source: "shopify_webhook",
+        },
+      });
+    } else if (
+      existing.financialStatus !== saved.financialStatus ||
+      existing.fulfillmentStatus !== saved.fulfillmentStatus
+    ) {
+      await prisma.auditLog.create({
+        data: {
+          actorType: "SYSTEM",
+          action: "order_status_changed",
+          entityType: "Order",
+          entityId: saved.id,
+          beforeState: {
+            financialStatus: existing.financialStatus,
+            fulfillmentStatus: existing.fulfillmentStatus,
+          },
+          afterState: {
+            financialStatus: saved.financialStatus,
+            fulfillmentStatus: saved.fulfillmentStatus,
+          },
+          source: "shopify_webhook",
+        },
+      });
+    }
+
+    // deliveredAt = first observed fulfilled; set once only.
     if (order.fulfillment_status === "fulfilled") {
       await prisma.order.updateMany({
         where: { shopifyOrderId: String(order.id), deliveredAt: null },
