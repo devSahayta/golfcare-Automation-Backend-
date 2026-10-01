@@ -10,15 +10,18 @@ const FALLBACK_REPLY =
 const MODEL = env.anthropicModelHaiku;
 
 // Fire-and-forget on purpose — a logging failure should never break the
-// actual chat response the staff member is waiting on.
+// actual chat response the staff member is waiting on. The insert and the
+// StaffUser total run in one transaction so the running total can never
+// drift out of sync with the sum of actual InsightsUsage rows.
 function logUsage({ staffUserId, question, usage, toolCallLog, outcome }) {
   const cost = computeCost(MODEL, usage);
   console.log(
     `[insights] cost: $${cost.usd.toFixed(6)} / ₹${cost.inr.toFixed(4)} ` +
       `(in=${usage?.inputTokens || 0} out=${usage?.outputTokens || 0} tools=${toolCallLog?.length || 0} outcome=${outcome})`,
   );
-  prisma.insightsUsage
-    .create({
+
+  const operations = [
+    prisma.insightsUsage.create({
       data: {
         staffUserId: staffUserId || null,
         question,
@@ -30,8 +33,24 @@ function logUsage({ staffUserId, question, usage, toolCallLog, outcome }) {
         toolCallCount: toolCallLog?.length || 0,
         outcome,
       },
-    })
-    .then(() => console.log("[insights] usage row saved"))
+    }),
+  ];
+
+  if (staffUserId) {
+    operations.push(
+      prisma.staffUser.update({
+        where: { id: staffUserId },
+        data: {
+          totalInsightsCostUsd: { increment: cost.usd },
+          totalInsightsCostInr: { increment: cost.inr },
+        },
+      }),
+    );
+  }
+
+  prisma
+    .$transaction(operations)
+    .then(() => console.log("[insights] usage row saved + staff total updated"))
     .catch((err) =>
       console.error("[insights] usage logging FAILED:", err.message),
     );
