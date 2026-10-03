@@ -466,6 +466,8 @@ model StaffUser {
   isActive  Boolean   @default(true)
   createdAt DateTime  @default(now()) @db.Timestamptz(6)
   InsightsUsage InsightsUsage[]
+  totalInsightsCostUsd Decimal @default(0) @db.Decimal(10, 6)
+  totalInsightsCostInr Decimal @default(0) @db.Decimal(10, 4)
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
