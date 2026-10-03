@@ -97,6 +97,36 @@ async function listTemplates() {
   });
 }
 
+/**
+ * Upload an image by URL for use as a template's media header — the
+ * server fetches the binary itself, no size limit (unlike the
+ * multipart /media/upload route, capped at 4.5MB by Vercel). Module 6 —
+ * used by dynamicTemplateController.js to give a dynamic template a real
+ * image header (the featured product's own Shopify photo, never an
+ * AI-generated one) before calling createTemplate with the returned
+ * headerHandle/mediaId.
+ *
+ * @param {object} input
+ * @param {string} input.url - publicly accessible image URL
+ * @param {string} input.fileName
+ * @param {string} input.fileType - MIME type, e.g. "image/jpeg"
+ * @returns {Promise<{mediaId: string, headerHandle: string, headerFormat: string}>}
+ */
+async function uploadMediaFromUrl({ url, fileName, fileType }) {
+  return callSamvaadik(async (client) => {
+    const res = await client.post("/media/upload-from-url", {
+      url,
+      file_name: fileName,
+      file_type: fileType,
+    });
+    return {
+      mediaId: res.data.media_id,
+      headerHandle: res.data.header_handle,
+      headerFormat: res.data.header_format,
+    };
+  });
+}
+
 async function downloadMedia(mediaUrl) {
   const axios = require("axios");
   const res = await axios.get(mediaUrl, {
@@ -193,6 +223,7 @@ module.exports = {
   createTemplate,
   listTemplates,
   deleteTemplate,
+  uploadMediaFromUrl,
   getProduct,
   updateInventory,
   getOrderStatus,
