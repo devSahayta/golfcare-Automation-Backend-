@@ -1,17 +1,54 @@
 // controllers/agentUsageController.js
 //
-// Normalizes two different source tables into one shape so the frontend
-// never has to know that Sales/Supplier usage lives in AgentUsage
-// (keyed by conversationId, agentName "sales" / "SUPPLIER") while
-// Insights usage lives in a separate InsightsUsage table (keyed by
-// staffUserId, no agentName at all). Campaign agent is deliberately
-// left out — a colleague owns that build.
+// Normalizes three different source tables into one shape so the
+// frontend never has to know where each agent's usage actually lives:
+//   - Sales / Supplier -> AgentUsage (keyed by conversationId; agentName
+//     is "sales" / "SUPPLIER" — Supplier has no explicit agentName in its
+//     config, so it falls back to context.participantType)
+//   - Insights         -> InsightsUsage (keyed by staffUserId)
+//   - Campaign         -> DynamicTemplate (the cost of the isolated Claude
+//     drafting call lives directly on the row as draft* columns, since a
+//     proactive campaign draft has no Conversation to hang an AgentUsage
+//     off of). That is DRAFTING cost only — any Meta/WhatsApp per-message
+//     send fee isn't tracked anywhere in the schema.
 const { prisma } = require("../lib/prisma");
 
+// Standard column names, shared by AgentUsage and InsightsUsage.
+const STANDARD_FIELDS = {
+  inputTokens: "inputTokens",
+  outputTokens: "outputTokens",
+  costUsd: "costUsd",
+  costInr: "costInr",
+  toolCallCount: "toolCallCount",
+};
+
 const AGENTS = {
-  sales: { table: "agentUsage", match: { agentName: "sales" } },
-  supplier: { table: "agentUsage", match: { agentName: "SUPPLIER" } },
-  insights: { table: "insightsUsage", match: {} },
+  sales: {
+    table: "agentUsage",
+    match: { agentName: "sales" },
+    fields: STANDARD_FIELDS,
+  },
+  supplier: {
+    table: "agentUsage",
+    match: { agentName: "SUPPLIER" },
+    fields: STANDARD_FIELDS,
+  },
+  insights: {
+    table: "insightsUsage",
+    match: {},
+    fields: STANDARD_FIELDS,
+  },
+  campaign: {
+    table: "dynamicTemplate",
+    match: {},
+    fields: {
+      inputTokens: "draftInputTokens",
+      outputTokens: "draftOutputTokens",
+      costUsd: "draftCostUsd",
+      costInr: "draftCostInr",
+      toolCallCount: null, // campaign drafting makes no tool calls
+    },
+  },
 };
 
 function parseRange(query) {
@@ -30,8 +67,68 @@ function parsePaging(query) {
   return { page, limit, skip: (page - 1) * limit };
 }
 
+// Builds the { _sum: { <realColumn>: true } } object for a given agent,
+// skipping any field that agent doesn't have (e.g. campaign tool calls).
+function buildSumSelect(fields) {
+  const select = {};
+  for (const col of Object.values(fields)) {
+    if (col) select[col] = true;
+  }
+  return select;
+}
+
+// Reads a normalized value out of an aggregate's _sum using the agent's
+// real column name for it.
+function readSum(sum, fields, key) {
+  const col = fields[key];
+  return col ? sum[col] || 0 : 0;
+}
+
+function humanize(str = "") {
+  const s = String(str).replace(/_/g, " ").toLowerCase();
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// One status word for a campaign draft, in order of "how far did it get /
+// where did it stop", since DynamicTemplate has no single outcome column.
+function campaignOutcome(row) {
+  if (row.internalApprovalStatus === "REJECTED") return "rejected";
+  if (row.metaStatus === "META_REJECTED") return "meta_rejected";
+  if (row.sendStatus === "SENT") return "sent";
+  if (row.sendStatus === "FAILED") return "failed";
+  if (row.internalApprovalStatus === "PENDING") return "awaiting_approval";
+  return "pending";
+}
+
+function customerName(c) {
+  if (!c) return "Unknown customer";
+  return (
+    [c.firstName, c.lastName].filter(Boolean).join(" ") ||
+    c.waPhone ||
+    "Unknown customer"
+  );
+}
+
 // Shared row shape, regardless of source table.
 function normalizeRow(row, agent) {
+  if (agent === "campaign") {
+    return {
+      id: row.id,
+      agent,
+      label: `${humanize(row.scenario)} · ${customerName(row.Customer)}`,
+      model: null,
+      inputTokens: row.draftInputTokens || 0,
+      outputTokens: row.draftOutputTokens || 0,
+      costUsd: row.draftCostUsd,
+      costInr: row.draftCostInr,
+      toolCallCount: 0,
+      outcome: campaignOutcome(row),
+      createdAt: row.createdAt,
+      conversationId: null,
+      staffUserId: null,
+    };
+  }
+
   return {
     id: row.id,
     agent,
@@ -47,18 +144,16 @@ function normalizeRow(row, agent) {
     toolCallCount: row.toolCallCount,
     outcome: row.outcome,
     createdAt: row.createdAt,
-    // Only present for sales/supplier
     conversationId: row.conversationId || null,
-    // Only present for insights
     staffUserId: row.staffUserId || null,
   };
 }
 
 // Groups InsightsUsage by staffUserId and joins the staff member's name/
 // email, so the Insights tab can show "who is costing what" rather than
-// just a system-wide total. Rows with no staffUserId (shouldn't normally
-// happen, but requests can come in without req.staffUser attached) are
-// grouped under a single "Unknown" entry rather than dropped silently.
+// just a system-wide total. Rows with no staffUserId (older rows logged
+// before requireStaffAuth reliably attached req.staffUser) are grouped
+// under a single "Unknown" entry rather than dropped silently.
 async function getInsightsStaffBreakdown(where) {
   const grouped = await prisma.insightsUsage.groupBy({
     by: ["staffUserId"],
@@ -91,6 +186,22 @@ async function getInsightsStaffBreakdown(where) {
     .sort((a, b) => b.totalCostInr - a.totalCostInr);
 }
 
+function includeFor(agent) {
+  if (agent === "insights") {
+    return { include: { StaffUser: { select: { name: true, email: true } } } };
+  }
+  if (agent === "campaign") {
+    return {
+      include: {
+        Customer: {
+          select: { firstName: true, lastName: true, waPhone: true },
+        },
+      },
+    };
+  }
+  return {};
+}
+
 async function getAgentUsage(req, res) {
   const agent = req.params.agent;
   const config = AGENTS[agent];
@@ -111,43 +222,36 @@ async function getAgentUsage(req, res) {
         orderBy: { createdAt: "desc" },
         skip,
         take: limit,
-        // Pull staff name/email alongside Insights rows, for display
-        ...(agent === "insights"
-          ? { include: { StaffUser: { select: { name: true, email: true } } } }
-          : {}),
+        ...includeFor(agent),
       }),
       model.count({ where }),
       model.aggregate({
         where,
-        _sum: {
-          inputTokens: true,
-          outputTokens: true,
-          costUsd: true,
-          costInr: true,
-          toolCallCount: true,
-        },
+        _sum: buildSumSelect(config.fields),
       }),
-      // Per-staff-member totals — only meaningful for Insights, since
-      // Sales/Supplier usage isn't attributed to an individual staff
-      // member (it's conversation-driven, not login-driven).
+      // Per-staff-member totals — only meaningful for Insights, since the
+      // other agents' usage isn't attributed to an individual staff login.
       agent === "insights"
         ? getInsightsStaffBreakdown(where)
         : Promise.resolve(null),
     ]);
 
     const sum = aggregate._sum;
+    const f = config.fields;
+    const totalCostUsd = Number(readSum(sum, f, "costUsd"));
+    const totalCostInr = Number(readSum(sum, f, "costInr"));
 
     res.json({
       agent,
       summary: {
         totalInteractions: total,
-        totalInputTokens: sum.inputTokens || 0,
-        totalOutputTokens: sum.outputTokens || 0,
-        totalToolCalls: sum.toolCallCount || 0,
-        totalCostUsd: Number(sum.costUsd || 0),
-        totalCostInr: Number(sum.costInr || 0),
-        avgCostUsd: total > 0 ? Number(sum.costUsd || 0) / total : 0,
-        avgCostInr: total > 0 ? Number(sum.costInr || 0) / total : 0,
+        totalInputTokens: readSum(sum, f, "inputTokens"),
+        totalOutputTokens: readSum(sum, f, "outputTokens"),
+        totalToolCalls: readSum(sum, f, "toolCallCount"),
+        totalCostUsd,
+        totalCostInr,
+        avgCostUsd: total > 0 ? totalCostUsd / total : 0,
+        avgCostInr: total > 0 ? totalCostInr / total : 0,
       },
       data: rows.map((r) =>
         normalizeRow(
@@ -174,8 +278,8 @@ async function getAgentUsage(req, res) {
   }
 }
 
-// GET /api/agent-usage/summary — all three agents' totals in one call,
-// for the overview cards at the top of the page without three round trips.
+// GET /api/agent-usage/summary — every agent's totals in one call, for
+// the overview cards at the top of the page without N round trips.
 async function getAgentUsageSummary(req, res) {
   try {
     const where = parseRange(req.query);
@@ -188,22 +292,19 @@ async function getAgentUsageSummary(req, res) {
           model.count({ where: agentWhere }),
           model.aggregate({
             where: agentWhere,
-            _sum: {
-              costUsd: true,
-              costInr: true,
-              inputTokens: true,
-              outputTokens: true,
-            },
+            _sum: buildSumSelect(config.fields),
           }),
         ]);
+        const sum = aggregate._sum;
+        const f = config.fields;
         return [
           agent,
           {
             totalInteractions: total,
-            totalCostUsd: Number(aggregate._sum.costUsd || 0),
-            totalCostInr: Number(aggregate._sum.costInr || 0),
-            totalInputTokens: aggregate._sum.inputTokens || 0,
-            totalOutputTokens: aggregate._sum.outputTokens || 0,
+            totalCostUsd: Number(readSum(sum, f, "costUsd")),
+            totalCostInr: Number(readSum(sum, f, "costInr")),
+            totalInputTokens: readSum(sum, f, "inputTokens"),
+            totalOutputTokens: readSum(sum, f, "outputTokens"),
           },
         ];
       }),
