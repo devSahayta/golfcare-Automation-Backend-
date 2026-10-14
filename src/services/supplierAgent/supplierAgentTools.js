@@ -114,7 +114,13 @@ function buildSupplierAgentTools(context) {
       // otherwise try to create dozens of drafts (and send dozens of
       // emails) in one turn. Above the cap, the model is told to escalate
       // the whole batch instead of attempting each one.
-      const tooManyNewProducts = unmatched.length > env.supplierBulkNewProductLimit;
+      // SUPPLIER_BULK_NEW_PRODUCT_LIMIT=0 disables the cap entirely (for
+      // testing a full document end-to-end) — downstream, ShopifySyncQueue
+      // drains whatever gets created in small, paced batches regardless
+      // (see scheduler's shopifySyncQueueDrain.js), so lifting this cap
+      // doesn't need any change on that side.
+      const limit = env.supplierBulkNewProductLimit;
+      const tooManyNewProducts = limit > 0 && unmatched.length > limit;
 
       // Record each genuinely-new item as a PendingProductLead — NOT a
       // ProductDraft yet, just a marker that this conversation still has
