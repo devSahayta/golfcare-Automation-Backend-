@@ -1,16 +1,16 @@
 // controllers/agentUsageController.js
 //
 // Normalizes two different source tables into one shape so the frontend
-// never has to know that Sales/Supplier usage lives in AgentUsage
-// (keyed by conversationId, agentName "sales" / "SUPPLIER") while
-// Insights usage lives in a separate InsightsUsage table (keyed by
-// staffUserId, no agentName at all). Campaign agent is deliberately
-// left out — a colleague owns that build.
+// never has to know that Sales/Supplier/Lifecycle usage lives in AgentUsage
+// (keyed by conversationId, agentName "sales" / "SUPPLIER" / "LIFECYCLE")
+// while Insights usage lives in a separate InsightsUsage table (keyed by
+// staffUserId, no agentName at all).
 const { prisma } = require("../lib/prisma");
 
 const AGENTS = {
   sales: { table: "agentUsage", match: { agentName: "sales" } },
   supplier: { table: "agentUsage", match: { agentName: "SUPPLIER" } },
+  lifecycle: { table: "agentUsage", match: { agentName: "LIFECYCLE" } },
   insights: { table: "insightsUsage", match: {} },
 };
 

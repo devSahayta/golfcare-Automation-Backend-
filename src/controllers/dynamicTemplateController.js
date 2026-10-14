@@ -19,16 +19,7 @@
 // templateDeletionSweep.js.
 
 const { prisma } = require("../lib/prisma");
-const { createTemplate, uploadMediaFromUrl } = require("../lib/samvaadik/adapter");
-
-const EXT_TO_MIME = {
-  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif",
-};
-
-function guessImageMimeType(url) {
-  const match = /\.([a-z0-9]+)(?:\?|$)/i.exec(url || "");
-  return EXT_TO_MIME[match?.[1]?.toLowerCase()] || "image/jpeg";
-}
+const { approveAndSubmit, reject } = require("../services/campaignTemplateService");
 
 function escapeHtml(str) {
   return String(str ?? "").replace(
@@ -103,48 +94,7 @@ async function approveTemplate(req, res) {
   }
 
   try {
-    const variables = Array.isArray(template.variables) ? template.variables : [];
-
-    // Best-effort image header — same resilience shape as
-    // shopifyProductCreate.js's image-then-no-image retry: a dead/expired
-    // image URL shouldn't lose the whole template, just its header.
-    let headerOptions = {};
-    if (template.imageUrl) {
-      try {
-        const upload = await uploadMediaFromUrl({
-          url: template.imageUrl,
-          fileName: `${template.templateName}.jpg`,
-          fileType: guessImageMimeType(template.imageUrl),
-        });
-        headerOptions = {
-          headerFormat: "IMAGE",
-          headerHandle: upload.headerHandle,
-          mediaId: upload.mediaId,
-        };
-      } catch (uploadErr) {
-        console.error(
-          "[dynamicTemplateController] image upload failed, submitting as text-only:",
-          uploadErr.message,
-        );
-      }
-    }
-
-    const result = await createTemplate(template.templateName, template.category, template.bodyDraft, {
-      bodyExamples: variables,
-      ...headerOptions,
-    });
-
-    await prisma.dynamicTemplate.update({
-      where: { id: template.id },
-      data: {
-        internalApprovalStatus: "APPROVED",
-        internalApprovedBy: "EMAIL",
-        internalApprovedAt: new Date(),
-        samvaadikWtId: result.wt_id,
-        metaStatus: "SUBMITTED",
-        metaSubmittedAt: new Date(),
-      },
-    });
+    await approveAndSubmit(template.id, "EMAIL");
 
     res.send(
       page(
@@ -166,10 +116,7 @@ async function rejectTemplate(req, res) {
     return res.status(error === "not_found" ? 404 : 409).send(page(`<h2>Can't reject</h2><p>${error}</p>`));
   }
 
-  await prisma.dynamicTemplate.update({
-    where: { id: template.id },
-    data: { internalApprovalStatus: "REJECTED", internalApprovedBy: "EMAIL", internalApprovedAt: new Date() },
-  });
+  await reject(template.id, "EMAIL");
   res.send(page("<h2>Rejected</h2><p>The draft was left unsubmitted — nothing was sent to the customer.</p>"));
 }
 

@@ -98,6 +98,21 @@ async function listTemplates() {
 }
 
 /**
+ * Full detail for one template, including its components (body text,
+ * header). The list endpoint returns only summary fields, so use this
+ * when the actual message content is needed.
+ *
+ * @param {string} wtId
+ * @returns {Promise<object>} the template row, with components as stored
+ */
+async function getTemplate(wtId) {
+  return callSamvaadik(async (client) => {
+    const res = await client.get(`/templates/${wtId}`);
+    return res.data.data;
+  });
+}
+
+/**
  * Upload an image by URL for use as a template's media header — the
  * server fetches the binary itself, no size limit (unlike the
  * multipart /media/upload route, capped at 4.5MB by Vercel). Module 6 —
@@ -222,6 +237,7 @@ module.exports = {
   parseWebhook,
   createTemplate,
   listTemplates,
+  getTemplate,
   deleteTemplate,
   uploadMediaFromUrl,
   getProduct,
