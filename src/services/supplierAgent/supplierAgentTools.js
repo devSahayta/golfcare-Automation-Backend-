@@ -583,6 +583,83 @@ function buildSupplierAgentTools(context) {
       };
     },
 
+    // Deliberately does NOT take the items themselves — confirmed live,
+    // twice, that asking the model to transcribe a large catalog's items
+    // into this tool call fails: even chunked at 20 items/call with an
+    // explicit instruction to do so, Haiku needed 5 attempts (truncating
+    // mid-JSON against toolLoop.js's shared 1024-token response cap) to
+    // land ONE chunk, then immediately hit the whole turn's 6-iteration
+    // cap with ~80% of a ~100-item catalog still untouched. The fix isn't
+    // a smaller chunk size — it's not asking the live conversational model
+    // to re-type the catalog at all. This just records that a document in
+    // this conversation should be bulk-imported, with the blanket margin/
+    // GST the supplier gave; the scheduler's jobs/productImportDrain.js
+    // does the actual parsing as its own isolated, unbounded Claude call
+    // (same "isolated call, not the main loop" pattern as
+    // research_product_specs), then the normal per-item draining already
+    // built proceeds exactly as before.
+    async start_bulk_product_import({ marginPercent, gstPercent }) {
+      if (!supplier) return { error: "no_supplier_on_conversation" };
+      if (marginPercent == null || gstPercent == null) {
+        return { error: "margin_and_gst_required" };
+      }
+
+      const attachmentMsg = await prisma.message.findFirst({
+        where: {
+          conversationId: context.conversation.id,
+          direction: "INBOUND",
+          body: { contains: "[Attached file" },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      if (!attachmentMsg) {
+        return {
+          error: "no_attachment_found",
+          message: "No document attachment found in this conversation to import from.",
+        };
+      }
+      const marker = "[Attached file — extracted contents below]";
+      const idx = attachmentMsg.body.indexOf(marker);
+      const documentText = idx >= 0 ? attachmentMsg.body.slice(idx + marker.length).trim() : attachmentMsg.body;
+
+      // Same dedup reasoning as findExistingPendingDraft for create_product_draft
+      // (see its own comment) — confirmed live here too: an agentEngine
+      // guardrail retry re-ran this exact tool call for the same document a
+      // few seconds after the first attempt already created a batch,
+      // because the first attempt's reply text failed a guardrail even
+      // though its tool call had already succeeded. Block on the document
+      // text itself, not on the caller somehow being idempotent.
+      const existingBatch = await prisma.productImportBatch.findFirst({
+        where: { supplierId: supplier.id, rawDocumentText: documentText },
+        orderBy: { createdAt: "desc" },
+      });
+      if (existingBatch) {
+        return {
+          batchId: existingBatch.id,
+          alreadyQueued: true,
+          status: existingBatch.status,
+          message: `This exact document was already queued (batch ${existingBatch.id}, status ${existingBatch.status}) — not creating a duplicate. Just tell the supplier it's received and being processed.`,
+        };
+      }
+
+      const batch = await prisma.productImportBatch.create({
+        data: {
+          supplierId: supplier.id,
+          conversationId: context.conversation.id,
+          marginPercent,
+          gstPercent,
+          rawDocumentText: documentText,
+          status: "PENDING_EXTRACTION",
+        },
+      });
+
+      return {
+        batchId: batch.id,
+        message:
+          "Queued the document for background import. This takes a while — parsing the catalog, checking for existing products, researching and creating drafts for new ones — not an instant result. Tell the supplier now that their list was received and is being processed; don't wait for or claim an immediate result, and don't call create_product_draft for any of these items yourself.",
+      };
+    },
+
     async escalate_to_human({ reason, urgency }) {
       // Deliberately does NOT touch Conversation.state. agentEngine gates
       // on that (only AI_HANDLING gets a response), and with no dashboard

@@ -491,6 +491,74 @@ model Supplier {
   ProductDraft     ProductDraft[]
   SupplierCheck    SupplierCheck[]
   SupplierProduct  SupplierProduct[]
+  ProductImportBatch ProductImportBatch[]
+}
+
+enum ImportBatchStatus {
+  PENDING_EXTRACTION
+  PROCESSING
+  DONE
+}
+
+enum ImportItemStatus {
+  PENDING
+  RESEARCHING
+  DRAFTED
+  LINKED_EXISTING
+  FAILED
+}
+
+// A supplier sending a large catalog/price list (many new products at
+// once) can't be processed inline during the chat turn — see
+// start_bulk_product_import in supplierAgentTools.js and
+// golfcare-Automation-Schedular-'s jobs/productImportDrain.js, which
+// drains ProductImportItem rows gradually (duplicate-check, research,
+// real Shopify draft creation) with no request-timeout risk.
+model ProductImportBatch {
+  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  supplierId      String
+  conversationId  String?
+  totalItems      Int               @default(0)
+  processedItems  Int               @default(0)
+  draftedCount    Int               @default(0)
+  linkedCount     Int               @default(0)
+  failedCount     Int               @default(0)
+  status          ImportBatchStatus @default(PENDING_EXTRACTION)
+  // Set at creation (PENDING_EXTRACTION), consumed once by the scheduler's
+  // extraction step (jobs/productImportDrain.js) — the raw document text
+  // the supplier sent and the blanket margin/GST they gave for the whole
+  // catalog. The live chat turn never has to parse this itself; see
+  // start_bulk_product_import in supplierAgentTools.js for why.
+  rawDocumentText String?
+  marginPercent   Decimal?
+  gstPercent      Decimal?
+  extractionError String?
+  createdAt       DateTime          @default(now())
+  completedAt     DateTime?
+  Supplier        Supplier          @relation(fields: [supplierId], references: [id])
+  Items           ProductImportItem[]
+}
+
+model ProductImportItem {
+  id                     String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  batchId                String
+  title                  String
+  sku                    String?
+  brand                  String?
+  mrp                    Decimal
+  marginPercent          Decimal
+  gstPercent             Decimal
+  variantOptions         Json?
+  status                 ImportItemStatus  @default(PENDING)
+  resultProductDraftId   String?
+  resultMatchedProductId String?
+  errorMessage           String?
+  createdAt              DateTime          @default(now())
+  processedAt            DateTime?
+  Batch                  ProductImportBatch @relation(fields: [batchId], references: [id])
+
+  @@index([status])
+  @@index([batchId])
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.

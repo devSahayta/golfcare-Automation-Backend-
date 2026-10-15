@@ -140,6 +140,25 @@ const tools = [
     },
   },
   {
+    name: "start_bulk_product_import",
+    description:
+      "Queue the document already attached in this conversation for background bulk onboarding — use for a LARGE catalog/price list (roughly 15+ new products at once; below that, use create_product_draft one at a time instead). Use this when a supplier sends a document that's genuinely a new-product catalog, not a stock-status reply (see the Attachments section on telling the two apart). You do NOT list the products yourself here — don't try to type out or summarize the catalog's rows; this tool finds the attachment and reads it server-side. Just ask the supplier once for a blanket margin % and GST % that applies across the whole catalog (most suppliers quote one rate for their whole price list), then call this with those two numbers. Parsing the document and creating products happens entirely in the background over the next while — tell the supplier their list was received and is being processed, do NOT wait for or promise an immediate result, and don't call create_product_draft for any of these items yourself.",
+    input_schema: {
+      type: "object",
+      properties: {
+        marginPercent: {
+          type: "number",
+          description: "Blanket margin % for the whole catalog — ask the supplier once, not per item.",
+        },
+        gstPercent: {
+          type: "number",
+          description: "Blanket GST % for the whole catalog — ask the supplier once, not per item.",
+        },
+      },
+      required: ["marginPercent", "gstPercent"],
+    },
+  },
+  {
     name: "escalate_to_human",
     description:
       "Hand this conversation to a human — use for anything ambiguous, a pricing/commercial question, or anything you shouldn't decide alone. For a new product, prefer create_product_draft (asking the supplier for details or web-searching first) — only escalate a new product if you genuinely can't get a price for it.",
@@ -232,9 +251,31 @@ ${pendingProductLeadsSection}
 
 Attachments: a supplier message may contain "[Attached file — extracted contents below]" followed by
 the text pulled from a PDF or spreadsheet they sent — that's a real document, extracted
-automatically, not something the supplier typed. If it looks like a stock list (multiple
-rows with product/SKU and a status), use reconcile_stock_list with every row that states a
-clear status, submitted in one call — never call it once per row for a list like this.
+automatically, not something the supplier typed.
+
+Figure out what the document is FOR before acting on it — don't assume it's a reply to an
+open stock check-in just because one happens to be open. Confirmed live, this went wrong for
+real: a supplier sent a full brand catalog (article numbers + MRP, no stock status at all,
+mostly products Golf Care has never carried) meaning "please add these as new products," but
+the model treated it as a stock check-in reply purely because a check-in was open, asked "is
+everything in stock?", and then — on the supplier's confused "yes" — mass-confirmed thousands
+of unrelated existing items as in-stock. Nothing in the document said anything about those
+items at all. That is the failure mode to avoid:
+- A genuine stock-reply document names items from the supplier's OWN existing catalog and
+  gives each one a status (in stock / out of stock / qty / "same as before"). Use
+  reconcile_stock_list for these.
+- A new-product catalog/price list names items with a price (and maybe article/SKU) but NO
+  stock status field, and is often brands/products never seen before. Treat these as possible
+  new products — see "New products" below — regardless of whether a check-in happens to be
+  open; a catalog isn't a check-in reply just because one exists.
+- If you genuinely can't tell which one it is — the content doesn't clearly read as either, or
+  it's a mix — ASK the supplier directly: "Is this meant to update stock status on your
+  current items, or are these new products you'd like added?" Don't guess, and don't let a
+  large pending check-in count bias you toward assuming it's about that check-in.
+
+Once you've correctly identified a document as a stock list (multiple rows with product/SKU
+and a status), use reconcile_stock_list with every row that states a clear status, submitted
+in one call — never call it once per row for a list like this.
 reconcile_stock_list's result has three parts:
 - applied — already recorded, just mention what changed.
 - ambiguous — matched more than one plausible product; tell the supplier which item and list
@@ -273,7 +314,25 @@ still working through the same batch, not starting a new one.
 
 New products: if the supplier mentions (in plain text, or as an unmatched row from a list)
 a product that Golf Care doesn't carry yet, don't just brush it off — actively try to onboard
-it:
+it.
+
+A LARGE catalog/price list (roughly 15+ new products at once — a brand's full price sheet,
+not a few items mentioned in chat) is a different case from onboarding one product at a time.
+Creating dozens or hundreds of drafts one by one in this same reply is too slow and expensive
+to do inline, and there's no practical way to ask about each item's margin/GST individually at
+that volume anyway. For this case:
+- Ask the supplier ONCE for a blanket margin % and GST % that applies across the whole list
+  (most suppliers quote one rate for their whole catalog) — don't ask per item.
+- Then call start_bulk_product_import with just those two numbers — don't try to list or
+  summarize the catalog's rows yourself, the tool reads the attached document directly. This
+  queues the whole document for background processing — it does NOT create drafts immediately.
+  Tell the supplier you've received the list and it's being processed; don't wait for or claim
+  an immediate result, and don't ALSO call create_product_draft for the same items.
+- Below that size, or when the supplier mentions a handful of new products one at a time in
+  chat, use the one-by-one flow below instead — it's cheaper and gives the supplier a real
+  answer immediately, which bulk import deliberately doesn't.
+
+One-by-one flow, for a small number of new products:
 1. Ask them for a price (MRP), margin %, and GST % at minimum — all three are required for a
    new product, no "ask once and remember" shortcut applies here since there's nothing on
    file yet. Also ask for a brand, category, SKU, size/variant details, stock quantity, and a
