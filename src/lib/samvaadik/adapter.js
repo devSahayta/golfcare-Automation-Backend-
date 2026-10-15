@@ -214,6 +214,110 @@ async function getOrderStatus(_orderIdOrNumber) {
   );
 }
 
+async function getTemplateStatus(wtId) {
+  return callSamvaadik(async (client) => {
+    // GET /v1/templates returns only APPROVED templates for this account
+    const res = await client.get("/templates");
+    const templates = res.data?.data || [];
+    const match = templates.find((t) => t.wt_id === wtId);
+
+    if (match) {
+      return {
+        wtId,
+        status: "APPROVED",
+        name: match.name,
+        metaStatus: match.status,
+      };
+    }
+
+    // Not in the approved list — could be PENDING or REJECTED.
+    // Samvaadik doesn't expose a single-template GET endpoint, so we
+    // treat "not found in approved list" as PENDING for polling purposes.
+    // The controller will keep polling until it appears or the campaign is
+    // manually cancelled.
+    return { wtId, status: "PENDING" };
+  });
+}
+
+/**
+ * Schedule a WhatsApp template message via Samvaadik.
+ *
+ * POST /v1/messages/schedule
+ *
+ * @param {object} params
+ * @param {string} params.phone           - recipient phone, digits only e.g. "919876543210"
+ * @param {string} [params.contactName]   - optional display name
+ * @param {string} params.wtId            - Samvaadik template wt_id
+ * @param {object} [params.templateVariables] - e.g. { "1": "Rahul" }
+ * @param {string} params.scheduledAt     - ISO 8601 datetime string
+ * @param {string} [params.timezone]      - e.g. "Asia/Kolkata"
+ * @param {string} [params.batchId]       - group related messages, ≤100 chars
+ * @param {string} [params.mediaId]       - required only if template has media header
+ * @returns {Promise<{ sm_id: string, status: string }>}
+ */
+async function scheduleTemplateMessage({
+  phone,
+  contactName,
+  wtId,
+  templateVariables = {},
+  scheduledAt,
+  timezone = "Asia/Kolkata",
+  batchId,
+  mediaId,
+}) {
+  return callSamvaadik(async (client) => {
+    const body = {
+      phone,
+      wt_id: wtId,
+      scheduled_at: scheduledAt,
+      timezone,
+      template_variables: templateVariables,
+      ...(contactName && { contact_name: contactName }),
+      ...(batchId && { batch_id: batchId }),
+      ...(mediaId && { media_id: mediaId }),
+    };
+
+    const res = await client.post("/messages/schedule", body);
+    // Response: { success, message, data: { sm_id, status, scheduled_at, ... } }
+    return res.data.data;
+  });
+}
+
+/**
+ * List scheduled messages, optionally filtered by batch_id.
+ *
+ * GET /v1/messages/schedule?batch_id=...&limit=...
+ *
+ * @param {object} [filters]
+ * @param {string} [filters.batchId]   - filter to a specific campaign batch
+ * @param {string} [filters.status]    - "scheduled" | "sent" | "failed" | "cancelled"
+ * @param {string} [filters.phone]     - filter by recipient phone
+ * @param {number} [filters.limit]     - max rows (default 50, max 200)
+ * @param {number} [filters.offset]    - pagination offset
+ * @returns {Promise<{ rows: object[], total: number }>}
+ */
+async function listScheduledMessages({
+  batchId,
+  status,
+  phone,
+  limit = 200,
+  offset = 0,
+} = {}) {
+  return callSamvaadik(async (client) => {
+    const params = { limit, offset };
+    if (batchId) params.batch_id = batchId;
+    if (status) params.status = status;
+    if (phone) params.phone = phone;
+
+    const res = await client.get("/messages/schedule", { params });
+    // Response: { success, total, limit, offset, data: [...rows] }
+    return {
+      rows: res.data?.data || [],
+      total: res.data?.total || 0,
+    };
+  });
+}
+
 module.exports = {
   sendText,
   sendTemplate,
@@ -224,6 +328,9 @@ module.exports = {
   listTemplates,
   deleteTemplate,
   uploadMediaFromUrl,
+  getTemplateStatus,
+  scheduleTemplateMessage,
+  listScheduledMessages,
   getProduct,
   updateInventory,
   getOrderStatus,

@@ -128,6 +128,43 @@ async function handleInboundMessage(evt) {
     }
   }
 
+  // ── STOP / opt-out detection ──────────────────────────────────────────
+  // WhatsApp users reply "STOP", "UNSUBSCRIBE", etc. to opt out of
+  // marketing messages. We promised this in the consent text — honour it
+  // immediately by setting optedOutAt on the Customer row. The agent
+  // still runs (to ack the opt-out politely) but no campaign send will
+  // include this customer again.
+  const stopPattern = /^\s*(stop|unsubscribe|opt\s*out|no\s*more|cancel)\s*$/i;
+  if (body && stopPattern.test(body)) {
+    const phone = evt.from;
+    try {
+      await prisma.customer.updateMany({
+        where: { waPhone: phone, optedOutAt: null },
+        data: { optedOutAt: new Date(), consentMarketing: false },
+      });
+      await prisma.auditLog.create({
+        data: {
+          actorType: "SYSTEM",
+          action: "OPT_OUT",
+          entityType: "Customer",
+          entityId: phone,
+          afterState: {
+            optedOutAt: new Date().toISOString(),
+            trigger: "STOP_reply",
+          },
+          source: "samvaadik_webhook",
+        },
+      });
+      console.log(`[samvaadik webhook] OPT_OUT recorded for ${phone}`);
+    } catch (optOutErr) {
+      console.error(
+        "[samvaadik webhook] opt-out update failed:",
+        optOutErr.message,
+      );
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────
+
   const savedMessage = await prisma.message.create({
     data: {
       conversationId: conversation.id,

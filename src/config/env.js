@@ -26,6 +26,7 @@ const env = {
     ),
   },
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
+  replicateApiToken: process.env.REPLICATE_API_TOKEN || "",
   approvalLinkBaseUrl:
     process.env.APPROVAL_LINK_BASE_URL || "http://localhost:4000",
   // Placeholder default — TTL per product category is still an open

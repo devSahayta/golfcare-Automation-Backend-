@@ -1,4 +1,8 @@
 // src/controllers/insightsController.js
+// v2 — extracts contentPickerData from suggest_campaign_content tool call,
+// no longer extracts campaignData from draft_campaign (frontend now calls
+// POST /api/campaigns/draft directly).
+
 const { runToolLoop } = require("../services/agentEngine/toolLoop");
 const { computeCost } = require("../services/agentEngine/modelPricing");
 const insightsAgentConfig = require("../services/insightsAgent/insightsAgentConfig");
@@ -7,17 +11,29 @@ const { env } = require("../config/env");
 
 const FALLBACK_REPLY =
   "I wasn't able to work that out — try rephrasing, or ask something more specific.";
-const MODEL = env.anthropicModelHaiku;
 
-// Fire-and-forget on purpose — a logging failure should never break the
-// actual chat response the staff member is waiting on. The insert and the
-// StaffUser total run in one transaction so the running total can never
-// drift out of sync with the sum of actual InsightsUsage rows.
-function logUsage({ staffUserId, question, usage, toolCallLog, outcome }) {
-  const cost = computeCost(MODEL, usage);
+const CAMPAIGN_INTENT_RE =
+  /\b(campaign|broadcast|send|message|announce|promotion|promo|offer|blast|bulk|whatsapp|template|notify|reach out|follow.?up|tournament|invite)\b/i;
+
+function pickInsightsModel(message, history) {
+  if (CAMPAIGN_INTENT_RE.test(message)) return env.anthropicModelSonnet;
+  return env.anthropicModelHaiku;
+}
+
+function logUsage({
+  staffUserId,
+  question,
+  model,
+  usage,
+  toolCallLog,
+  outcome,
+}) {
+  const cost = computeCost(model, usage);
   console.log(
-    `[insights] cost: $${cost.usd.toFixed(6)} / ₹${cost.inr.toFixed(4)} ` +
-      `(in=${usage?.inputTokens || 0} out=${usage?.outputTokens || 0} tools=${toolCallLog?.length || 0} outcome=${outcome})`,
+    `[insights] model=${model} cost: $${cost.usd.toFixed(6)} / ₹${cost.inr.toFixed(4)} ` +
+      `(in=${usage?.inputTokens || 0} out=${usage?.outputTokens || 0} ` +
+      `cache_created=${usage?.cacheCreationTokens || 0} cache_read=${usage?.cacheReadTokens || 0} ` +
+      `tools=${toolCallLog?.length || 0} outcome=${outcome})`,
   );
 
   const operations = [
@@ -25,7 +41,7 @@ function logUsage({ staffUserId, question, usage, toolCallLog, outcome }) {
       data: {
         staffUserId: staffUserId || null,
         question,
-        model: MODEL,
+        model,
         inputTokens: usage?.inputTokens || 0,
         outputTokens: usage?.outputTokens || 0,
         costUsd: cost.usd,
@@ -50,7 +66,7 @@ function logUsage({ staffUserId, question, usage, toolCallLog, outcome }) {
 
   prisma
     .$transaction(operations)
-    .then(() => console.log("[insights] usage row saved + staff total updated"))
+    .then(() => console.log("[insights] usage row saved"))
     .catch((err) =>
       console.error("[insights] usage logging FAILED:", err.message),
     );
@@ -77,10 +93,13 @@ async function askInsights(req, res) {
   const question = message.trim();
   const fullHistory = [...priorTurns, { role: "user", content: question }];
 
-  // Static per-request context, not worth a tool round-trip — req.staffUser
-  // is already attached by requireStaffAuth on every request.
+  const model = pickInsightsModel(question, priorTurns);
+  console.log(
+    `[insights] turn model=${model} message="${question.slice(0, 60)}"`,
+  );
+
   const staffContext = req.staffUser
-    ? `\n\nThe staff member you're talking to right now is ${req.staffUser.name} (role: ${req.staffUser.role}). You may greet them by name and answer if they ask who they are — you don't need a tool for that, it's given to you here.`
+    ? `\n\nThe staff member talking to you right now is ${req.staffUser.name} (role: ${req.staffUser.role}). Greet them by name if it's their first message.`
     : "";
   const systemPrompt = insightsAgentConfig.systemPrompt + staffContext;
 
@@ -88,21 +107,18 @@ async function askInsights(req, res) {
     const result = await runToolLoop({
       systemPrompt,
       tools: insightsAgentConfig.tools,
-      toolHandlers: insightsAgentConfig.buildToolHandlers(),
+      toolHandlers: insightsAgentConfig.buildToolHandlers({
+        staffUserId: req.staffUser?.id || null,
+      }),
       history: fullHistory,
-      maxIterations: env.agentMaxToolIterations || 6,
-      // Haiku for now — cheaper while this is still early/internal. Your
-      // own modelRouter.js notes Haiku had a ~37% tool-call miss rate on
-      // Sales Agent's onboarding flow, so if Insights starts giving
-      // wrong/empty answers on questions that clearly should hit a tool,
-      // that's the likely cause — swap MODEL above to
-      // env.anthropicModelSonnet.
-      model: MODEL,
+      maxIterations: env.agentMaxToolIterations || 8,
+      model,
     });
 
     logUsage({
       staffUserId: req.staffUser?.id,
       question,
+      model,
       usage: result.usage,
       toolCallLog: result.toolCallLog,
       outcome: result.hitIterationCap ? "iteration_cap" : "completed",
@@ -112,12 +128,52 @@ async function askInsights(req, res) {
       return res.json({ reply: FALLBACK_REPLY });
     }
 
-    res.json({ reply: result.finalText });
+    // v2: extract contentPickerData from suggest_campaign_content tool call.
+    // This replaces the old campaignData extraction from draft_campaign.
+    let contentPickerData = null;
+    const pickerCall = result.toolCallLog
+      ?.slice()
+      .reverse()
+      .find(
+        (t) =>
+          t.tool === "suggest_campaign_content" &&
+          t.output?.success === true &&
+          t.output?.action === "SHOW_CONTENT_PICKER",
+      );
+    if (pickerCall) {
+      contentPickerData = {
+        campaignName: pickerCall.output.campaignName,
+        audienceRules: pickerCall.output.audienceRules,
+        audienceSize: pickerCall.output.audienceSize,
+        intent: pickerCall.output.intent,
+        variants: pickerCall.output.variants,
+        recommendedIndex: pickerCall.output.recommendedIndex,
+        // Pass through the original agent prompt for the draft record
+        agentPrompt: question,
+      };
+    }
+
+    console.log(
+      "[insights] toolCallLog:",
+      JSON.stringify(
+        result.toolCallLog?.map((t) => ({
+          tool: t.tool,
+          action: t.output?.action,
+          success: t.output?.success,
+        })),
+        null,
+        2,
+      ),
+    );
+    console.log("[insights] contentPicker being returned:", contentPickerData);
+
+    res.json({ reply: result.finalText, contentPicker: contentPickerData });
   } catch (err) {
     console.error("askInsights error:", err);
     logUsage({
       staffUserId: req.staffUser?.id,
       question,
+      model,
       usage: null,
       toolCallLog: [],
       outcome: "error",

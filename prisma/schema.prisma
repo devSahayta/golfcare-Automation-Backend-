@@ -143,6 +143,7 @@ model Customer {
   createdAt             DateTime             @default(now()) @db.Timestamptz(6)
   updatedAt             DateTime             @default(now()) @db.Timestamptz(6)
   CampaignSend          CampaignSend[]
+    BroadcastRecipient    BroadcastRecipient[]
   CampaignTrigger       CampaignTrigger[]
   Conversation          Conversation[]
   CustomerSegment       CustomerSegment[]
@@ -466,6 +467,7 @@ model StaffUser {
   isActive  Boolean   @default(true)
   createdAt DateTime  @default(now()) @db.Timestamptz(6)
   InsightsUsage InsightsUsage[]
+    BroadcastCampaign  BroadcastCampaign[]
   totalInsightsCostUsd Decimal @default(0) @db.Decimal(10, 6)
   totalInsightsCostInr Decimal @default(0) @db.Decimal(10, 4)
 }
@@ -584,6 +586,83 @@ model InsightsUsage {
 
   @@index([staffUserId])
   @@index([createdAt])
+}
+
+// ── Broadcast campaigns (Insights-agent-created, one template → many customers) ──
+model BroadcastCampaign {
+  id                  String             @id @default(dbgenerated("(gen_random_uuid())::text"))
+  name                String
+  status              BroadcastStatus    @default(DRAFT)
+  createdByStaffId    String?
+  agentPrompt         String?
+  audienceRules       Json
+  audienceSize        Int                @default(0)
+  templateName        String             @unique
+  category            TemplateCategory   @default(MARKETING)
+  bodyText            String
+  headerImageUrl      String?
+  samvaadikWtId       String?
+  metaStatus          MetaTemplateStatus @default(NOT_SUBMITTED)
+  metaSubmittedAt     DateTime?          @db.Timestamptz(6)
+  metaApprovedAt      DateTime?          @db.Timestamptz(6)
+  metaRejectionReason String?
+  confirmedAt         DateTime?          @db.Timestamptz(6)
+  scheduledFor        DateTime?          @db.Timestamptz(6)
+  sentCount           Int                @default(0)
+  failedCount         Int                @default(0)
+  skippedCount        Int                @default(0)
+  completedAt         DateTime?          @db.Timestamptz(6)
+  deleteAfter         DateTime?          @db.Timestamptz(6)
+  deleteStatus        DeleteStatus       @default(NOT_DUE)
+  deletedAt           DateTime?          @db.Timestamptz(6)
+  createdAt           DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime           @default(now()) @updatedAt @db.Timestamptz(6)
+  StaffUser           StaffUser?         @relation(fields: [createdByStaffId], references: [id], onUpdate: NoAction)
+  BroadcastRecipient  BroadcastRecipient[]
+  headerType          String?  @default("NONE")
+  headerText          String?
+  footerText          String?
+  buttons             Json?    @default("[]")
+
+  @@index([status], map: "idx_broadcastcampaign_status")
+}
+
+model BroadcastRecipient {
+  id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
+  campaignId      String
+  customerId      String
+  phone           String
+  firstName       String?
+  status          RecipientStatus   @default(PENDING)
+  samvaadikSmId   String?
+  waMessageId     String?
+  skipReason      String?
+  errorMessage    String?
+  sentAt          DateTime?         @db.Timestamptz(6)
+  createdAt       DateTime          @default(now()) @db.Timestamptz(6)
+  BroadcastCampaign BroadcastCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  Customer        Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  @@unique([campaignId, customerId])
+  @@index([campaignId, status], map: "idx_broadcastrecipient_campaign_status")
+}
+
+enum BroadcastStatus {
+  DRAFT
+  SUBMITTED
+  READY
+  SCHEDULED
+  COMPLETED
+  REJECTED
+  CANCELLED
+  FAILED
+}
+
+enum RecipientStatus {
+  PENDING
+  SCHEDULED
+  SENT
+  FAILED
+  SKIPPED
 }
 
 enum ActorType {

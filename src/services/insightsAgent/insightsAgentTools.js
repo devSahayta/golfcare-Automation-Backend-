@@ -1,23 +1,26 @@
 // src/services/insightsAgent/insightsAgentTools.js
 //
-// Every tool here is read-only, by design (see insightsAgentConfig.js's
-// system prompt) — this agent answers questions about the business, it
-// never writes anything. No conversationId/customerId scoping needed
-// (unlike salesAgentTools/supplierAgentTools) since this isn't tied to a
-// WhatsApp conversation — it's a stateless staff-facing query each call.
+// Two classes of tools live here:
+//   1. Read-only query tools — look up products, customers, suppliers.
+//   2. Campaign tools:
+//        preview_audience       — read-only, shows who would be reached
+//        suggest_campaign_content — read-only, generates 3 message variants (NO DB write)
+//        draft_campaign         — writes a DRAFT BroadcastCampaign row
+//
+//   NEW FLOW: The agent calls preview_audience → suggest_campaign_content only.
+//   draft_campaign is now called by the FRONTEND directly (via REST) when the
+//   staff member clicks "Save Draft" on the content picker card in the widget.
+//   The agent never calls draft_campaign itself.
 
+const Anthropic = require("@anthropic-ai/sdk");
 const { prisma } = require("../../lib/prisma");
+const { buildAudience, MAX_AUDIENCE } = require("../broadcastAudienceService");
+const { env } = require("../../config/env");
 
 function daysAgo(n) {
   return new Date(Date.now() - n * 24 * 60 * 60 * 1000);
 }
 
-// Splits a query into words and matches on ANY of them, rather than
-// requiring the whole phrase as one exact substring. A single punctuation
-// mismatch (curly vs straight apostrophe, an extra hyphen) shouldn't be
-// able to block an otherwise-obviously-correct match on a full product
-// name — this is what makes that forgiving. Returns undefined (no filter)
-// when the query is empty, so callers can pass it straight into `where`.
 function wordsOf(query) {
   return (query || "")
     .split(/\s+/)
@@ -35,18 +38,149 @@ function buildOrClause(query, fields) {
   );
 }
 
-function buildInsightsAgentTools() {
+// ── Content generation for suggest_campaign_content ──────────────────────────
+//
+// Uses a separate Haiku call (cheap — 3 short messages) to write the variants.
+// Returns { variants: [{ label, bodyText, tone, headerType, headerText, headerImagePromptHint, footerText, buttons }], recommendedIndex: number }
+
+const CONTENT_GEN_PROMPT = `You write WhatsApp message variants for Golf Care, a golf equipment retailer in India.
+
+Given a campaign intent, context, and any specific requests (like "add a header", "add an image", "add buttons", "add a footer"), write exactly 3 message variants.
+
+Each variant has these fields:
+- bodyText (required): starts with "Hi {{1}},", up to 900 characters after the greeting
+- label (required): "Recommended", "Direct", or "Conversational"
+- tone (required): one sentence describing this variant's approach
+- headerType (required): "IMAGE" for a photographic golf scene image, "TEXT" if a short text header helps, otherwise "NONE"
+- headerText: short header text if headerType is "TEXT" (max 60 chars, plain text, no variables, no emojis)
+- headerImagePromptHint: ONLY when headerType is "IMAGE" — a short phrase describing the golf scene that best fits this campaign (e.g. "championship golf course golden hour", "golf equipment on grass", "putting green sunrise"). No text, no logos, no people's faces. Max 15 words.
+- footerText: short footer line if requested or appropriate (max 60 chars, e.g. "Reply STOP to opt out")
+- buttons: array of up to 2 quick-reply button objects if requested, e.g. [{"type":"QUICK_REPLY","text":"Count me in"},{"type":"QUICK_REPLY","text":"Not interested"}]
+
+Rules for bodyText:
+- Start with "Hi {{1}},"
+- Natural, conversational tone — write like a person, not a brand
+- Include ALL relevant details from context (dates, venue, phone numbers, offers, etc.)
+- Soft CTA: "reply here", "visit us", "call us at [number if provided]"
+- Max one emoji per variant, placed naturally
+- NEVER use: ALL CAPS words, "click here", "act now", "don't miss out", "limited time only"
+
+When to use each headerType:
+- headerType "IMAGE": use for EVENT, ANNOUNCEMENT, PROMOTIONAL intents where a photographic golf scene would make the message stand out. This generates a real AI photo — best for visual impact. Set headerImagePromptHint to describe the scene (no text, no logos).
+- headerType "TEXT" + headerText: use when a short title label helps clarity but an image isn't needed, OR when the user/context explicitly asks for a text header.
+- headerType "NONE": for simple, personal messages where a header would feel too formal.
+
+Meta image rules (important — the AI image must pass Meta review):
+- headerImagePromptHint must describe a CLEAN OUTDOOR GOLF SCENE ONLY
+- No text, no words, no signs in the image
+- No logos, no branding
+- No promotional elements (prices, banners, sale text)
+- Natural lighting, photorealistic style
+
+footerText and buttons:
+- footerText: when the user/context explicitly asks, OR for PROMOTIONAL intents (best practice: "Reply STOP to opt out")
+- buttons: when user/context explicitly asks, OR for EVENT intents with a clear RSVP action
+- If not asked and not clearly helpful, omit/null footerText and buttons
+
+Variant strategy:
+- Variant 1 (label: "Recommended"): Best overall — include components where they genuinely help. Most likely to get Meta approval. Prefer IMAGE header for visually strong campaigns.
+- Variant 2 (label: "Direct"): Concise and fact-forward. Minimal components — TEXT header only if clearly needed, no image.
+- Variant 3 (label: "Conversational"): Warmer and more personal. No header. Softer CTA.
+
+Respond ONLY with valid JSON — no explanation, no markdown fences, just the raw JSON object:
+{
+  "variants": [
+    {
+      "label": "Recommended",
+      "tone": "one sentence describing this variant's approach",
+      "bodyText": "Hi {{1}}, ...",
+      "headerType": "IMAGE",
+      "headerText": null,
+      "headerImagePromptHint": "championship golf course golden hour fairway",
+      "footerText": "Reply STOP to opt out",
+      "buttons": [{"type": "QUICK_REPLY", "text": "Count me in"}, {"type": "QUICK_REPLY", "text": "Not this time"}]
+    },
+    {
+      "label": "Direct",
+      "tone": "one sentence describing this variant's approach",
+      "bodyText": "Hi {{1}}, ...",
+      "headerType": "TEXT",
+      "headerText": "Golf Care Tournament",
+      "headerImagePromptHint": null,
+      "footerText": null,
+      "buttons": null
+    },
+    {
+      "label": "Conversational",
+      "tone": "one sentence describing this variant's approach",
+      "bodyText": "Hi {{1}}, ...",
+      "headerType": "NONE",
+      "headerText": null,
+      "headerImagePromptHint": null,
+      "footerText": null,
+      "buttons": null
+    }
+  ],
+  "recommendedIndex": 0
+}`;
+
+async function generateContentVariants({
+  intent,
+  context,
+  campaignName,
+  preferredHeaderType = null,
+}) {
+  const client = new Anthropic({ apiKey: env.anthropicApiKey });
+
+  // Build a hard directive line when staff explicitly chose a header type
+  let headerDirective = "";
+  if (preferredHeaderType === "IMAGE") {
+    headerDirective = `\nSTAFF REQUIREMENT: The staff member explicitly requested an IMAGE header. Variant 1 (Recommended) MUST use headerType "IMAGE" with a valid headerImagePromptHint. Do not override this.`;
+  } else if (preferredHeaderType === "TEXT") {
+    headerDirective = `\nSTAFF REQUIREMENT: The staff member explicitly requested a TEXT header. Variant 1 (Recommended) MUST use headerType "TEXT" with a suitable headerText. Do not override this.`;
+  } else if (preferredHeaderType === "NONE") {
+    headerDirective = `\nSTAFF REQUIREMENT: The staff member explicitly requested NO header. Variant 1 (Recommended) MUST use headerType "NONE". Do not override this.`;
+  }
+
+  const userMessage = `Campaign name: ${campaignName}
+Intent: ${intent}
+Context: ${context || "No additional context provided."}${headerDirective}
+
+Write 3 message variants following the JSON schema exactly.`;
+
+  const response = await client.messages.create({
+    model: env.anthropicModelHaiku,
+    max_tokens: 1800,
+    system: CONTENT_GEN_PROMPT,
+    messages: [{ role: "user", content: userMessage }],
+  });
+
+  const raw = response.content[0]?.text || "";
+
+  // Parse JSON — strip any accidental markdown fences
+  const cleaned = raw
+    .replace(/^```(?:json)?\n?/, "")
+    .replace(/\n?```$/, "")
+    .trim();
+  const parsed = JSON.parse(cleaned);
+
+  return {
+    variants: parsed.variants,
+    recommendedIndex: parsed.recommendedIndex ?? 0,
+    tokensUsed: response.usage,
+  };
+}
+
+function buildInsightsAgentTools({ staffUserId = null } = {}) {
   return {
     async get_top_selling_products({ days = 7, limit = 5 }) {
       const since = daysAgo(days);
       const orders = await prisma.order.findMany({
         where: { placedAt: { gte: since } },
         select: { lineItems: true },
-        take: 1000, // safety cap, not expected to bind in practice
+        take: 1000,
       });
 
-      // Shopify's raw line-item shape varies by field naming across API
-      // versions — read defensively rather than assuming one exact shape.
       const totals = new Map();
       for (const order of orders) {
         const items = Array.isArray(order.lineItems) ? order.lineItems : [];
@@ -176,7 +310,7 @@ function buildInsightsAgentTools() {
         "waPhone",
       ]);
       const customers = await prisma.customer.findMany({
-        where: orClause ? { OR: orClause } : undefined, // no query = list, not "match nothing"
+        where: orClause ? { OR: orClause } : undefined,
         orderBy: { createdAt: "desc" },
         take: limit,
         select: {
@@ -229,24 +363,16 @@ function buildInsightsAgentTools() {
     },
 
     async find_customers_for_price_range({ minPrice, maxPrice, limit = 10 }) {
-      // Check the catalog-wide gap first, not just within this price
-      // range — if literally no product anywhere has a tierLevel, that's
-      // the real, specific reason this can't work, for any price range,
-      // and the agent should say exactly that instead of hedging.
       const taggedProductCount = await prisma.product.count({
         where: { tierLevel: { not: null } },
       });
       if (taggedProductCount === 0) {
         return {
           supported: false,
-          note: "No product in the catalog has a budget tier (tierLevel) assigned yet — this isn't specific to this price range, it's true catalog-wide. This kind of question can't be answered until products get tagged with a tier.",
+          note: "No product in the catalog has a budget tier (tierLevel) assigned yet.",
         };
       }
 
-      // Ground this in real product prices rather than hardcoding tier
-      // boundaries nobody has actually defined anywhere in the schema —
-      // find which budget tiers your catalog actually prices into this
-      // range, then match customers on that.
       const matchingProducts = await prisma.product.findMany({
         where: {
           tierLevel: { not: null },
@@ -271,7 +397,7 @@ function buildInsightsAgentTools() {
           supported: true,
           tiersFound: [],
           customers: [],
-          note: "Some products in the catalog do have a budget tier assigned, but none of those tagged products fall in this specific price range.",
+          note: "No tagged products in this price range.",
         };
       }
 
@@ -292,13 +418,160 @@ function buildInsightsAgentTools() {
 
       return { supported: true, tiersFound: tiers, customers };
     },
+
+    // ── Campaign tools ────────────────────────────────────────────────
+
+    /**
+     * preview_audience — show who would receive a campaign without creating anything.
+     * Read-only. Always call this FIRST.
+     */
+    async preview_audience({ rules = {} }) {
+      const result = await buildAudience(rules);
+      const samples = result.customers.slice(0, 5).map((c) => ({
+        name: [c.firstName, c.lastName].filter(Boolean).join(" ") || c.waPhone,
+        city: c.city || null,
+        tier: c.tier,
+      }));
+      return {
+        eligibleCount: result.customers.length,
+        excludedNoConsent: result.excludedNoConsent,
+        excludedOptedOut: result.excludedOptedOut,
+        totalMatched: result.totalMatched,
+        capped: result.capped,
+        capLimit: MAX_AUDIENCE,
+        sampleCustomers: samples,
+        rules,
+      };
+    },
+
+    /**
+     * suggest_campaign_content — generate 3 message variants WITHOUT saving to DB.
+     * Called after preview_audience confirms the audience.
+     *
+     * Each variant now includes:
+     *   headerType: "IMAGE" | "TEXT" | "NONE"
+     *   headerText: string | null           (for TEXT headers)
+     *   headerImagePromptHint: string | null (for IMAGE headers — passed to imageGenerationService at submit time)
+     *   footerText: string | null
+     *   buttons: array | null
+     *
+     * The frontend shows these as selectable cards. When the staff member picks one
+     * and clicks "Save Draft", the frontend calls PATCH /api/campaigns/:id/template.
+     * The IMAGE header is generated at submit time (POST /submit), not at draft time.
+     */
+    async suggest_campaign_content({
+      campaignName,
+      intent,
+      context = "",
+      audienceRules,
+      audienceSize,
+      preferredHeaderType = null,
+    }) {
+      if (!campaignName || !intent || !audienceRules) {
+        return {
+          success: false,
+          error: "campaignName, intent, and audienceRules are required",
+        };
+      }
+      if (audienceSize === 0) {
+        return {
+          success: false,
+          error: "Audience is empty — cannot suggest content for 0 recipients.",
+        };
+      }
+
+      const generated = await generateContentVariants({
+        intent,
+        context,
+        campaignName,
+        preferredHeaderType,
+      });
+
+      return {
+        success: true,
+        campaignName,
+        audienceRules,
+        audienceSize,
+        intent,
+        variants: generated.variants,
+        // variants: { label, tone, bodyText, headerType, headerText, headerImagePromptHint, footerText, buttons }
+        recommendedIndex: generated.recommendedIndex,
+        // Signal to the frontend to show the content picker card
+        action: "SHOW_CONTENT_PICKER",
+      };
+    },
+
+    /**
+     * draft_campaign — save a DRAFT BroadcastCampaign and its recipient list.
+     * NOTE: In the NEW flow, this is called by the FRONTEND via REST (POST /api/campaigns/draft),
+     * not by the agent. It remains here as a fallback if called, but the agent's system prompt
+     * instructs it never to call this.
+     */
+    async draft_campaign({ name, bodyText, audienceRules, agentPrompt = "" }) {
+      if (!name || !bodyText || !audienceRules) {
+        return {
+          success: false,
+          error: "name, bodyText, and audienceRules are all required",
+        };
+      }
+
+      const audienceResult = await buildAudience(audienceRules);
+      if (audienceResult.customers.length === 0) {
+        return {
+          success: false,
+          error: "No eligible customers match these rules.",
+          excludedNoConsent: audienceResult.excludedNoConsent,
+          excludedOptedOut: audienceResult.excludedOptedOut,
+        };
+      }
+
+      const baseName = name
+        .toLowerCase()
+        .replace(/\s+/g, "_")
+        .replace(/[^a-z0-9_]/g, "")
+        .slice(0, 40);
+      const templateName = `${baseName}_${Date.now()}`;
+
+      const campaign = await prisma.$transaction(async (tx) => {
+        const c = await tx.broadcastCampaign.create({
+          data: {
+            name,
+            templateName,
+            bodyText,
+            audienceRules,
+            audienceSize: audienceResult.customers.length,
+            agentPrompt,
+            createdByStaffId: staffUserId || null,
+            status: "DRAFT",
+          },
+        });
+
+        await tx.broadcastRecipient.createMany({
+          data: audienceResult.customers.map((cust) => ({
+            campaignId: c.id,
+            customerId: cust.id,
+            phone: cust.waPhone,
+            firstName: cust.firstName || null,
+            status: "PENDING",
+          })),
+        });
+
+        return c;
+      });
+
+      return {
+        success: true,
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        templateName: campaign.templateName,
+        audienceSize: audienceResult.customers.length,
+        bodyText: campaign.bodyText,
+        action: "SHOW_CAMPAIGN_CARD",
+      };
+    },
   };
 }
 
-// Logs every tool call with its arguments and whether it succeeded — this
-// is what lets you verify which tool Haiku actually picked while testing,
-// rather than inferring it from the reply text alone. Cheap enough to
-// leave on permanently; if it gets noisy later, gate it behind an env var.
 function withLogging(handlers) {
   return Object.fromEntries(
     Object.entries(handlers).map(([name, fn]) => [
@@ -319,5 +592,6 @@ function withLogging(handlers) {
 }
 
 module.exports = {
-  buildInsightsAgentTools: () => withLogging(buildInsightsAgentTools()),
+  buildInsightsAgentTools: (opts = {}) =>
+    withLogging(buildInsightsAgentTools(opts)),
 };
