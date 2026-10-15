@@ -75,7 +75,7 @@ function writeAudit(action, campaignId, staffId, before, after) {
   });
 }
 
-// ── GET /api/campaigns — list ─────────────────────────────────────────────
+// ── GET /api/broadcast-campaigns — list ─────────────────────────────────────────────
 
 async function listCampaigns(req, res) {
   try {
@@ -126,7 +126,7 @@ async function listCampaigns(req, res) {
   }
 }
 
-// ── GET /api/campaigns/:id — status (used by card polling) ───────────────
+// ── GET /api/broadcast-campaigns/:id — status (used by card polling) ───────────────
 
 async function getCampaign(req, res) {
   try {
@@ -280,7 +280,7 @@ async function getCampaign(req, res) {
   }
 }
 
-// ── POST /api/campaigns/:id/submit — staff clicks "Confirm & submit to Meta" ─
+// ── POST /api/broadcast-campaigns/:id/submit — staff clicks "Confirm & submit to Meta" ─
 
 async function submitCampaign(req, res) {
   const campaignId = req.params.id;
@@ -457,7 +457,7 @@ async function submitCampaign(req, res) {
   }
 }
 
-// ── POST /api/campaigns/:id/send — staff clicks "Send" after Meta approves ─
+// ── POST /api/broadcast-campaigns/:id/send — staff clicks "Send" after Meta approves ─
 
 async function sendCampaign(req, res) {
   const campaignId = req.params.id;
@@ -643,7 +643,7 @@ async function sendCampaign(req, res) {
   }
 }
 
-// ── POST /api/campaigns/:id/cancel ────────────────────────────────────────
+// ── POST /api/broadcast-campaigns/:id/cancel ────────────────────────────────────────
 
 async function cancelCampaign(req, res) {
   const campaignId = req.params.id;
@@ -817,7 +817,7 @@ async function updateCampaignTemplate(req, res) {
   }
 }
 
-// ── POST /api/campaigns/preview-image ────────────────────────────────────────
+// ── POST /api/broadcast-campaigns/preview-image ────────────────────────────────────────
 //
 // Generates a preview image for the Insights widget picker — called when staff
 // selects an IMAGE variant so they can see the image before saving the draft.

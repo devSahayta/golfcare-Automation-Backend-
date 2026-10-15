@@ -20,6 +20,7 @@ const orderRouter = require("./routes/orderRoutes");
 const auditLogRouter = require("./routes/auditLogRoutes");
 const agentUsageRouter = require("./routes/agentUsageRoutes");
 const broadcastCampaignRouter = require("./routes/broadcastCampaignRoutes");
+const campaignRouter = require("./routes/campaignRoutes");
 
 const app = express();
 app.use(cors());
@@ -41,7 +42,8 @@ app.use("/api/insights", insightsRouter);
 app.use("/api/orders", orderRouter);
 app.use("/api/audit-logs", auditLogRouter);
 app.use("/api/agent-usage", agentUsageRouter);
-app.use("/api/campaigns", broadcastCampaignRouter);
+app.use("/api/broadcast-campaigns", broadcastCampaignRouter);
+app.use("/api/campaigns", campaignRouter);
 
 app.get("/", (_req, res) => {
   res.json({ service: "Golf Care OS API", status: "running" });

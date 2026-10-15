@@ -1,16 +1,23 @@
 // controllers/agentUsageController.js
 //
-// Normalizes three different source tables into one shape so the
+// Normalizes several different source tables into one shape so the
 // frontend never has to know where each agent's usage actually lives:
-//   - Sales / Supplier -> AgentUsage (keyed by conversationId; agentName
-//     is "sales" / "SUPPLIER" — Supplier has no explicit agentName in its
-//     config, so it falls back to context.participantType)
+//   - Sales / Supplier / Lifecycle -> AgentUsage (keyed by conversationId;
+//     agentName is "sales" / "SUPPLIER" / "LIFECYCLE" — Supplier has no
+//     explicit agentName in its config, so it falls back to
+//     context.participantType)
 //   - Insights         -> InsightsUsage (keyed by staffUserId)
 //   - Campaign         -> DynamicTemplate (the cost of the isolated Claude
 //     drafting call lives directly on the row as draft* columns, since a
 //     proactive campaign draft has no Conversation to hang an AgentUsage
 //     off of). That is DRAFTING cost only — any Meta/WhatsApp per-message
 //     send fee isn't tracked anywhere in the schema.
+//
+// NOTE: "lifecycle" and "campaign" currently overlap — both report the
+// same cross-sell drafting spend, just sourced from two different tables
+// (AgentUsage rows the scheduler now writes directly, vs. the draft*
+// columns already on DynamicTemplate). Kept both after a merge conflict
+// rather than deciding unilaterally which one to drop — see conversation.
 const { prisma } = require("../lib/prisma");
 
 // Standard column names, shared by AgentUsage and InsightsUsage.
@@ -31,6 +38,11 @@ const AGENTS = {
   supplier: {
     table: "agentUsage",
     match: { agentName: "SUPPLIER" },
+    fields: STANDARD_FIELDS,
+  },
+  lifecycle: {
+    table: "agentUsage",
+    match: { agentName: "LIFECYCLE" },
     fields: STANDARD_FIELDS,
   },
   insights: {
