@@ -142,20 +142,32 @@ const tools = [
   {
     name: "start_bulk_product_import",
     description:
-      "Queue the document already attached in this conversation for background bulk onboarding — use for a LARGE catalog/price list (roughly 15+ new products at once; below that, use create_product_draft one at a time instead). Use this when a supplier sends a document that's genuinely a new-product catalog, not a stock-status reply (see the Attachments section on telling the two apart). You do NOT list the products yourself here — don't try to type out or summarize the catalog's rows; this tool finds the attachment and reads it server-side. Just ask the supplier once for a blanket margin % and GST % that applies across the whole catalog (most suppliers quote one rate for their whole price list), then call this with those two numbers. Parsing the document and creating products happens entirely in the background over the next while — tell the supplier their list was received and is being processed, do NOT wait for or promise an immediate result, and don't call create_product_draft for any of these items yourself.",
+      "Queue the document already attached in this conversation for background bulk onboarding — use for a LARGE catalog/price list (roughly 15+ new products at once; below that, use create_product_draft one at a time instead). Use this when a supplier sends a document that's genuinely a new-product catalog, not a stock-status reply (see the Attachments section on telling the two apart). You do NOT list the products yourself here — don't try to type out or summarize the catalog's rows; this tool finds the attachment and reads it server-side. Parsing the document and creating products happens entirely in the background over the next while — tell the supplier their list was received and is being processed, do NOT wait for or promise an immediate result, and don't call create_product_draft for any of these items yourself.\n\nMargin and GST are NOT one blanket number for the whole document — a catalog spanning several brands or categories (apparel vs bags vs accessories, or one brand vs another) commonly has a different rate per group. Ask the supplier directly whether their margin/GST is the same across everything in this document, or varies — don't just assume it's uniform. If they confirm it's the same for everything, pass ONE rule with brand and category both left out (that becomes the default for every item). If it varies, pass one rule per group they actually gave you a rate for (brand and/or category set on each). Any product in the document that doesn't match any rule you pass will be held back rather than drafted with a guessed rate — so if the supplier's answer doesn't clearly cover everything in the document, say so and ask what rate applies to the rest, rather than passing just the parts you have.",
     input_schema: {
       type: "object",
       properties: {
-        marginPercent: {
-          type: "number",
-          description: "Blanket margin % for the whole catalog — ask the supplier once, not per item.",
-        },
-        gstPercent: {
-          type: "number",
-          description: "Blanket GST % for the whole catalog — ask the supplier once, not per item.",
+        rates: {
+          type: "array",
+          description: "One or more margin/GST rules, reflecting exactly what the supplier told you — not guessed or assumed.",
+          items: {
+            type: "object",
+            properties: {
+              brand: {
+                type: "string",
+                description: "Only set this if the supplier gave a rate specific to one brand. Leave out for a rule that isn't brand-specific.",
+              },
+              category: {
+                type: "string",
+                description: "Only set this if the supplier gave a rate specific to one product category (e.g. \"Bags\", \"Apparel\", \"Headwear\"). Leave out for a rule that isn't category-specific.",
+              },
+              marginPercent: { type: "number" },
+              gstPercent: { type: "number" },
+            },
+            required: ["marginPercent", "gstPercent"],
+          },
         },
       },
-      required: ["marginPercent", "gstPercent"],
+      required: ["rates"],
     },
   },
   {
@@ -321,13 +333,16 @@ not a few items mentioned in chat) is a different case from onboarding one produ
 Creating dozens or hundreds of drafts one by one in this same reply is too slow and expensive
 to do inline, and there's no practical way to ask about each item's margin/GST individually at
 that volume anyway. For this case:
-- Ask the supplier ONCE for a blanket margin % and GST % that applies across the whole list
-  (most suppliers quote one rate for their whole catalog) — don't ask per item.
-- Then call start_bulk_product_import with just those two numbers — don't try to list or
-  summarize the catalog's rows yourself, the tool reads the attached document directly. This
-  queues the whole document for background processing — it does NOT create drafts immediately.
-  Tell the supplier you've received the list and it's being processed; don't wait for or claim
-  an immediate result, and don't ALSO call create_product_draft for the same items.
+- Ask the supplier about margin % and GST % — do NOT assume one rate covers everything. A
+  catalog spanning several brands or categories often has a different rate per group; ask
+  whether it's the same across the whole document or varies by brand/category, and only treat
+  it as one blanket rate if they actually confirm that.
+- Then call start_bulk_product_import with the rate(s) the supplier actually gave (see the
+  tool's own description for the exact shape) — don't try to list or summarize the catalog's
+  rows yourself, the tool reads the attached document directly. This queues the whole document
+  for background processing — it does NOT create drafts immediately. Tell the supplier you've
+  received the list and it's being processed; don't wait for or claim an immediate result, and
+  don't ALSO call create_product_draft for the same items.
 - Below that size, or when the supplier mentions a handful of new products one at a time in
   chat, use the one-by-one flow below instead — it's cheaper and gives the supplier a real
   answer immediately, which bulk import deliberately doesn't.

@@ -29,7 +29,7 @@ router.use(express.json());
 
 async function handleInboundMessage(evt) {
   console.log(`[samvaadik webhook] inbound message from ${evt.from}:`, evt);
-  // const TESTING_ALLOWED_PHONE = "916206958504"; // only allow this number in testing mode
+  // const TESTING_ALLOWED_PHONE = "916382592767"; // only allow this number in testing mode
   // if (evt.from !== TESTING_ALLOWED_PHONE) {
   //   console.log(
   //     `[samvaadik webhook] ignoring message from ${evt.from} (testing mode, only ${TESTING_ALLOWED_PHONE} allowed)`,

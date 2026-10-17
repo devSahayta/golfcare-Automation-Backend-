@@ -598,10 +598,18 @@ function buildSupplierAgentTools(context) {
     // (same "isolated call, not the main loop" pattern as
     // research_product_specs), then the normal per-item draining already
     // built proceeds exactly as before.
-    async start_bulk_product_import({ marginPercent, gstPercent }) {
+    async start_bulk_product_import({ rates }) {
       if (!supplier) return { error: "no_supplier_on_conversation" };
-      if (marginPercent == null || gstPercent == null) {
-        return { error: "margin_and_gst_required" };
+      const cleanRates = (Array.isArray(rates) ? rates : [])
+        .filter((r) => r?.marginPercent != null && r?.gstPercent != null)
+        .map((r) => ({
+          brand: r.brand || null,
+          category: r.category || null,
+          marginPercent: r.marginPercent,
+          gstPercent: r.gstPercent,
+        }));
+      if (cleanRates.length === 0) {
+        return { error: "rates_required" };
       }
 
       const attachmentMsg = await prisma.message.findFirst({
@@ -646,8 +654,7 @@ function buildSupplierAgentTools(context) {
         data: {
           supplierId: supplier.id,
           conversationId: context.conversation.id,
-          marginPercent,
-          gstPercent,
+          rateRules: cleanRates,
           rawDocumentText: documentText,
           status: "PENDING_EXTRACTION",
         },

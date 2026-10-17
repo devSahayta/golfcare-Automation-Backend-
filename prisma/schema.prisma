@@ -506,6 +506,12 @@ enum ImportItemStatus {
   DRAFTED
   LINKED_EXISTING
   FAILED
+  // No rate rule (see ProductImportBatch.rateRules) matched this item's
+  // brand/category — held back rather than guessing a margin/GST. Never
+  // picked up by the drain loop (which only queries PENDING); sits here
+  // until a human resolves it (asks the supplier, re-runs with a rule
+  // that covers it). Counted in ProductImportBatch.needsRateCount.
+  NEEDS_RATE
 }
 
 // A supplier sending a large catalog/price list (many new products at
@@ -523,15 +529,26 @@ model ProductImportBatch {
   draftedCount    Int               @default(0)
   linkedCount     Int               @default(0)
   failedCount     Int               @default(0)
+  // Items extraction couldn't match to any rate rule below — held back,
+  // not drafted with a guessed rate. See ImportItemStatus.NEEDS_RATE.
+  needsRateCount  Int               @default(0)
   status          ImportBatchStatus @default(PENDING_EXTRACTION)
   // Set at creation (PENDING_EXTRACTION), consumed once by the scheduler's
   // extraction step (jobs/productImportDrain.js) — the raw document text
-  // the supplier sent and the blanket margin/GST they gave for the whole
-  // catalog. The live chat turn never has to parse this itself; see
-  // start_bulk_product_import in supplierAgentTools.js for why.
+  // the supplier sent. The live chat turn never has to parse this itself;
+  // see start_bulk_product_import in supplierAgentTools.js for why.
   rawDocumentText String?
-  marginPercent   Decimal?
-  gstPercent      Decimal?
+  // Margin/GST are NOT one blanket rate for the whole document — a
+  // supplier catalog commonly spans several brands/categories with
+  // different rates each. rateRules: [{brand, category, marginPercent,
+  // gstPercent}], one entry per rate the supplier actually gave; a rule
+  // with brand/category both omitted is an explicit "same for everything"
+  // default. Each extracted item is matched against these (fuzzy
+  // brand/category match, most-specific rule wins) to resolve its own
+  // marginPercent/gstPercent — items matching nothing are NEEDS_RATE, not
+  // guessed. See start_bulk_product_import's tool description for how the
+  // agent is told to collect this instead of assuming one rate.
+  rateRules       Json?
   extractionError String?
   createdAt       DateTime          @default(now())
   completedAt     DateTime?
@@ -545,9 +562,25 @@ model ProductImportItem {
   title                  String
   sku                    String?
   brand                  String?
+  // Inferred from the document's own section structure (e.g. "Bags",
+  // "Headwear", "Apparel") — used to resolve this item's rate rule
+  // against ProductImportBatch.rateRules, nothing else. Not a Golf Care
+  // catalog taxonomy.
+  category               String?
   mrp                    Decimal
-  marginPercent          Decimal
-  gstPercent             Decimal
+  // Nullable now — a NEEDS_RATE item (see ImportItemStatus) genuinely has
+  // no resolved rate yet; the drain loop only ever touches PENDING items,
+  // which always have both set by the time they reach that status.
+  marginPercent          Decimal?
+  gstPercent             Decimal?
+  // One row is one Shopify PRODUCT, which may cover several real variants
+  // (e.g. a belt in 4 colors) — not one row per SKU. variantOptions holds
+  // the full list: [{value, sku, mrp}], one entry per real Shopify
+  // variant; variantOptionName is the dimension name ("Color"/"Size"),
+  // null for a single-variant product. Top-level sku/mrp above mirror the
+  // first variant, kept for simple display. See extractBulkCatalogItems.js
+  // (scheduler) for how a document's rows get grouped into this shape.
+  variantOptionName      String?
   variantOptions         Json?
   status                 ImportItemStatus  @default(PENDING)
   resultProductDraftId   String?
