@@ -15,6 +15,7 @@
 const Anthropic = require("@anthropic-ai/sdk");
 const { prisma } = require("../../lib/prisma");
 const { buildAudience, MAX_AUDIENCE } = require("../broadcastAudienceService");
+const { matchProductImage } = require("../productImageMatchService");
 const { env } = require("../../config/env");
 
 function daysAgo(n) {
@@ -41,7 +42,22 @@ function buildOrClause(query, fields) {
 // ── Content generation for suggest_campaign_content ──────────────────────────
 //
 // Uses a separate Haiku call (cheap — 3 short messages) to write the variants.
-// Returns { variants: [{ label, bodyText, tone, headerType, headerText, headerImagePromptHint, footerText, buttons }], recommendedIndex: number }
+// Returns { variants: [{ label, bodyText, tone, headerType, headerText, headerImagePromptHint, headerImageHeadline, footerText, buttons }], recommendedIndex: number }
+//
+// headerImageHeadline is a deliberate, known-risk feature: it asks Flux to
+// render a short line of real text (e.g. "Celebrate Diwali with Us")
+// directly into the generated photo, so the image communicates what the
+// campaign is for at a glance, not just a decorative product shot. Two
+// things to know about this (confirmed with the business owner before
+// building it, not a silent default):
+//   1. Flux (and image models generally) are unreliable at rendering
+//      legible text — it can come out garbled or misspelled. Staff should
+//      check the preview before saving a draft, and can click "Generate
+//      new image" to retry if the text came out wrong.
+//   2. WhatsApp template header images containing text are more likely to
+//      be rejected by Meta's review than text-free ones. This was a
+//      conscious trade-off, not an oversight — if a template gets
+//      rejected over this, resubmit with headerImageHeadline left out.
 
 const CONTENT_GEN_PROMPT = `You write WhatsApp message variants for Golf Care, a golf equipment retailer in India.
 
@@ -53,9 +69,34 @@ Each variant has these fields:
 - tone (required): one sentence describing this variant's approach
 - headerType (required): "IMAGE" for a photographic golf scene image, "TEXT" if a short text header helps, otherwise "NONE"
 - headerText: short header text if headerType is "TEXT" (max 60 chars, plain text, no variables, no emojis)
-- headerImagePromptHint: ONLY when headerType is "IMAGE" — a short phrase describing the golf scene that best fits this campaign (e.g. "championship golf course golden hour", "golf equipment on grass", "putting green sunrise"). No text, no logos, no people's faces. Max 15 words.
+- headerImagePromptHint: ONLY when headerType is "IMAGE" — a specific, concrete image description that will be used VERBATIM to generate the photo. Write it the way a commercial product photographer or art director would brief a shoot, not a plain inventory list of what's in frame. Describe the SCENE only (no wording/text here — wording is handled entirely by headerImageEyebrow/headerImageHeadline/headerImageBadgeText below, which are rendered as real typography over the photo, not drawn by Flux), no logos, no people's faces. 12–30 words.
+  - Think like a stylist: specify the SURFACE/BACKDROP (reclaimed wood, slate, linen, a fairway), the PROP STYLING (how items are arranged — fanned out, stacked, leaning, one item slightly forward as the hero), the LIGHT (soft directional window light, golden-hour side light, a single warm key light with soft shadow), and the LENS LOOK (shallow depth of field, slight overhead/45-degree angle, macro detail on texture) — the same vocabulary you'd see in a premium catalog or editorial product shoot, e.g. Nike/Titleist-style commercial photography, not a snapshot.
+  - For a campaign about ONE specific real product (e.g. "Pro V1 golf balls back in stock"): style it like hero product photography — e.g. "a single golf ball in sharp focus on a dark slate surface, dramatic soft side-lighting, shallow depth of field, a faint reflection below it, premium minimalist product photography".
+  - For a THEMED or MULTI-PRODUCT campaign (a gift box/combo of several named items, a festival/occasion offer, a seasonal bundle): name the ACTUAL items, describe how a stylist would ARRANGE them together, and weave in occasion motifs as styling props (not labels) — e.g. for a Diwali gift box of ball/glove/driver headcover/shoe/cap: "a golf ball, glove, driver headcover, shoe, and cap styled as a flat-lay gift arrangement on dark wood, a few brass diyas and loose marigold petals placed as styling accents, warm directional golden-hour light, shallow depth of field, premium editorial product photography" — specific products AND deliberate styling, not a generic inventory phrase like "golf equipment collection" or "assorted golf gear".
+  - CRITICAL — occasion props must match the ACTUAL occasion named in the campaign, never a default. Diyas (oil lamps) and marigold petals are specific to Diwali and ONLY Diwali — never use them for Christmas, New Year, a generic "festive"/"holiday" campaign, or any occasion that isn't explicitly Diwali. Pick props from the real occasion instead:
+    - Diwali: brass diyas with small warm flames, marigold petals, fairy lights
+    - Christmas: pine or fir sprigs, small red baubles/ornaments, warm string lights, a sprig of holly, pinecones
+    - New Year: gold/silver confetti, a single sparkler, a champagne flute (no alcohol branding visible)
+    - Republic Day / Independence Day: a small tricolour ribbon or bunting, no flag imagery that could look like misuse of a national symbol
+    - Generic sale/offer/restock with no named occasion: no themed props at all — just clean premium styling (wood/slate/linen surface, controlled light), nothing invented
+    If you are not certain which occasion a campaign refers to, default to NO occasion props rather than guessing — plain premium styling is always safe; the wrong festival's motifs are not.
+  - Avoid plain, flat description ("a picture of X and Y on a table"). Every hint should read like a photography/styling brief with a clear surface, light, and composition choice.
+  - Do NOT describe any text/wording here — headerImagePromptHint is the SCENE only.
+- headerImageEyebrow: OPTIONAL, only when headerType is "IMAGE" — a short kicker/label line (max 4 words, ~28 characters) rendered in small letter-spaced caps ABOVE the headline. Leave null if the headline already says it all.
+- headerImageHeadline: OPTIONAL, only when headerType is "IMAGE" — the big, bold statement line (max 6 words, ~40 characters) rendered directly over the photo as real typography (not drawn by Flux — this is composited afterward, so it always comes out crisp and legible). Use this whenever the image alone wouldn't make the occasion/purpose obvious at a glance. Leave it null only for a simple single-product restock where the product itself is self-explanatory. Keep it punchy — this is a headline, not a sentence. Never include a price, phone number, or anything time-sensitive.
+- headerImageBadgeText: OPTIONAL, only when headerType is "IMAGE" — a very short tag/pill (max 3 words, ~16 characters) rendered as a small rounded badge below the headline, the way a product ad has a "FLASH SALE" or "NEW" sticker. This is what makes the image feel like a real promotional creative instead of a plain product photo — use it for PROMOTION/EVENT campaigns where there's a genuine hook (an offer, a limited window, a bundle). Leave null for a plain restock with no particular angle. Never put a price or a countdown/urgency claim you can't actually back ("today only" etc.) — keep it to what's true.
+
+VARY THE WORDING PATTERN EVERY TIME — do not settle into one template. A real reviewer of this prompt noticed back-to-back campaigns all coming out as "[Occasion] at Golf Care" / "[Product A] & [Product B] Combo" / "Festive Offer" — technically correct but repetitive and visibly templated once staff see more than one. Pick a DIFFERENT structural approach each time, for example (mix and match, don't always reach for the first one):
+  - Occasion-led: eyebrow names the occasion, headline is a benefit or command — "Diwali at Golf Care" / "Light Up Your Game" / "Festive Offer"
+  - Product-led: eyebrow is a category/status tag, headline names the product plainly — "New Arrival" / "Pro V1 Dozen Pack" / "In Stock Now"
+  - Benefit-led: headline leads with what the customer gets, no eyebrow needed — "Two Legends, One Price" / (badge) "Limited Stock"
+  - Question or direct-address: "Ready for Round One?" / "Your Winter Golf Kit" — skip the generic "X Combo" naming entirely
+  - Plain and confident, no badge at all: sometimes the strongest choice is just a clean headline with nothing else — not every image needs all three fields filled
+  Also vary WORD CHOICE for the same concept across campaigns — don't always reach for "Festive Offer" for a badge or "Combo" for a headline; use whatever genuinely fits that specific campaign's tone and offer (e.g. "Gift Ready", "Grab Yours", "Stock Up", "Holiday Pick", "Just Landed", "Members First" are all valid alternatives depending on context). Read the campaign's own context/intent and let IT drive the wording, rather than defaulting to the same formula you used last time.
 - footerText: short footer line if requested or appropriate (max 60 chars, e.g. "Reply STOP to opt out")
 - buttons: array of up to 2 quick-reply button objects if requested, e.g. [{"type":"QUICK_REPLY","text":"Count me in"},{"type":"QUICK_REPLY","text":"Not interested"}]
+
+Staff can edit headerImageEyebrow/headerImageHeadline/headerImageBadgeText themselves in the preview after the image is generated, without regenerating the photo (it just re-draws the text layer, so it's instant and free) — so write your best, specific wording rather than something generic or null "to be safe"; it's easy for staff to tweak.
 
 Rules for bodyText:
 - Start with "Hi {{1}},"
@@ -70,12 +111,16 @@ When to use each headerType:
 - headerType "TEXT" + headerText: use when a short title label helps clarity but an image isn't needed, OR when the user/context explicitly asks for a text header.
 - headerType "NONE": for simple, personal messages where a header would feel too formal.
 
-Meta image rules (important — the AI image must pass Meta review):
-- headerImagePromptHint must describe a CLEAN OUTDOOR GOLF SCENE ONLY
-- No text, no words, no signs in the image
-- No logos, no branding
-- No promotional elements (prices, banners, sale text)
+Meta image rules (the AI image should stay as safe as possible for Meta review):
+- headerImagePromptHint must describe a CLEAN, PHOTOREALISTIC GOLF-RELATED SCENE — an outdoor
+  course scene for single-product or general campaigns, or a tabletop/still-life arrangement of
+  the actual named products for multi-product/gift/combo campaigns. Either is fine as long as it's
+  real photography, not an illustration or graphic.
+- No logos, no branding, no watermarks
+- No price tags, no banners, no countdown/urgency text
 - Natural lighting, photorealistic style
+- The ONLY text allowed anywhere in the image is the short wording in headerImageHeadline, if set —
+  everything else about the scene stays text-free (no extra signage, no readable labels on products).
 
 footerText and buttons:
 - footerText: when the user/context explicitly asks, OR for PROMOTIONAL intents (best practice: "Reply STOP to opt out")
@@ -96,7 +141,10 @@ Respond ONLY with valid JSON — no explanation, no markdown fences, just the ra
       "bodyText": "Hi {{1}}, ...",
       "headerType": "IMAGE",
       "headerText": null,
-      "headerImagePromptHint": "championship golf course golden hour fairway",
+      "headerImagePromptHint": "a trophy and golf ball on a championship fairway at golden hour, dramatic warm side light, shallow depth of field, premium editorial sports photography",
+      "headerImageEyebrow": "Golf Care Presents",
+      "headerImageHeadline": "1st Anniversary Tournament",
+      "headerImageBadgeText": "RSVP Now",
       "footerText": "Reply STOP to opt out",
       "buttons": [{"type": "QUICK_REPLY", "text": "Count me in"}, {"type": "QUICK_REPLY", "text": "Not this time"}]
     },
@@ -107,6 +155,9 @@ Respond ONLY with valid JSON — no explanation, no markdown fences, just the ra
       "headerType": "TEXT",
       "headerText": "Golf Care Tournament",
       "headerImagePromptHint": null,
+      "headerImageEyebrow": null,
+      "headerImageHeadline": null,
+      "headerImageBadgeText": null,
       "footerText": null,
       "buttons": null
     },
@@ -117,6 +168,9 @@ Respond ONLY with valid JSON — no explanation, no markdown fences, just the ra
       "headerType": "NONE",
       "headerText": null,
       "headerImagePromptHint": null,
+      "headerImageEyebrow": null,
+      "headerImageHeadline": null,
+      "headerImageBadgeText": null,
       "footerText": null,
       "buttons": null
     }
@@ -129,6 +183,7 @@ async function generateContentVariants({
   context,
   campaignName,
   preferredHeaderType = null,
+  headerImageProductTitles = null,
 }) {
   const client = new Anthropic({ apiKey: env.anthropicApiKey });
 
@@ -142,9 +197,58 @@ async function generateContentVariants({
     headerDirective = `\nSTAFF REQUIREMENT: The staff member explicitly requested NO header. Variant 1 (Recommended) MUST use headerType "NONE". Do not override this.`;
   }
 
+  // When the agent has already confirmed real catalog photos for specific
+  // products (via check_product_photo, before this was ever called), those
+  // exact photos get PASTED into the image server-side — they are never
+  // drawn by Flux. So headerImagePromptHint here must describe ONLY the
+  // backdrop (surface, props, lighting) and must NOT name or describe any
+  // product, or the written scene and the actually-composited photos would
+  // visually contradict each other (e.g. hint says "a golf ball on grass"
+  // while the real pasted product is a driver). The exact product list
+  // itself is NOT something Haiku invents or echoes — it's attached to the
+  // variant afterward, verbatim, from what was already confirmed.
+  let productDirective = "";
+  if (
+    Array.isArray(headerImageProductTitles) &&
+    headerImageProductTitles.length > 0
+  ) {
+    productDirective = `\nREAL PRODUCT PHOTOS WILL BE COMPOSITED FOR: ${headerImageProductTitles.join(", ")}. These exact real photos will be pasted into the final image by code — do NOT describe, name, or imply any of these products (or any other product) in headerImagePromptHint. headerImagePromptHint must describe ONLY the backdrop: surface/background, occasion props and motifs, lighting, composition style. The pasted products are flat-cut real photos with hard edges, not AI-rendered, so they only look believable against a CALM, UNCLUTTERED backdrop — busy or glowing elements right where the product sits make the paste-in obvious. Specifically:
+  - If (and only if) the campaign names a specific occasion, describe THAT occasion's own props as small, literal, physically resting objects — e.g. "a few brass diyas with small warm flames" for Diwali, "a few small pine sprigs and red ornaments" for Christmas — NEVER as "scattered", "bokeh", "glowing orbs", "soft blur in the background", or anything that reads as out-of-focus light (Flux reliably turns those words into abstract glowing blobs, not recognizable objects), and NEVER a different occasion's motifs than the one actually named — diyas belong to Diwali only, never to Christmas/New Year/a generic "festive" campaign. If no specific occasion is named, use NO themed props at all — a clean premium surface is always correct; guessing the wrong festival is not.
+  - Keep props confined to the edges/corners or the top third of the frame, never the lower-middle.
+  - Explicitly state the lower-middle 40% of the frame is bare surface with nothing on it (not just "open space" — say "completely bare, no props, no petals, no light flares") so the real product cutout has a calm area to sit in rather than competing with backdrop detail.
+  - Avoid "soft glow", "warm bokeh", "light flares", "dreamy" — these push Flux toward blurred light shapes that don't read as anything in particular.`;
+  }
+
+  // Forced wording-pattern variety for headerImageEyebrow/Headline/BadgeText.
+  //
+  // Earlier this just TOLD the model to vary its wording between campaigns.
+  // That didn't hold up — confirmed from two real generated images sent
+  // back: a Christmas and a Diwali campaign both still came out as
+  // "[Occasion] AT GOLF CARE" / "[Product A] & [Product B] COMBO" / a
+  // generic offer-word badge, just with different product names slotted
+  // in. That phrasing is clearly the model's strong default for this kind
+  // of content — a soft instruction to "mix it up" doesn't reliably beat a
+  // habit that strong. So instead of asking, this PICKS one structural
+  // pattern at random per generation call and hands it over as a required
+  // structure for this specific campaign, with the two overused phrasings
+  // explicitly banned. Randomizing in code guarantees actual variety across
+  // calls — the model no longer gets to default to its favorite shape,
+  // because a different one is assigned on each request.
+  const WORDING_PATTERNS = [
+    'Eyebrow: just the occasion/theme name on its own — NOT "[Occasion] at Golf Care". Headline: a short benefit or action statement (what the customer gets or should do), NOT a "[Product A] & [Product B]" list and NOT the word "Combo". Badge: a specific value/urgency word — NOT "Festive Offer".',
+    'Eyebrow: a plain status word only ("New In", "Back in Stock", "Just Landed", "In Stock Now") — no occasion name in the eyebrow at all, even if the campaign is about a festival. Headline: the product name(s) written plainly, like a shelf tag. Badge: availability/stock info, not a generic offer word.',
+    'Leave the eyebrow null entirely — no eyebrow line. Headline: lead with the customer benefit or outcome in a punchy phrase, NOT a product-name list joined with "&", and NOT the word "Combo". Badge: a short value or urgency tag.',
+    'Headline: phrase it as a short question or a direct command to the reader, not a list of product names joined with "&". Eyebrow: optional — if used, the occasion name alone, never "at Golf Care". Badge: optional, a short call-to-action word.',
+    "Use ONLY the headline — leave both eyebrow and badge null for this one. The headline alone should say what this is, confidently, in a few words, without needing support text around it.",
+    'Headline: state the deal or value directly (how many, bundled, or saved) rather than naming the products — written like a price-tag headline, not "[Product A] & [Product B] Combo". Eyebrow: the occasion name alone if used, never "at Golf Care". Badge: a short action word.',
+  ];
+  const assignedPattern =
+    WORDING_PATTERNS[Math.floor(Math.random() * WORDING_PATTERNS.length)];
+  const wordingPatternDirective = `\nON-IMAGE WORDING STRUCTURE FOR THIS CAMPAIGN (headerImageEyebrow / headerImageHeadline / headerImageBadgeText — follow this shape, don't default to a generic template): ${assignedPattern} Whatever specific words you choose, they must genuinely fit THIS campaign's occasion/products/offer — don't force in a word from this instruction that doesn't make sense here.`;
+
   const userMessage = `Campaign name: ${campaignName}
 Intent: ${intent}
-Context: ${context || "No additional context provided."}${headerDirective}
+Context: ${context || "No additional context provided."}${headerDirective}${productDirective}${wordingPatternDirective}
 
 Write 3 message variants following the JSON schema exactly.`;
 
@@ -422,6 +526,71 @@ function buildInsightsAgentTools({ staffUserId = null } = {}) {
     // ── Campaign tools ────────────────────────────────────────────────
 
     /**
+     * check_product_photo — look up whether a named product already has a
+     * real photo in the catalog, BEFORE suggest_campaign_content runs.
+     *
+     * This is Path A's "ask before you leap" check for the agent itself.
+     * Without it, the agent would call suggest_campaign_content with an
+     * IMAGE header, the frontend would try to resolve a real product photo
+     * on its own, fail silently, and fall back to generating an AI image —
+     * and the staff member would never be told the named product wasn't
+     * actually found. This tool lets the agent find that out up front and
+     * say so directly, e.g. "I couldn't find 'Callaway bags' as a specific
+     * product in the catalog — want me to generate a themed image instead,
+     * or did you mean a different product?"
+     *
+     * Uses the SAME matching function as the REST endpoint the widget
+     * calls (productImageMatchService.matchProductImage), so the agent's
+     * upfront answer and the widget's later resolution can never disagree.
+     *
+     * Read-only — never fetches or generates anything, just reports what
+     * Path A would find.
+     */
+    async check_product_photo({ query }) {
+      if (!query || !query.trim()) {
+        return {
+          success: false,
+          error:
+            "query is required (the product name or campaign subject to check)",
+        };
+      }
+      const result = await matchProductImage(query);
+
+      if (!result.matched) {
+        return {
+          found: false,
+          query,
+          note: `No real product in the catalog matched "${query}" closely enough. Tell the staff member this specific product wasn't found before falling back to an AI-generated image — ask them to confirm/clarify the product name, or explicitly approve a generated image instead.`,
+        };
+      }
+
+      if (result.ambiguous) {
+        return {
+          found: true,
+          ambiguous: true,
+          query,
+          candidates: result.candidates.map((c) => ({
+            title: c.title,
+            productType: c.productType,
+          })),
+          note: `Multiple products matched "${query}" equally well. Ask the staff member which one they meant before proceeding.`,
+        };
+      }
+
+      return {
+        found: true,
+        ambiguous: false,
+        query,
+        product: {
+          title: result.product.title,
+          productType: result.product.productType,
+          hasPhoto: result.product.imageUrls.length > 0,
+        },
+        note: `Found a real catalog photo for "${result.product.title}". The widget will show this real photo for approval — no AI generation needed.`,
+      };
+    },
+
+    /**
      * preview_audience — show who would receive a campaign without creating anything.
      * Read-only. Always call this FIRST.
      */
@@ -452,6 +621,10 @@ function buildInsightsAgentTools({ staffUserId = null } = {}) {
      *   headerType: "IMAGE" | "TEXT" | "NONE"
      *   headerText: string | null           (for TEXT headers)
      *   headerImagePromptHint: string | null (for IMAGE headers — passed to imageGenerationService at submit time)
+     *   headerImageHeadline: string | null (optional short wording rendered directly in the IMAGE)
+     *   headerImageProductTitles: string[] | null (exact catalog titles to composite in as
+     *     real product photos — attached here in code from this tool's own input, never
+     *     authored by the content model; see the suggest_campaign_content handler below)
      *   footerText: string | null
      *   buttons: array | null
      *
@@ -466,6 +639,8 @@ function buildInsightsAgentTools({ staffUserId = null } = {}) {
       audienceRules,
       audienceSize,
       preferredHeaderType = null,
+      headerImageProductTitles = null,
+      imageMode = null,
     }) {
       if (!campaignName || !intent || !audienceRules) {
         return {
@@ -485,7 +660,37 @@ function buildInsightsAgentTools({ staffUserId = null } = {}) {
         context,
         campaignName,
         preferredHeaderType,
+        headerImageProductTitles,
       });
+
+      // headerImageProductTitles (and imageMode alongside it) are attached
+      // here, in code, rather than left for Haiku to echo back in its JSON
+      // — these are exact catalog titles and an explicit staff choice the
+      // agent already confirmed via check_product_photo / STEP 2.6, and
+      // letting an LLM re-type/re-decide either one a second time risks a
+      // subtly different (and therefore unmatched) string, or a decision
+      // that was never actually the staff member's. Only IMAGE-header
+      // variants get either field; a TEXT/NONE variant has no image to
+      // composite products into or choose a presentation for.
+      const hasRealPhoto =
+        Array.isArray(headerImageProductTitles) &&
+        headerImageProductTitles.length > 0;
+      const variants = Array.isArray(generated.variants)
+        ? generated.variants.map((v) =>
+            v.headerType === "IMAGE" && hasRealPhoto
+              ? {
+                  ...v,
+                  headerImageProductTitles,
+                  // Default to AI_SCENE only as a safety net against a
+                  // malformed call that skipped STEP 2.6 entirely — the
+                  // system prompt requires the agent to have actually
+                  // asked the staff member first.
+                  imageMode:
+                    imageMode === "RAW_PHOTO" ? "RAW_PHOTO" : "AI_SCENE",
+                }
+              : { ...v, headerImageProductTitles: null, imageMode: null },
+          )
+        : generated.variants;
 
       return {
         success: true,
@@ -493,8 +698,8 @@ function buildInsightsAgentTools({ staffUserId = null } = {}) {
         audienceRules,
         audienceSize,
         intent,
-        variants: generated.variants,
-        // variants: { label, tone, bodyText, headerType, headerText, headerImagePromptHint, footerText, buttons }
+        variants,
+        // variants: { label, tone, bodyText, headerType, headerText, headerImagePromptHint, headerImageHeadline, headerImageProductTitles, footerText, buttons }
         recommendedIndex: generated.recommendedIndex,
         // Signal to the frontend to show the content picker card
         action: "SHOW_CONTENT_PICKER",

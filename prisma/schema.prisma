@@ -655,6 +655,7 @@ enum BroadcastStatus {
   REJECTED
   CANCELLED
   FAILED
+  PENDING_SCHEDULE
 }
 
 enum RecipientStatus {

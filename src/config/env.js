@@ -27,6 +27,13 @@ const env = {
   },
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
   replicateApiToken: process.env.REPLICATE_API_TOKEN || "",
+  // Same Supabase project DATABASE_URL already points at — reused here only
+  // for Storage (hosting AI-composited campaign images at a public URL so
+  // Samvaadik/Meta can fetch them). See supabaseStorageService.js.
+  supabaseUrl: process.env.SUPABASE_URL || "",
+  supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
+  supabaseStorageBucket:
+    process.env.SUPABASE_STORAGE_BUCKET || "campaign-images",
   approvalLinkBaseUrl:
     process.env.APPROVAL_LINK_BASE_URL || "http://localhost:4000",
   // Placeholder default — TTL per product category is still an open
