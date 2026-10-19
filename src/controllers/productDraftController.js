@@ -56,29 +56,63 @@ async function linkSupplierToApprovedProduct(draft) {
     where: { shopifyProductId: draft.shopifyDraftProductId },
   });
   if (!localProduct) return; // upsert failed silently somehow — nothing to link
-  const localVariant = await prisma.variant.findFirst({ where: { productId: localProduct.id } });
-  if (!localVariant) return;
 
-  const alreadyLinked = await prisma.supplierProduct.findFirst({
-    where: { supplierId: draft.supplierId, variantId: localVariant.id },
-  });
-  if (alreadyLinked) return;
+  // Was findFirst (one variant only) — a real gap for a bulk-import
+  // multi-variant draft (e.g. a belt in 4 colors): the other 3 variants
+  // synced into Variant via handleProductUpsert above but never got a
+  // SupplierProduct row, so they had no margin/GST/cost recorded. Loops
+  // every real variant now; a single-variant draft (the normal one-by-one
+  // case) just has one to loop over, so this doesn't change behavior
+  // there at all.
+  const localVariants = await prisma.variant.findMany({ where: { productId: localProduct.id } });
+  if (localVariants.length === 0) return;
 
   const p = draft.rawPayload || {};
-  await prisma.supplierProduct.create({
-    data: {
-      supplierId: draft.supplierId,
-      productId: localProduct.id,
-      variantId: localVariant.id,
-      supplierSku: p.sku || null,
-      costPrice: p.costPrice ?? null,
-      marginPercent: p.marginPercent ?? null,
-      gstPercent: p.gstPercent ?? null,
-      isPrimary: true,
-      lastConfirmedStatus: "IN_STOCK",
-      lastConfirmedAt: new Date(),
-    },
-  });
+  // Bulk-import drafts carry a real per-variant breakdown in
+  // rawPayload.variants (see productImportDrain.js). A plain one-by-one
+  // draft has no such field — treat it as a single implied "variant"
+  // using the existing top-level fields, so the loop below handles both
+  // shapes with the same code instead of branching.
+  const payloadVariants =
+    Array.isArray(p.variants) && p.variants.length > 0
+      ? p.variants
+      : [{ sku: p.sku || null, value: null, mrp: p.price ?? null, costPrice: p.costPrice ?? null }];
+
+  for (let i = 0; i < localVariants.length; i++) {
+    const localVariant = localVariants[i];
+    const alreadyLinked = await prisma.supplierProduct.findFirst({
+      where: { supplierId: draft.supplierId, variantId: localVariant.id },
+    });
+    if (alreadyLinked) continue;
+
+    // Match this real Shopify variant back to its own cost/sku — by SKU
+    // first (most reliable), falling back to its option value (the
+    // color/size word), falling back to positional order for a
+    // single-variant draft where neither is ambiguous anyway.
+    const match =
+      payloadVariants.find((v) => v.sku && localVariant.sku && v.sku === localVariant.sku) ||
+      payloadVariants.find((v) => v.value && localVariant.optionValues?.option1 === v.value) ||
+      payloadVariants[i] ||
+      payloadVariants[0];
+
+    await prisma.supplierProduct.create({
+      data: {
+        supplierId: draft.supplierId,
+        productId: localProduct.id,
+        variantId: localVariant.id,
+        supplierSku: match.sku || localVariant.sku || null,
+        costPrice: match.costPrice ?? null,
+        // Margin/GST are a per-product (not per-variant) rate — same
+        // value for every variant of this draft, matching how they were
+        // collected (see ProductImportItem.marginPercent/gstPercent).
+        marginPercent: p.marginPercent ?? null,
+        gstPercent: p.gstPercent ?? null,
+        isPrimary: i === 0,
+        lastConfirmedStatus: "IN_STOCK",
+        lastConfirmedAt: new Date(),
+      },
+    });
+  }
 }
 
 function escapeHtml(str) {
