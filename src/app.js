@@ -22,6 +22,8 @@ const auditLogRouter = require("./routes/auditLogRoutes");
 const agentUsageRouter = require("./routes/agentUsageRoutes");
 const broadcastCampaignRouter = require("./routes/broadcastCampaignRoutes");
 const campaignRouter = require("./routes/campaignRoutes");
+const { prisma } = require("./lib/prisma");
+const { sendCampaign } = require("./controllers/broadcastCampaignController");
 
 const app = express();
 app.use(cors());
