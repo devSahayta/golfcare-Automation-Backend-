@@ -202,4 +202,19 @@ async function publishProduct(shopifyProductId) {
   }
 }
 
-module.exports = { createDraftProduct, publishProduct, publishToAllChannels };
+// Staff rejected the draft — remove it from Shopify entirely rather than
+// leaving an orphaned unpublished "draft" status product sitting in the
+// store forever. A 404 (already deleted/never existed) is treated as
+// success since the end state staff want — gone from Shopify — is
+// already true.
+async function deleteProduct(shopifyProductId) {
+  const client = await shopifyClient();
+  try {
+    await client.delete(`/products/${shopifyProductId}.json`);
+  } catch (err) {
+    if (err.response?.status === 404) return;
+    throw err;
+  }
+}
+
+module.exports = { createDraftProduct, publishProduct, publishToAllChannels, deleteProduct };

@@ -6,6 +6,7 @@ const healthRouter = require("./routes/health");
 const userRouter = require("./routes/userRoutes");
 const availabilityRouter = require("./routes/availabilityRoutes");
 const productDraftRoutes = require("./routes/productDraftRoutes");
+const productImportRoutes = require("./routes/productImportRoutes");
 const dynamicTemplateRoutes = require("./routes/dynamicTemplateRoutes");
 const samvaadikWebhookRouter = require("./webhooks/samvaadik");
 const shopifyWebhookRoutes = require("./routes/shopifyWebhookRoutes.js");
@@ -31,6 +32,7 @@ app.use("/health", healthRouter);
 app.use("/api/users", userRouter);
 app.use("/api/availability", availabilityRouter);
 app.use("/api/product-drafts", productDraftRoutes);
+app.use("/api/product-imports", productImportRoutes);
 app.use("/api/dynamic-templates", dynamicTemplateRoutes);
 
 app.use("/api/notifications", notificationRouter);
