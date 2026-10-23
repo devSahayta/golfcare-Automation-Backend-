@@ -81,10 +81,11 @@ Each variant has these fields:
     - Generic sale/offer/restock with no named occasion: no themed props at all — just clean premium styling (wood/slate/linen surface, controlled light), nothing invented
     If you are not certain which occasion a campaign refers to, default to NO occasion props rather than guessing — plain premium styling is always safe; the wrong festival's motifs are not.
   - Avoid plain, flat description ("a picture of X and Y on a table"). Every hint should read like a photography/styling brief with a clear surface, light, and composition choice.
+  - BRAND PALETTE — Golf Care's identity is deep forest green, white, and warm gold. Weave this into the scene naturally through surface color, accent props, or background tone — e.g. "a deep forest-green felt surface", "a white marble surface with gold-toned accessories", "a rich dark-green backdrop with soft warm gold side-lighting". Do not force it if the occasion already has a stronger color story (Christmas red/green is fine and naturally matches), but default to green-toned surfaces and warm gold light whenever no other palette is dictated by the occasion.
   - Do NOT describe any text/wording here — headerImagePromptHint is the SCENE only.
 - headerImageEyebrow: OPTIONAL, only when headerType is "IMAGE" — a short kicker/label line (max 4 words, ~28 characters) rendered in small letter-spaced caps ABOVE the headline. Leave null if the headline already says it all.
-- headerImageHeadline: OPTIONAL, only when headerType is "IMAGE" — the big, bold statement line (max 6 words, ~40 characters) rendered directly over the photo as real typography (not drawn by Flux — this is composited afterward, so it always comes out crisp and legible). Use this whenever the image alone wouldn't make the occasion/purpose obvious at a glance. Leave it null only for a simple single-product restock where the product itself is self-explanatory. Keep it punchy — this is a headline, not a sentence. Never include a price, phone number, or anything time-sensitive.
-- headerImageBadgeText: OPTIONAL, only when headerType is "IMAGE" — a very short tag/pill (max 3 words, ~16 characters) rendered as a small rounded badge below the headline, the way a product ad has a "FLASH SALE" or "NEW" sticker. This is what makes the image feel like a real promotional creative instead of a plain product photo — use it for PROMOTION/EVENT campaigns where there's a genuine hook (an offer, a limited window, a bundle). Leave null for a plain restock with no particular angle. Never put a price or a countdown/urgency claim you can't actually back ("today only" etc.) — keep it to what's true.
+- headerImageHeadline: OPTIONAL, only when headerType is "IMAGE" — the big, bold statement line (max 6 words, ~40 characters) rendered by the AI directly into the generated image as part of the same shot (AI_SCENE path only — ignored entirely for RAW_PHOTO, which has no AI step to draw it). Use this whenever the image alone wouldn't make the occasion/purpose obvious at a glance. Leave it null only for a simple single-product restock where the product itself is self-explanatory. Keep it punchy — this is a headline, not a sentence. Never include a price, phone number, or anything time-sensitive.
+- headerImageBadgeText: OPTIONAL, only when headerType is "IMAGE" — a very short tag/pill (max 3 words, ~16 characters) rendered by the AI as a small rounded badge below the headline (AI_SCENE path only, same as headerImageHeadline), the way a product ad has a "FLASH SALE" or "NEW" sticker. This is what makes the image feel like a real promotional creative instead of a plain product photo — use it for PROMOTION/EVENT campaigns where there's a genuine hook (an offer, a limited window, a bundle). Leave null for a plain restock with no particular angle. Never put a price or a countdown/urgency claim you can't actually back ("today only" etc.) — keep it to what's true.
 
 VARY THE WORDING PATTERN EVERY TIME — do not settle into one template. A real reviewer of this prompt noticed back-to-back campaigns all coming out as "[Occasion] at Golf Care" / "[Product A] & [Product B] Combo" / "Festive Offer" — technically correct but repetitive and visibly templated once staff see more than one. Pick a DIFFERENT structural approach each time, for example (mix and match, don't always reach for the first one):
   - Occasion-led: eyebrow names the occasion, headline is a benefit or command — "Diwali at Golf Care" / "Light Up Your Game" / "Festive Offer"
@@ -184,6 +185,7 @@ async function generateContentVariants({
   campaignName,
   preferredHeaderType = null,
   headerImageProductTitles = null,
+  imageMode = null,
 }) {
   const client = new Anthropic({ apiKey: env.anthropicApiKey });
 
@@ -198,25 +200,21 @@ async function generateContentVariants({
   }
 
   // When the agent has already confirmed real catalog photos for specific
-  // products (via check_product_photo, before this was ever called), those
-  // exact photos get PASTED into the image server-side — they are never
-  // drawn by Flux. So headerImagePromptHint here must describe ONLY the
-  // backdrop (surface, props, lighting) and must NOT name or describe any
-  // product, or the written scene and the actually-composited photos would
-  // visually contradict each other (e.g. hint says "a golf ball on grass"
-  // while the real pasted product is a driver). The exact product list
-  // itself is NOT something Haiku invents or echoes — it's attached to the
-  // variant afterward, verbatim, from what was already confirmed.
+  // products (via check_product_photo, before this was ever called) AND the
+  // staff member chose the AI_SCENE path (STEP 2.6) rather than RAW_PHOTO,
+  // those exact photos are handed to FLUX.2 Pro as REFERENCE IMAGES — Flux
+  // regenerates the whole frame in one pass, product included, rather than
+  // code pasting an unmodified cutout onto a separately-generated backdrop.
+  // The exact product list itself is NOT something Haiku invents or echoes
+  // — it's attached to the variant afterward, verbatim, from what was
+  // already confirmed; this directive just tells Haiku how to write the
+  // scene around it.
   let productDirective = "";
   if (
     Array.isArray(headerImageProductTitles) &&
     headerImageProductTitles.length > 0
   ) {
-    productDirective = `\nREAL PRODUCT PHOTOS WILL BE COMPOSITED FOR: ${headerImageProductTitles.join(", ")}. These exact real photos will be pasted into the final image by code — do NOT describe, name, or imply any of these products (or any other product) in headerImagePromptHint. headerImagePromptHint must describe ONLY the backdrop: surface/background, occasion props and motifs, lighting, composition style. The pasted products are flat-cut real photos with hard edges, not AI-rendered, so they only look believable against a CALM, UNCLUTTERED backdrop — busy or glowing elements right where the product sits make the paste-in obvious. Specifically:
-  - If (and only if) the campaign names a specific occasion, describe THAT occasion's own props as small, literal, physically resting objects — e.g. "a few brass diyas with small warm flames" for Diwali, "a few small pine sprigs and red ornaments" for Christmas — NEVER as "scattered", "bokeh", "glowing orbs", "soft blur in the background", or anything that reads as out-of-focus light (Flux reliably turns those words into abstract glowing blobs, not recognizable objects), and NEVER a different occasion's motifs than the one actually named — diyas belong to Diwali only, never to Christmas/New Year/a generic "festive" campaign. If no specific occasion is named, use NO themed props at all — a clean premium surface is always correct; guessing the wrong festival is not.
-  - Keep props confined to the edges/corners or the top third of the frame, never the lower-middle.
-  - Explicitly state the lower-middle 40% of the frame is bare surface with nothing on it (not just "open space" — say "completely bare, no props, no petals, no light flares") so the real product cutout has a calm area to sit in rather than competing with backdrop detail.
-  - Avoid "soft glow", "warm bokeh", "light flares", "dreamy" — these push Flux toward blurred light shapes that don't read as anything in particular.`;
+    productDirective = `\nREAL PRODUCT PHOTO(S) PROVIDED AS AI REFERENCE IMAGES FOR: ${headerImageProductTitles.join(", ")}. FLUX.2 Pro will regenerate the whole scene using these as reference, including the product itself — not paste an unmodified cutout. You MAY describe the product naturally as part of the scene (how it's arranged, positioned, lit relative to any props) — there's no hard-edged cutout to protect, so ordinary styling language (soft glow, props near the product, etc.) is fine, unlike a flat paste. Do NOT invent a different product than what's named, and do NOT describe any change to the product's own appearance (no re-coloring, no redesigning, no adding/removing markings, no different packaging) — the reference image's whole purpose is for Flux to reproduce that real product faithfully, and your scene description should support that, not fight it.`;
   }
 
   // Forced wording-pattern variety for headerImageEyebrow/Headline/BadgeText.
@@ -661,6 +659,7 @@ function buildInsightsAgentTools({ staffUserId = null } = {}) {
         campaignName,
         preferredHeaderType,
         headerImageProductTitles,
+        imageMode,
       });
 
       // headerImageProductTitles (and imageMode alongside it) are attached

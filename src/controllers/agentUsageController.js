@@ -61,6 +61,11 @@ const AGENTS = {
       toolCallCount: null, // campaign drafting makes no tool calls
     },
   },
+  "gpt-image-2": {
+    table: "insightsUsage",
+    match: { question: { startsWith: "gpt-image-2:" } },
+    fields: STANDARD_FIELDS,
+  },
 };
 
 function parseRange(query) {
@@ -147,7 +152,9 @@ function normalizeRow(row, agent) {
     label:
       agent === "insights"
         ? row.question
-        : `Conversation ${String(row.conversationId || "").slice(0, 8)}`,
+        : agent === "gpt-image-2"
+          ? `Image generation · ${new Date(row.createdAt).toLocaleDateString()}`
+          : `Conversation ${String(row.conversationId || "").slice(0, 8)}`,
     model: row.model || null,
     inputTokens: row.inputTokens,
     outputTokens: row.outputTokens,

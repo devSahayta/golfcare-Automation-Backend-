@@ -23,15 +23,14 @@ const {
   uploadMediaFromUrl,
 } = require("../lib/samvaadik/adapter");
 const {
-  generateCampaignImage,
-  generateCompositeCampaignImage,
   generateRawProductCampaignImage,
-  recomposeCampaignImage,
+  generateAIComposedCampaignImage,
 } = require("../services/imageGenerationService");
 const {
   matchProductImage,
   getProductPhotosByTitles,
 } = require("../services/productImageMatchService");
+const { logUsage } = require("../services/agentEngine/logger");
 
 const BATCH_SIZE = 10; // schedule this many recipients per loop iteration
 const SEND_DELAY_MS = 300; // ms between batches — stay well under Samvaadik rate limits
@@ -350,19 +349,26 @@ async function submitCampaign(req, res) {
         );
       } else {
         console.log(
-          `[submitCampaign] No preview image found — generating now via Flux 1.1 Pro`,
+          `[submitCampaign] No preview image found — generating now via FLUX.2 Pro`,
         );
-        const intent =
+        // No product titles are persisted on the BroadcastCampaign row (see
+        // prisma/schema.prisma), so a cold-regenerate here can only use the
+        // generic thematic path, same limitation that existed before this
+        // file switched models — staff should normally never hit this,
+        // since the preview step in the widget always saves headerImageUrl
+        // first.
+        // backdropHint = agentPrompt/category only — do NOT append bodyText.
+        // The WhatsApp message body is customer-facing copy, not scene
+        // direction, and injecting it into the image prompt corrupts
+        // generation ("Hi {{1}}, start 2025..." renders as visible text
+        // in the scene).
+        const backdropHint =
           campaign.agentPrompt || campaign.category || "golf campaign";
-        const context = campaign.bodyText
-          ? campaign.bodyText.slice(0, 200)
-          : "";
 
         try {
-          const { imageUrl } = await generateCampaignImage({
+          const { imageUrl } = await generateAIComposedCampaignImage({
             campaignName: campaign.name,
-            intent,
-            context,
+            backdropHint,
           });
           generatedImageUrl = imageUrl;
         } catch (genErr) {
@@ -781,6 +787,11 @@ async function updateCampaignTemplate(req, res) {
     headerImageUrl,
     footerText,
     buttons,
+    // Cost of the AI image generation call — passed by the frontend after a
+    // successful previewCampaignImage call so it can be persisted alongside
+    // the image URL. Null/absent for RAW_PHOTO mode or TEXT header campaigns.
+    imageGenCostUsd,
+    imageGenCostInr,
   } = req.body;
 
   try {
@@ -816,6 +827,12 @@ async function updateCampaignTemplate(req, res) {
         ...(headerImageUrl !== undefined && { headerImageUrl }),
         ...(footerText !== undefined && { footerText }),
         ...(buttons !== undefined && { buttons }),
+        // Store image generation cost when provided (AI_SCENE mode only).
+        // Only written when the frontend explicitly passes both fields — a
+        // partial update (e.g. editing bodyText) must not overwrite a cost
+        // already saved from a prior previewCampaignImage call.
+        ...(imageGenCostUsd != null && { imageGenCostUsd }),
+        ...(imageGenCostInr != null && { imageGenCostInr }),
       },
     });
 
@@ -843,12 +860,11 @@ async function previewCampaignImage(req, res) {
     headerImageHeadline,
     headerImageBadgeText,
     headerImageProductTitles,
-    // "AI_SCENE" (default) = Flux backdrop + real photo composited in.
-    // "RAW_PHOTO" = no AI generation at all, real photo on a plain
-    // backdrop. Staff picks this in chat (see STEP 2.6 in
-    // insightsAgentConfig.js) whenever a real product photo is confirmed —
-    // it's stamped onto the variant the same way headerImageProductTitles
-    // is, never left for the content model to invent.
+    // Exactly two values now (see STEP 2.6 in insightsAgentConfig.js):
+    //   "RAW_PHOTO" — no AI anywhere, the real catalog photo as-is.
+    //   "AI_SCENE" (default) — one AI generation call does everything:
+    //     scene, product (via reference image when a real photo is
+    //     confirmed), and wording, in a single pass.
     imageMode,
     // RAW_PHOTO only: which of the matched product's real catalog photos
     // to use (Product.imageUrls can hold several). Lets staff switch
@@ -870,14 +886,14 @@ async function previewCampaignImage(req, res) {
     // the general campaign intent (e.g. "championship golf course golden hour"
     // vs just "EVENT")
     const effectiveIntent = headerImagePromptHint || intent || campaignName;
+    const usingRawPhoto = imageMode === "RAW_PHOTO";
 
-    // ── Real-product compositing path ────────────────────────────────────
+    // ── Real, named product confirmed (STEP 2.5 in insightsAgentConfig.js) ──
     //
     // If the agent passed confirmed catalog product titles (check_product_photo
-    // already ran per product — see insightsAgentConfig.js STEP 2.5), resolve
-    // them to real photo URLs here and composite instead of generating a fully
-    // AI scene. This is a SECOND, deterministic exact-title lookup — no
-    // re-fuzzy-matching — same "can't drift apart" principle as matchProductImage.
+    // already ran per product), resolve them to real photo URLs here. This is
+    // a SECOND, deterministic exact-title lookup — no re-fuzzy-matching —
+    // same "can't drift apart" principle as matchProductImage.
     if (
       Array.isArray(headerImageProductTitles) &&
       headerImageProductTitles.length > 0
@@ -891,9 +907,12 @@ async function previewCampaignImage(req, res) {
       );
 
       if (resolvedPhotos.length > 0) {
-        const usingRawPhoto = imageMode === "RAW_PHOTO";
         console.log(
-          `[previewCampaignImage] ${usingRawPhoto ? "Raw-photo (no AI)" : "Compositing real photos"} for "${campaignName}" — ` +
+          `[previewCampaignImage] ${
+            usingRawPhoto
+              ? "Raw-photo (no AI)"
+              : "AI-generated (real photo as reference)"
+          } for "${campaignName}" — ` +
             `matched: ${matchedProductTitles.join(", ")}` +
             (unmatchedProductTitles.length
               ? ` — unmatched (no longer found, will be skipped): ${unmatchedProductTitles.join(", ")}`
@@ -902,15 +921,15 @@ async function previewCampaignImage(req, res) {
 
         const generate = usingRawPhoto
           ? generateRawProductCampaignImage
-          : generateCompositeCampaignImage;
+          : generateAIComposedCampaignImage;
 
         // RAW_PHOTO only: let staff switch which of the FIRST matched
         // product's real catalog photos gets used (Product.imageUrls can
         // hold several — e.g. front/back/in-hand shots). Scoped to the
-        // first product deliberately: a multi-product campaign composites
-        // all of them together, and "switch photo" for just one of several
-        // products at once isn't a UI this needs yet — the common, tested
-        // case is a single named product.
+        // first product deliberately: a multi-product campaign uses all of
+        // them together, and "switch photo" for just one of several at once
+        // isn't a UI this needs yet — the common, tested case is a single
+        // named product.
         let productPhotosForGenerate = resolvedPhotos;
         if (usingRawPhoto && resolvedPhotos[0]?.imageUrls?.length > 1) {
           const idx = Number.isInteger(selectedProductImageIndex)
@@ -929,7 +948,15 @@ async function previewCampaignImage(req, res) {
           ];
         }
 
-        const { imageUrl, backdropUrl, prompt } = await generate({
+        const {
+          imageUrl,
+          prompt,
+          costUsd = null,
+          costInr = null,
+          inputTokens: imgInputTokens = 0,
+          outputTokens: imgOutputTokens = 0,
+          model: imgModel = null,
+        } = await generate({
           campaignName: campaignName || "Golf Campaign",
           backdropHint: effectiveIntent,
           headline: headerImageHeadline || null,
@@ -938,19 +965,36 @@ async function previewCampaignImage(req, res) {
           productPhotos: productPhotosForGenerate,
         });
 
+        if (!usingRawPhoto && costUsd != null) {
+          prisma.insightsUsage
+            .create({
+              data: {
+                staffUserId: null,
+                question: `gpt-image-2: ${campaignName || "campaign"}`,
+                model: imgModel || "gpt-image-2-2026-04-21",
+                inputTokens: imgInputTokens,
+                outputTokens: imgOutputTokens,
+                costUsd,
+                costInr: costInr || 0,
+                toolCallCount: 0,
+                outcome: "completed",
+              },
+            })
+            .catch((err) =>
+              console.error(
+                "[previewCampaignImage] usage log failed:",
+                err.message,
+              ),
+            );
+        }
+
         return res.json({
           imageUrl,
-          // backdropUrl is NOT the final image — it's the plain scene (AI
-          // or, on the raw-photo path, a flat brand-color backdrop) before
-          // any product/text compositing. The frontend holds onto it so
-          // staff can edit the wording afterward via POST
-          // /preview-image/text without paying for another Flux generation
-          // (see recomposeCampaignImageText below) — on the raw-photo path
-          // there's no Flux cost to save, but reusing the same mechanism
-          // keeps the edit flow identical either way.
-          backdropUrl,
           prompt,
           imageMode: usingRawPhoto ? "RAW_PHOTO" : "AI_SCENE",
+          // Pass cost back to frontend so it can save alongside headerImageUrl
+          imageGenCostUsd: costUsd,
+          imageGenCostInr: costInr,
           matchedProductTitles,
           unmatchedProductTitles,
           // RAW_PHOTO + the first matched product has more than one real
@@ -998,77 +1042,95 @@ async function previewCampaignImage(req, res) {
       });
     }
 
+    // ── No specific named product — generic thematic AI image ───────────
+    //
+    // RAW_PHOTO has no meaning with nothing to show "raw," so this is
+    // always the AI_SCENE path regardless of what imageMode the caller sent.
+    //
+    // backdropHint = effectiveIntent only — do NOT append context (the
+    // campaign body text). The body text ("Hi {{1}}, start 2025 with your
+    // dream clubs...") is WhatsApp message copy, not image-scene direction,
+    // and appending it to the prompt corrupts image generation: the model
+    // tries to render the message text as part of the scene.
+    // The agent's headerImagePromptHint already contains all the scene
+    // description needed ("golf clubs arranged on dark slate, gold confetti,
+    // New Year mood") — context adds nothing useful here.
     console.log(
       `[previewCampaignImage] Generating preview for "${campaignName}" — hint: "${effectiveIntent}"` +
         (headerImageHeadline ? ` — headline: "${headerImageHeadline}"` : ""),
     );
 
-    const { imageUrl, prompt } = await generateCampaignImage({
+    const {
+      imageUrl,
+      prompt,
+      costUsd = null,
+      costInr = null,
+      inputTokens: imgInputTokens = 0,
+      outputTokens: imgOutputTokens = 0,
+      model: imgModel = null,
+    } = await generateAIComposedCampaignImage({
       campaignName: campaignName || "Golf Campaign",
-      intent: effectiveIntent,
-      context: context || "",
+      backdropHint: effectiveIntent,
       headline: headerImageHeadline || null,
       eyebrow: headerImageEyebrow || null,
       badgeText: headerImageBadgeText || null,
     });
 
-    return res.json({ imageUrl, prompt });
+    if (costUsd != null) {
+      prisma.insightsUsage
+        .create({
+          data: {
+            staffUserId: null,
+            question: `gpt-image-2: ${campaignName || "campaign"}`,
+            model: imgModel || "gpt-image-2-2026-04-21",
+            inputTokens: imgInputTokens,
+            outputTokens: imgOutputTokens,
+            costUsd,
+            costInr: costInr || 0,
+            toolCallCount: 0,
+            outcome: "completed",
+          },
+        })
+        .catch((err) =>
+          console.error(
+            "[previewCampaignImage] usage log failed:",
+            err.message,
+          ),
+        );
+    }
+
+    return res.json({
+      imageUrl,
+      prompt,
+      imageMode: "AI_SCENE",
+      imageGenCostUsd: costUsd,
+      imageGenCostInr: costInr,
+    });
   } catch (err) {
+    // Flux's brand/logo IP-protection filter blocked this specific request
+    // (see the matching throw in imageGenerationService.js) — not a generic
+    // failure, so give the frontend a distinct, actionable code instead of
+    // a flat 500. Same "tell the staff member directly" principle as
+    // PRODUCT_PHOTOS_UNRESOLVED above: the fix here (switch to RAW_PHOTO)
+    // is known and reliable, so say so rather than making staff guess.
+    if (err.code === "AI_BRAND_LOGO_BLOCKED") {
+      console.error(
+        "[previewCampaignImage] AI_BRAND_LOGO_BLOCKED:",
+        err.message,
+      );
+      return res.status(409).json({
+        error: "AI_BRAND_LOGO_BLOCKED",
+        message:
+          "AI generation was blocked for this branded product. Switch to the raw-photo " +
+          "(no AI) option, which uses your real catalog photo exactly.",
+        productNames: err.productNames || [],
+      });
+    }
     console.error("[previewCampaignImage] error:", err.message);
     return res.status(500).json({
       error: "Failed to generate preview image",
       details: err.message,
-      hint: "Check REPLICATE_API_TOKEN in .env",
-    });
-  }
-}
-
-// ── POST /api/broadcast-campaigns/preview-image/text ────────────────────────
-//
-// Lets staff edit the eyebrow/headline/badge wording on an already-generated
-// composite image WITHOUT regenerating the AI backdrop — re-draws only the
-// sharp/SVG text layer over the persisted backdrop from the original
-// previewCampaignImage call. No Replicate call, no rate limit, near-instant.
-// Only applies to the real-product compositing path (it needs backdropUrl,
-// which only that path produces); the plain AI-generated path doesn't have
-// a reusable backdrop separate from its final image.
-
-async function recomposeCampaignImageText(req, res) {
-  const {
-    backdropUrl,
-    headerImageProductTitles,
-    headerImageEyebrow,
-    headerImageHeadline,
-    headerImageBadgeText,
-    campaignName,
-  } = req.body;
-
-  if (!backdropUrl) {
-    return res.status(400).json({ error: "backdropUrl is required" });
-  }
-
-  try {
-    const resolvedPhotos =
-      Array.isArray(headerImageProductTitles) &&
-      headerImageProductTitles.length > 0
-        ? await getProductPhotosByTitles(headerImageProductTitles)
-        : [];
-
-    const { imageUrl } = await recomposeCampaignImage({
-      backdropUrl,
-      productPhotos: resolvedPhotos,
-      headline: headerImageHeadline || null,
-      eyebrow: headerImageEyebrow || null,
-      badgeText: headerImageBadgeText || null,
-      campaignName: campaignName || "Golf Campaign",
-    });
-
-    return res.json({ imageUrl });
-  } catch (err) {
-    console.error("[recomposeCampaignImageText] error:", err.message);
-    return res.status(500).json({
-      error: "Failed to update image wording",
-      details: err.message,
+      hint: "Check OPENAI_API_KEY in .env",
     });
   }
 }
@@ -1339,6 +1401,5 @@ module.exports = {
   createCampaignDraft,
   updateCampaignTemplate,
   previewCampaignImage,
-  recomposeCampaignImageText,
   resolveProductImage,
 };

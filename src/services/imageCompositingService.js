@@ -1,28 +1,26 @@
 // src/services/imageCompositingService.js
 //
-// Pastes your REAL product photos onto an AI-generated backdrop, instead of
-// asking an image-to-image model to redraw the products. This is the
-// deliberate architecture choice for the "use our actual products" feature:
-// diffusion-based image-to-image models (Flux Kontext etc.) regenerate
-// pixels, which risks distorting logos, colors, and packaging text on real
-// branded products — exactly the opposite of "the product in the image has
-// to be ours". Compositing guarantees the product pixels are untouched;
-// only the backdrop and the caption text/badge are AI/code-generated.
+// HISTORICAL NOTE: this file used to run a full pipeline — generate an AI
+// backdrop, cut out and paste a real product photo onto it, draw eyebrow/
+// headline/badge text with embedded-font SVG, pick a random layout — for
+// the "use our real products" campaign image feature. That pipeline has
+// been retired (imageGenerationService.js's generateCompositeCampaignImage
+// and recomposeCampaignImage, which drove it, are gone); it produced a
+// visibly templated, "pasted-on" look. Image generation now goes through
+// FLUX.2 Pro doing the whole creative — scene, product, and wording — in
+// one generation pass (see generateAIComposedCampaignImage).
 //
-// Pipeline (see imageGenerationService.generateCompositeCampaignImage):
-//   1. Flux generates a backdrop ONLY — no products described in the prompt
-//   2. Each real product photo gets its background keyed out (this version:
-//      a cheap white/near-white threshold — most catalog shots are plain
-//      studio photos, so this is usually enough; a photo with a busy/colored
-//      background will show a visible edge until a proper ML background
-//      remover is added later)
-//   3. Cutouts are laid out on the backdrop with a soft drop shadow so they
-//      read as "placed" rather than "pasted"
-//   4. The text block (eyebrow + headline + badge, any of which are
-//      optional) is rendered as real typography via SVG + sharp — not asked
-//      of Flux, which is unreliable at legible text. This is strictly more
-//      reliable than the text-in-Flux-prompt approach used for campaigns
-//      with no specific named products.
+// What's left in THIS file and still actively used:
+//   - removeWhiteBackground — cuts a product photo's background out
+//   - composeImage — centers a cutout on a backdrop with a soft shadow
+// Both are used ONLY by generateRawProductCampaignImage (the "no AI, real
+// photo as-is" option) to center/pad the real photo onto a plain white
+// square for WhatsApp's 1:1 requirement. headline/eyebrow/badgeText are
+// never passed on that path, so the text-rendering code below this point
+// (layouts, embedded fonts, occasion decoration) is effectively dead code
+// — kept for now rather than deleted outright, in case a future feature
+// wants real-typography text rendering again, but nothing currently calls
+// composeImage with any text fields set.
 //
 // FONT NOTE (local-vs-production parity): the text is rendered with a font
 // embedded directly in the SVG as a base64 data URI (see loadEmbeddedFonts
@@ -997,21 +995,12 @@ function computeProductZone(band, canvasSize = CANVAS_SIZE) {
  * @returns {Promise<Buffer>} final JPEG buffer, 1024x1024
  *
  * NOTE: layoutStyle (which of LAYOUT_STYLES gets used) and occasion
- * decoration are picked randomly INSIDE this function, not passed in —
- * every call to composeImage gets a fresh composition. This includes
- * recomposeCampaignImage (the cheap wording-only edit path in
- * imageGenerationService.js): editing the eyebrow/headline/badge text on an
- * already-generated image also rerolls which layout/decoration it uses.
- * That's a deliberate trade-off, not an oversight — persisting the exact
- * original layout choice across edits would mean wiring a new field through
- * imageGenerationService, broadcastCampaignController, the frontend API
- * call, and InsightsWidget's saved state (the same shape of change that was
- * done for backdropUrl persistence). Given a layout reroll on text-edit is
- * harmless — if anything it gives staff a free "try a different look" for
- * nothing — this was judged not worth that wiring cost right now. If a
- * campaign's layout needs to stay fixed across wording edits later, add a
- * `layoutStyle` param here (default to random when omitted) and thread it
- * through the same four files the same way backdropUrl was threaded.
+ * decoration are picked randomly INSIDE this function when not passed in.
+ * As of the FLUX.2 Pro switch, the only live caller is
+ * generateRawProductCampaignImage, which never passes headline/eyebrow/
+ * badgeText — so in practice no layout or decoration is ever drawn today;
+ * this code path is kept for a possible future feature that wants real-
+ * typography text rendering again, not actively exercised right now.
  */
 async function composeImage({
   backdropBuffer,

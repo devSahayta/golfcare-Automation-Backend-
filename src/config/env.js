@@ -27,6 +27,16 @@ const env = {
   },
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
   replicateApiToken: process.env.REPLICATE_API_TOKEN || "",
+  // OpenAI API key — used for gpt-image-1 (images/edits endpoint) as the
+  // primary AI_SCENE provider. Flux/Replicate is the fallback when this is
+  // not set. Add OPENAI_API_KEY to your .env and Vercel environment variables.
+  openaiApiKey: process.env.OPENAI_API_KEY || "",
+  // Golf Care logo PNG — passed as a reference image to gpt-image-2.5-flare
+  // on every campaign image generation so the model can place it naturally
+  // in the scene (corner badge, signage, tag, etc.).
+  // Set this to the public CDN/Supabase URL of your logo PNG.
+  // Example: https://xyz.supabase.co/storage/v1/object/public/assets/logo.png
+  golfcareLogoUrl: process.env.GOLFCARE_LOGO_URL || "",
   // Same Supabase project DATABASE_URL already points at — reused here only
   // for Storage (hosting AI-composited campaign images at a public URL so
   // Samvaadik/Meta can fetch them). See supabaseStorageService.js.

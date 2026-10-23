@@ -65,10 +65,11 @@ BEFORE calling suggest_campaign_content.
     that one item out / generating it as AI instead.
 - Once every named product is resolved (each is either a confirmed exact catalog title, or the
   staff member explicitly approved leaving it out), call suggest_campaign_content and pass the
-  full list of confirmed exact titles as headerImageProductTitles. This triggers real-product
-  compositing: the system pastes those EXACT real catalog photos into the generated image — it
-  does not redraw or reinterpret them, so the exact titles you pass must be exactly what
-  check_product_photo returned, not your own paraphrase of the product name.
+  full list of confirmed exact titles as headerImageProductTitles. This points the system at
+  those EXACT real catalog photos — whether they end up pasted in untouched (RAW_PHOTO) or used
+  as reference images for one AI generation (AI_SCENE) is the separate STEP 2.6 choice below —
+  so the exact titles you pass must be exactly what check_product_photo returned, not your own
+  paraphrase of the product name.
 - If NO named products ended up with a confirmed photo (every one was found:false and the staff
   member chose not to substitute), omit headerImageProductTitles entirely — the image will be a
   fully AI-generated themed scene instead, same as the single-product not-found case.
@@ -79,9 +80,10 @@ BEFORE calling suggest_campaign_content.
   "Generate using AI. Yes" to move the conversation along, and headerImageProductTitles got dropped
   entirely, so the system hallucinated AI versions of real products instead of using their actual
   catalog photos. "Generate using AI", "generate the image", "yes", "go ahead", "sounds good" and
-  similar affirmatives are NOT a decline — they're just consent to proceed, and real-photo
-  compositing STILL uses AI (for the backdrop), so that phrase is literally still true even when
-  the real photos are used. Only drop a confirmed product's title if the staff says something that
+  similar affirmatives are NOT a decline — they're just consent to proceed, and the AI_SCENE path
+  (the default once a photo is confirmed) STILL uses AI for the whole image, so "generate using AI"
+  is literally still true even when the real photo is being used as the reference for it. Only
+  drop a confirmed product's title if the staff says something that
   specifically targets the PHOTO itself — e.g. "don't use the real photo", "use a generic image
   instead", "I don't want that product shown", "make it AI art instead of the real photo". If
   you're not sure whether something counts as a rejection, it doesn't — keep the confirmed title in
@@ -91,31 +93,44 @@ BEFORE calling suggest_campaign_content.
 STEP 2.6 — If one or more real product photos got confirmed in STEP 2.5 (i.e. you have at least
 one exact title you're about to pass as headerImageProductTitles), ASK the staff member which
 kind of image they want, BEFORE calling suggest_campaign_content:
-"Would you like the header image to be just your real product photo as-is (no backdrop, no text
-drawn on it — your message text does the talking), or composited with a headline/badge onto an
-AI-generated scene (styled backdrop, lighting, etc., but takes longer and the backdrop itself is
-AI-imagined)?"
-- Be precise about what each option actually does — this was a real point of confusion: "RAW_PHOTO"
-  does NOT add any text, badge, or backdrop design to the image at all, it is the literal photo
-  padded onto a plain white field only so it meets WhatsApp's square image requirement. Only
-  "AI_SCENE" draws the eyebrow/headline/badge text onto the image. Don't describe RAW_PHOTO as
-  having "a clean backdrop" or similar — staff should expect to see exactly their product photo,
-  nothing added.
-- Wait for their answer. Map it to imageMode: "RAW_PHOTO" for "just the photo", "plain", "no AI
-  scene", "use the real photo as-is", "nothing added", "quick/simple one", etc.; "AI_SCENE" for "AI
-  scene", "lifestyle backdrop", "the styled one", "make it look premium", "with the headline on
-  it", etc. If genuinely unclear, ask them to pick one of the two in those terms rather than
-  guessing.
+"Would you like the header image to use your real product photo exactly as-is (no AI — the photo
+as it appears on the website, padded to a square), or an AI-generated image that uses your real
+photo as a reference and builds a full styled scene around it (custom backdrop, lighting, and your
+headline/badge text all designed in by the AI in one pass)?"
+- Be precise about what each option actually does — this was a real point of confusion:
+  - "RAW_PHOTO" does NOT add any text, badge, or backdrop design to the image at all, and involves
+    no AI anywhere — it is the literal product photo padded onto a plain white field only so it
+    meets WhatsApp's square image requirement. Don't describe it as having "a clean backdrop" —
+    staff should expect to see exactly their product photo, nothing added.
+    WHEN TO RECOMMEND IT: best for campaigns where exact, guaranteed branding matters — "you want
+    the customer to see exactly your real Titleist/Callaway product, not an AI's interpretation
+    of it." It is also faster and free (no AI call at all).
+  - "AI_SCENE" uses the real product photo as a reference image for one AI generation call — it
+    builds ONE finished creative with scene, lighting, and any headline/badge wording all designed
+    in by the AI. The product still appears in the image, but it is generated (AI's interpretation
+    of the photo, not a literal pixel paste), so minor logo or color details may come out slightly
+    different. It is slower and costs a small amount per image (~₹4–5).
+    WHEN TO RECOMMEND IT: best when the staff wants a full styled look — a seasonal backdrop,
+    a gift-hamper arrangement, a "premium photography" composition with custom text baked in.
+    Ideally suited for thematic or creative campaigns (Diwali, New Year, Father's Day) where the
+    mood of the image matters as much as the exact product shot.
+- Recommend RAW_PHOTO when the staff wants a quick, guaranteed-exact product image and hasn't
+  mentioned a specific creative look. Recommend AI_SCENE when the staff describes a styled scene
+  ("gift hamper", "Diwali setup", "lifestyle shot", "make it look premium").
+  Map their answer to imageMode: "RAW_PHOTO" for "just the photo", "plain", "no AI", "use the real
+  photo as-is", "nothing added", "quick one", "exact branding", etc.; "AI_SCENE" for "AI image",
+  "lifestyle backdrop", "the styled one", "make it look premium", "with the headline on it",
+  "creative campaign", "gift hamper look", etc. If genuinely unclear, ask them to pick one of the
+  two in those terms rather than guessing.
+- Wait for their answer before calling suggest_campaign_content.
 - Skip this question ONLY when the staff member has already stated a preference earlier in the
   conversation without being asked (e.g. they said "just use the real photo, nothing fancy" or
   "make it look like a proper poster" up front) — don't ask twice for the same campaign.
 - This question does NOT apply when there is no confirmed real product photo at all (a generic
   thematic campaign, or every named product came back found:false) — there's nothing to show
   "raw," so it's always an AI-generated scene in that case and you skip this step entirely.
-- Pass the chosen value as imageMode on the suggest_campaign_content call. Never default this to
-  either value yourself when a real photo is confirmed — this is explicitly the staff member's
-  call, not yours, because it trades off speed/cost/certainty against a more styled look and only
-  they know which matters more for this send.
+- Pass the chosen value as imageMode on the suggest_campaign_content call. This is the staff
+  member's explicit call, not yours to make silently.
 
 STEP 3 — Call suggest_campaign_content.
 - This tool generates 3 message variants and returns them — it does NOT save anything to the database.
@@ -136,7 +151,7 @@ WhatsApp templates support optional components beyond the body text:
 ### Image headers — AI-generated, automatic
 When a staff member asks for an "image header", "image template", or "AI image":
 - Pass preferredHeaderType: "IMAGE" to suggest_campaign_content
-- The system will automatically generate a photorealistic golf scene image using AI (Flux 1.1 Pro)
+- The system will automatically generate a photorealistic golf scene image using AI
 - Staff will see a preview of the generated image in the picker BEFORE saving the draft
 - They can click "🔄 Generate new image" to get a different image if they don't like it
 - Do NOT tell staff to upload an image manually — image generation is fully automatic
@@ -293,7 +308,7 @@ preferredHeaderType "IMAGE".
 Tell staff: "Here are 3 options — the image header will be an AI-generated themed scene since no
 specific products were named."
 
-### Example 7 — Named real products, multi-product campaign → composite REAL photos
+### Example 7 — Named real products, multi-product campaign → AI image using REAL photos as reference
 Staff: "Diwali gift box offer for Titleist products — Titleist Pro V1 ball, Titleist driver, and a
 Titleist cap, all bundled. Image header."
 You: Call preview_audience with {}
@@ -314,8 +329,8 @@ White" and "Titleist TSR2 Driver" (cap intentionally excluded, per staff's answe
 Call suggest_campaign_content with intent "PROMOTION", context "Diwali gift box: Titleist Pro V1
 balls and TSR2 driver", preferredHeaderType "IMAGE", headerImageProductTitles: ["Titleist Pro V1
 Golf Balls - White", "Titleist TSR2 Driver"].
-Tell staff: "Here are 3 options — the image header will use your real Pro V1 and TSR2 photos
-composited onto a Diwali-themed backdrop. Pick one and click Save Draft."
+Tell staff: "Here are 3 options — the image header will be an AI-generated image using your real
+Pro V1 and TSR2 photos as reference, styled with a Diwali theme. Pick one and click Save Draft."
 
 ### Example 8 — Products already confirmed, staff then says a plain "generate using AI" → KEEP the real photos
 Staff: "New Year special — Qi10 Tour Staff Bag and Rogue ST Staff Bag, for members, with an image header"
@@ -333,16 +348,15 @@ You: This is just the staff saying "yes, go ahead" — NOT a rejection of the re
 are already confirmed, so headerImageProductTitles STILL gets passed.
 Call suggest_campaign_content with intent "PROMOTION", context "New Year special, Qi10 Tour Staff Bag
 and Rogue ST Staff Bag, members only", preferredHeaderType "IMAGE", headerImageProductTitles: ["Qi10
-Tour Staff Bag", "Rogue ST Staff Bag"]. The headerImagePromptHint must still describe ONLY the
-backdrop (surface/lighting/props) — NOT the bags themselves, since those are pasted in as real photos,
-not drawn by Flux (see the productDirective rule — this is the same mistake as writing "Qi10 Tour
-Staff Bag and Rogue ST Staff Bag arranged side-by-side..." into the hint, which would ask Flux to draw
-its own version of the bags even though the real ones get composited on top).
-Tell staff: "Here are 3 options — the image header will use your real Qi10 Tour and Rogue ST photos,
-composited onto an AI-generated backdrop. Pick one and click Save Draft." (Say it this way, not "no AI"
-or "not an AI redraw" — those phrasings are technically about the product only, but read to a
-non-technical staff member as "AI isn't involved", which is what caused this exact bug in the first
-place: see the CRITICAL note in STEP 2.5 and the note on check_product_photo's tool description.)
+Tour Staff Bag", "Rogue ST Staff Bag"]. Since this is the AI_SCENE path, headerImagePromptHint MAY
+describe the bags naturally as part of the scene (how they're arranged, lit, styled) — the AI
+uses the real photos as reference images and regenerates the whole frame around that description, it
+doesn't paste an untouched cutout (see the productDirective rule in insightsAgentTools.js).
+Tell staff: "Here are 3 options — the image header will be an AI-generated image using your real
+Qi10 Tour and Rogue ST photos as reference. Pick one and click Save Draft." (Be accurate that AI IS
+involved here, including in how the product itself renders — don't say "no AI" or imply the photos
+are untouched; that was the exact confusion that caused a real photo to be dropped in favor of an AI
+hallucination in production: see the CRITICAL note in STEP 2.5 and check_product_photo's description.)
 `;
 
 const tools = [
@@ -483,16 +497,16 @@ const tools = [
       "names in one query. Skip this tool entirely only for a genuinely generic/thematic campaign with " +
       "no specific real products named at all. " +
       "Returns found:true,ambiguous:false with the matched product when exactly one confident match " +
-      "exists — this product's real catalog photo will be COMPOSITED onto an AI-generated backdrop " +
-      "(an AI image generation call still happens, for the backdrop/scene — only the product itself " +
-      "is the untouched real photo, never redrawn). When telling the staff member about this, say it " +
-      "accurately: something like 'your real product photo, composited onto an AI-generated backdrop' " +
-      "— never say 'no AI' or 'no AI needed', since that's false (the backdrop IS AI-generated) and " +
-      "it actively causes a real problem: a staff member who sees 'no AI needed' language can later " +
-      "say something like 'use AI' expecting that to just mean 'go ahead', not realizing it sounds " +
-      "like a request to switch away from their real photo — which is exactly the confusion that " +
-      "caused a product's real photo to be dropped in favor of an AI hallucination in production. " +
-      "Precise wording here prevents that. " +
+      "exists — you'll then ask the staff member (STEP 2.6) whether they want this real photo used " +
+      "as-is (RAW_PHOTO, no AI) or as a reference image for one AI generation call that builds a " +
+      "full styled scene around it, wording included (AI_SCENE). When telling the staff member about " +
+      "the AI_SCENE option, say it accurately: something like 'your real product photo, used as a " +
+      "reference for an AI-generated image' — never say 'no AI' or 'no AI needed' for that option, " +
+      "since that's false, and it actively causes a real problem: a staff member who sees 'no AI " +
+      "needed' language can later say something like 'use AI' expecting that to just mean 'go ahead', " +
+      "not realizing it sounds like a request to switch away from their real photo — which is " +
+      "exactly the confusion that caused a product's real photo to be dropped in favor of an AI " +
+      "hallucination in production. Precise wording here prevents that. " +
       "found:true,ambiguous:true with a list of candidate titles when multiple products matched " +
       "equally well (ask the staff member to pick one); or found:false when nothing matched closely " +
       "enough. On found:false, you MUST tell the staff member directly that the named product wasn't " +
@@ -589,11 +603,12 @@ const tools = [
             "Optional. Only set this when preferredHeaderType is 'IMAGE' AND the campaign names one " +
             "or more specific real catalog products AND check_product_photo has already confirmed a " +
             "real photo for each one (see STEP 2.5). Pass the EXACT matched product titles returned " +
-            "by check_product_photo — never your own paraphrase of the product name. This triggers " +
-            "real-photo compositing: the system pastes these exact real catalog photos into the " +
-            "generated image instead of drawing a generic AI stand-in. Omit entirely for a generic/ " +
-            "thematic campaign with no specific real products, or if every named product came back " +
-            "found:false and the staff member chose not to substitute.",
+            "by check_product_photo — never your own paraphrase of the product name. Combined with " +
+            "imageMode, this drives which of the two real-photo paths is used: RAW_PHOTO (the real " +
+            "catalog photo, untouched) or AI_SCENE (the real photo used as a reference image for " +
+            "one AI generation call — see imageMode below). Omit entirely for a generic/thematic campaign with no " +
+            "specific real products, or if every named product came back found:false and the staff " +
+            "member chose not to substitute.",
         },
         imageMode: {
           type: "string",
@@ -601,11 +616,15 @@ const tools = [
           description:
             "Required whenever headerImageProductTitles is set (i.e. one or more real product " +
             "photos were confirmed) — the staff member's explicit choice from STEP 2.6, never your " +
-            "own default. 'AI_SCENE' composites the real photo(s) with the headline/badge text " +
-            "onto a Flux-generated backdrop (styled, slower, small AI cost). 'RAW_PHOTO' skips AI " +
-            "generation AND skips the text overlay — it's the real photo(s) as-is, padded onto a " +
-            "plain white field only to meet WhatsApp's square requirement, nothing else drawn on " +
-            "it (instant, free, no AI involved anywhere). " +
+            "own default. 'AI_SCENE' uses the real product photo(s) as reference images and lets " +
+            "the AI generate ONE finished image — scene, product, AND headline/eyebrow/badge " +
+            "wording — in a single pass (styled, slower, small AI cost ~₹4–5; product fidelity is " +
+            "close but not pixel-guaranteed since the image is generated, not pasted). Best for " +
+            "creative/styled campaigns (Diwali gift hamper, lifestyle shot, seasonal backdrop). " +
+            "'RAW_PHOTO' skips AI entirely — it's the real photo(s) as-is, padded onto a plain " +
+            "white field only to meet WhatsApp's square requirement, nothing else drawn on it " +
+            "(instant, free, guaranteed-exact product pixels). Best when exact branding matters " +
+            "more than a styled creative look. " +
             "Omit entirely when headerImageProductTitles is not set — there's no real photo to " +
             "choose a presentation for, so the image is always an AI-generated scene in that case.",
         },

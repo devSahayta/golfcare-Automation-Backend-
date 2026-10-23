@@ -20,6 +20,15 @@ function pickInsightsModel(message, history) {
   return env.anthropicModelHaiku;
 }
 
+// ── Per-session cost accumulator ─────────────────────────────────────────────
+//
+// Tracks cumulative LLM spend across all turns within a single browser/
+// conversation session. Key = staffUserId (or "anon" for unauthenticated).
+// Cleared when the process restarts — this is a console-visibility helper,
+// not durable billing data (that's insightsUsage rows in the DB).
+//
+const _sessionCost = new Map(); // staffUserId|"anon" -> { usd, inr, turns }
+
 function logUsage({
   staffUserId,
   question,
@@ -34,6 +43,20 @@ function logUsage({
       `(in=${usage?.inputTokens || 0} out=${usage?.outputTokens || 0} ` +
       `cache_created=${usage?.cacheCreationTokens || 0} cache_read=${usage?.cacheReadTokens || 0} ` +
       `tools=${toolCallLog?.length || 0} outcome=${outcome})`,
+  );
+
+  // Accumulate into session bucket and print a clear per-turn cost line
+  const key = staffUserId || "anon";
+  const prev = _sessionCost.get(key) || { usd: 0, inr: 0, turns: 0 };
+  const next = {
+    usd: prev.usd + cost.usd,
+    inr: prev.inr + cost.inr,
+    turns: prev.turns + 1,
+  };
+  _sessionCost.set(key, next);
+  console.log(
+    `[insights] 💰 Turn cost: $${cost.usd.toFixed(4)} / ₹${cost.inr.toFixed(2)}` +
+      `  |  Session total (${next.turns} turn${next.turns === 1 ? "" : "s"}): $${next.usd.toFixed(4)} / ₹${next.inr.toFixed(2)}`,
   );
 
   const operations = [
