@@ -121,4 +121,57 @@ async function uploadGeneratedImage(buffer, fileName) {
   return data.publicUrl;
 }
 
-module.exports = { uploadGeneratedImage };
+/**
+ * uploadReferenceImage
+ *
+ * Stages a product reference image in Supabase Storage under a neutral,
+ * generic filename so Replicate/Flux never sees the original CDN URL (which
+ * Flux's brand-detection filter can fingerprint). The caller passes raw image
+ * bytes; this function stores them under ref-images/ with a time-stamped,
+ * index-based name (e.g. ref-images/1729580400000-ref-1.jpg) that carries no
+ * brand information. Returns the Supabase public URL.
+ *
+ * Cleanup: these ref-images/ objects are temporary scratch files. A future
+ * scheduled job (or Supabase lifecycle rule) can delete anything under
+ * ref-images/ older than 7 days — the generated campaign images in the root
+ * of the bucket are the ones worth keeping long-term.
+ *
+ * @param {Buffer} buffer   - raw image bytes (any format — JPEG, PNG, WebP)
+ * @param {number} index    - 1-based position in the reference-image list
+ * @param {string} mimeType - e.g. "image/jpeg" or "image/png"
+ * @returns {Promise<string>} public HTTPS URL
+ */
+async function uploadReferenceImage(buffer, index, mimeType = "image/jpeg") {
+  await ensureBucket();
+  const supabase = getClient();
+
+  const ext = mimeType === "image/png" ? "png" : "jpg";
+  const path = `ref-images/${Date.now()}-ref-${index}.${ext}`;
+
+  const { error: uploadErr } = await supabase.storage
+    .from(env.supabaseStorageBucket)
+    .upload(path, buffer, { contentType: mimeType, upsert: false });
+
+  if (uploadErr) {
+    throw new Error(
+      `Supabase Storage reference-image upload failed: ${uploadErr.message}`,
+    );
+  }
+
+  const { data } = supabase.storage
+    .from(env.supabaseStorageBucket)
+    .getPublicUrl(path);
+
+  if (!data?.publicUrl) {
+    throw new Error(
+      "Supabase Storage ref-image upload succeeded but no public URL was returned.",
+    );
+  }
+
+  console.log(
+    `[supabaseStorageService] Staged reference image ${index} -> ${data.publicUrl}`,
+  );
+  return data.publicUrl;
+}
+
+module.exports = { uploadGeneratedImage, uploadReferenceImage };

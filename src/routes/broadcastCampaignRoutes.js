@@ -10,7 +10,6 @@ const {
   createCampaignDraft,
   updateCampaignTemplate,
   previewCampaignImage,
-  recomposeCampaignImageText,
   resolveProductImage,
   scheduleCampaign,
 } = require("../controllers/broadcastCampaignController");
@@ -29,9 +28,11 @@ router.post("/draft", createCampaignDraft);
 
 router.post("/preview-image", previewCampaignImage);
 
-// Cheap wording-only edit: re-draws eyebrow/headline/badge text over an
-// already-generated backdrop, no new Flux call.
-router.post("/preview-image/text", recomposeCampaignImageText);
+// NOTE: the old /preview-image/text "cheap wording-only edit" endpoint was
+// removed along with the paste-compositing image pipeline — there's no
+// longer a separable AI backdrop to re-draw text onto (FLUX.2 Pro produces
+// the whole image, including wording, in one generation). A wording change
+// now means calling POST /preview-image again.
 
 router.post("/resolve-product-image", resolveProductImage);
 
