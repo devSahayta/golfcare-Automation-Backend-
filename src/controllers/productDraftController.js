@@ -12,108 +12,15 @@
 // StaffUser session tied to it). Validity (exists, still PENDING, not
 // expired) is re-checked on the POST independently of what the GET
 // rendered, since the two requests can be minutes apart.
+//
+// The actual approve/reject + Shopify-publish logic lives in
+// services/productDraftService.js, shared with the staff dashboard
+// (controllers/productImportController.js) — this file just handles the
+// token lookup/expiry check that's specific to the emailed link, same
+// split as Module 6's dynamicTemplateController.js / campaignTemplateService.js.
 
-const axios = require("axios");
 const { prisma } = require("../lib/prisma");
-const { env } = require("../config/env");
-const { getValidAccessToken } = require("../services/shopifyAuth");
-const { publishProduct } = require("../services/shopifyProductCreate");
-const { handleProductUpsert } = require("./shopifyWebhookController");
-
-const SHOPIFY_API_VERSION = "2024-10";
-
-// Same fakeReqRes pattern shopifyProductImport.js already uses to reuse
-// handleProductUpsert outside of an actual webhook delivery.
-function fakeReqRes(product) {
-  return { req: { body: product }, res: { status: () => ({ send: () => {} }) } };
-}
-
-// Syncs the just-approved product into our own Product/Variant tables
-// immediately, rather than waiting on Shopify's products/update webhook —
-// this session already saw webhook timing/delivery-target mismatches
-// (local dev vs deployed instance) cause real drift, and the
-// SupplierProduct link this function creates needs the local ids to
-// exist right now, not whenever the webhook happens to land. Also where a
-// brand-new product's margin/GST/cost-price finally get a home — they've
-// been sitting in ProductDraft.rawPayload since create_product_draft
-// couldn't create this link itself (no local Product/Variant existed yet).
-async function linkSupplierToApprovedProduct(draft) {
-  if (!draft.supplierId || !draft.shopifyDraftProductId) return;
-
-  const accessToken = await getValidAccessToken();
-  const client = axios.create({
-    baseURL: `https://${env.shopify.shopDomain}/admin/api/${SHOPIFY_API_VERSION}`,
-    headers: { "X-Shopify-Access-Token": accessToken },
-    timeout: 15000,
-  });
-  const res = await client.get(`/products/${draft.shopifyDraftProductId}.json`);
-  const shopifyProduct = res.data.product;
-
-  const { req, res: fakeRes } = fakeReqRes(shopifyProduct);
-  await handleProductUpsert(req, fakeRes);
-
-  const localProduct = await prisma.product.findUnique({
-    where: { shopifyProductId: draft.shopifyDraftProductId },
-  });
-  if (!localProduct) return; // upsert failed silently somehow — nothing to link
-
-  // Was findFirst (one variant only) — a real gap for a bulk-import
-  // multi-variant draft (e.g. a belt in 4 colors): the other 3 variants
-  // synced into Variant via handleProductUpsert above but never got a
-  // SupplierProduct row, so they had no margin/GST/cost recorded. Loops
-  // every real variant now; a single-variant draft (the normal one-by-one
-  // case) just has one to loop over, so this doesn't change behavior
-  // there at all.
-  const localVariants = await prisma.variant.findMany({ where: { productId: localProduct.id } });
-  if (localVariants.length === 0) return;
-
-  const p = draft.rawPayload || {};
-  // Bulk-import drafts carry a real per-variant breakdown in
-  // rawPayload.variants (see productImportDrain.js). A plain one-by-one
-  // draft has no such field — treat it as a single implied "variant"
-  // using the existing top-level fields, so the loop below handles both
-  // shapes with the same code instead of branching.
-  const payloadVariants =
-    Array.isArray(p.variants) && p.variants.length > 0
-      ? p.variants
-      : [{ sku: p.sku || null, value: null, mrp: p.price ?? null, costPrice: p.costPrice ?? null }];
-
-  for (let i = 0; i < localVariants.length; i++) {
-    const localVariant = localVariants[i];
-    const alreadyLinked = await prisma.supplierProduct.findFirst({
-      where: { supplierId: draft.supplierId, variantId: localVariant.id },
-    });
-    if (alreadyLinked) continue;
-
-    // Match this real Shopify variant back to its own cost/sku — by SKU
-    // first (most reliable), falling back to its option value (the
-    // color/size word), falling back to positional order for a
-    // single-variant draft where neither is ambiguous anyway.
-    const match =
-      payloadVariants.find((v) => v.sku && localVariant.sku && v.sku === localVariant.sku) ||
-      payloadVariants.find((v) => v.value && localVariant.optionValues?.option1 === v.value) ||
-      payloadVariants[i] ||
-      payloadVariants[0];
-
-    await prisma.supplierProduct.create({
-      data: {
-        supplierId: draft.supplierId,
-        productId: localProduct.id,
-        variantId: localVariant.id,
-        supplierSku: match.sku || localVariant.sku || null,
-        costPrice: match.costPrice ?? null,
-        // Margin/GST are a per-product (not per-variant) rate — same
-        // value for every variant of this draft, matching how they were
-        // collected (see ProductImportItem.marginPercent/gstPercent).
-        marginPercent: p.marginPercent ?? null,
-        gstPercent: p.gstPercent ?? null,
-        isPrimary: i === 0,
-        lastConfirmedStatus: "IN_STOCK",
-        lastConfirmedAt: new Date(),
-      },
-    });
-  }
-}
+const { approveAndPublish, reject } = require("../services/productDraftService");
 
 function escapeHtml(str) {
   return String(str ?? "").replace(
@@ -196,26 +103,7 @@ async function approveDraft(req, res) {
   }
 
   try {
-    if (draft.shopifyDraftProductId) {
-      await publishProduct(draft.shopifyDraftProductId);
-    }
-    await prisma.productDraft.update({
-      where: { id: draft.id },
-      data: { approvalStatus: "APPROVED", approvedVia: "EMAIL", decidedAt: new Date() },
-    });
-
-    try {
-      await linkSupplierToApprovedProduct(draft);
-    } catch (linkErr) {
-      // The product itself is live either way — a missed supplier link
-      // means margin/GST/cost-price won't be on file yet, worth knowing
-      // about but not worth failing the whole approval over.
-      console.error(
-        "[productDraftController] linkSupplierToApprovedProduct failed:",
-        linkErr.response?.data || linkErr.message,
-      );
-    }
-
+    await approveAndPublish(draft.id, { approvedVia: "EMAIL" });
     res.send(page("<h2>Approved</h2><p>The product is now live on Shopify.</p>"));
   } catch (err) {
     console.error("[productDraftController] approve failed:", err.response?.data || err.message);
@@ -230,12 +118,7 @@ async function rejectDraft(req, res) {
     return res.status(error === "not_found" ? 404 : 409).send(page(`<h2>Can't reject</h2><p>${error}</p>`));
   }
 
-  // Left as an unpublished Shopify draft rather than deleted — reversible,
-  // a human can still revisit it directly in Shopify if this was a mistake.
-  await prisma.productDraft.update({
-    where: { id: draft.id },
-    data: { approvalStatus: "REJECTED", approvedVia: "EMAIL", decidedAt: new Date() },
-  });
+  await reject(draft.id, { approvedVia: "EMAIL" });
   res.send(page("<h2>Rejected</h2><p>The draft was left unpublished on Shopify.</p>"));
 }
 
