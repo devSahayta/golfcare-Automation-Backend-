@@ -70,6 +70,39 @@ function runGuardrails({ draftText, toolCallLog, context }) {
     }
   }
 
+  // Confirmed live (2026-10-23, real supplier conversation): a document
+  // submission — now ALWAYS routed through start_bulk_product_import
+  // regardless of size (see supplierAgentConfig.js) — got the model
+  // replying "received and is being processed" with toolCalls: [] on the
+  // logged message. The check above can't catch this: pendingProductLeads
+  // is populated by the one-by-one flow's own conversational tracking,
+  // which a document submission never touches, so pendingLeads.length was
+  // 0 and the whole check never activated. No ProductImportBatch was ever
+  // created — the supplier was told something was happening that wasn't.
+  //
+  // Separate check, same self-heal-retry contract: if the most recent
+  // inbound message carried an attachment (same "[Attached file" marker
+  // everywhere else keys off) and this reply sounds like something got
+  // done, require SOME real attachment-handling tool call this turn — not
+  // specifically start_bulk_product_import, since the same attachment
+  // could legitimately be a stock-status document handled via
+  // reconcile_stock_list/confirm_all_pending_items instead (see the
+  // Attachments section telling the two apart) — either is a genuine real
+  // action, so this only blocks a reply that claims something happened
+  // while having taken NO real action on the attachment at all.
+  const lastInbound = [...(context.recentMessages || [])].reverse().find((m) => m.direction === "INBOUND");
+  const hasAttachmentThisTurn = Boolean(lastInbound?.body?.includes("[Attached file"));
+  if (hasAttachmentThisTurn && COMPLETION_MARKERS.test(draftText)) {
+    const ATTACHMENT_ACTION_TOOLS = ["start_bulk_product_import", "reconcile_stock_list", "confirm_all_pending_items", "escalate_to_human"];
+    const tookRealAction = calls.some((c) => ATTACHMENT_ACTION_TOOLS.includes(c.tool) && !c.output?.error);
+    if (!tookRealAction) {
+      return {
+        action: "block",
+        reason: "claims the attached document was processed/queued without a real start_bulk_product_import, reconcile_stock_list, confirm_all_pending_items, or escalate_to_human call this turn",
+      };
+    }
+  }
+
   // Confirmed live, same failure shape as the new-product one above: a
   // check-in item that came back "ambiguous" from reconcile_stock_list
   // (matched more than one catalog candidate, nothing actually applied)
