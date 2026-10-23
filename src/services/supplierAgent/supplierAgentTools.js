@@ -656,6 +656,7 @@ function buildSupplierAgentTools(context) {
           conversationId: context.conversation.id,
           rateRules: cleanRates,
           rawDocumentText: documentText,
+          sourceMediaUrl: attachmentMsg.mediaUrl || null,
           status: "PENDING_EXTRACTION",
         },
       });

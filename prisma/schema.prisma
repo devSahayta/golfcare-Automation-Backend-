@@ -538,6 +538,13 @@ model ProductImportBatch {
   // the supplier sent. The live chat turn never has to parse this itself;
   // see start_bulk_product_import in supplierAgentTools.js for why.
   rawDocumentText String?
+  // The original WhatsApp attachment's own Message.mediaUrl, captured at
+  // batch-creation time (start_bulk_product_import). rawDocumentText above
+  // is TEXT ONLY — this is what lets the scheduler's extraction step go
+  // back and pull the raw PDF bytes themselves later, to extract embedded
+  // product photos per page/variant (see pdfImageExtractor.js, scheduler
+  // repo). Null for batches created before this existed.
+  sourceMediaUrl  String?
   // Margin/GST are NOT one blanket rate for the whole document — a
   // supplier catalog commonly spans several brands/categories with
   // different rates each. rateRules: [{brand, category, marginPercent,
