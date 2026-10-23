@@ -142,7 +142,7 @@ const tools = [
   {
     name: "start_bulk_product_import",
     description:
-      "Queue the document already attached in this conversation for background bulk onboarding — use for a LARGE catalog/price list (roughly 15+ new products at once; below that, use create_product_draft one at a time instead). Use this when a supplier sends a document that's genuinely a new-product catalog, not a stock-status reply (see the Attachments section on telling the two apart). You do NOT list the products yourself here — don't try to type out or summarize the catalog's rows; this tool finds the attachment and reads it server-side. Parsing the document and creating products happens entirely in the background over the next while — tell the supplier their list was received and is being processed, do NOT wait for or promise an immediate result, and don't call create_product_draft for any of these items yourself.\n\nMargin and GST are NOT one blanket number for the whole document — a catalog spanning several brands or categories (apparel vs bags vs accessories, or one brand vs another) commonly has a different rate per group. Ask the supplier directly whether their margin/GST is the same across everything in this document, or varies — don't just assume it's uniform. If they confirm it's the same for everything, pass ONE rule with brand and category both left out (that becomes the default for every item). If it varies, pass one rule per group they actually gave you a rate for (brand and/or category set on each). Any product in the document that doesn't match any rule you pass will be held back rather than drafted with a guessed rate — so if the supplier's answer doesn't clearly cover everything in the document, say so and ask what rate applies to the rest, rather than passing just the parts you have.",
+      "Queue the document already attached in this conversation for background bulk onboarding — use this any time a supplier sends a document/attachment that's genuinely a new-product catalog or price list, no matter how many products it contains (even just one). create_product_draft is NEVER used for anything that arrived as an attached document — only for a product the supplier mentions directly in chat text, with no attachment. Use this when a supplier sends a document that's genuinely a new-product catalog, not a stock-status reply (see the Attachments section on telling the two apart). You do NOT list the products yourself here — don't try to type out or summarize the catalog's rows; this tool finds the attachment and reads it server-side. Parsing the document and creating products happens entirely in the background over the next while — tell the supplier their list was received and is being processed, do NOT wait for or promise an immediate result, and don't call create_product_draft for any of these items yourself.\n\nMargin and GST are NOT one blanket number for the whole document — a catalog spanning several brands or categories (apparel vs bags vs accessories, or one brand vs another) commonly has a different rate per group. Ask the supplier directly whether their margin/GST is the same across everything in this document, or varies — don't just assume it's uniform. If they confirm it's the same for everything, pass ONE rule with brand and category both left out (that becomes the default for every item). If it varies, pass one rule per group they actually gave you a rate for (brand and/or category set on each). Any product in the document that doesn't match any rule you pass will be held back rather than drafted with a guessed rate — so if the supplier's answer doesn't clearly cover everything in the document, say so and ask what rate applies to the rest, rather than passing just the parts you have.",
     input_schema: {
       type: "object",
       properties: {
@@ -328,11 +328,12 @@ New products: if the supplier mentions (in plain text, or as an unmatched row fr
 a product that Golf Care doesn't carry yet, don't just brush it off — actively try to onboard
 it.
 
-A LARGE catalog/price list (roughly 15+ new products at once — a brand's full price sheet,
-not a few items mentioned in chat) is a different case from onboarding one product at a time.
-Creating dozens or hundreds of drafts one by one in this same reply is too slow and expensive
-to do inline, and there's no practical way to ask about each item's margin/GST individually at
-that volume anyway. For this case:
+A product mentioned via an ATTACHED DOCUMENT (the message contains "[Attached file —
+extracted contents below]") is a different case from a product the supplier just mentions in
+chat text — regardless of how many products are actually in that document, even just one.
+A document always means real embedded product photos and real structured rows worth reading
+server-side rather than guessing from a chat summary, so this case ALWAYS uses bulk import,
+never the one-by-one flow below, no matter how short the list is:
 - Ask the supplier about margin % and GST % — do NOT assume one rate covers everything. A
   catalog spanning several brands or categories often has a different rate per group; ask
   whether it's the same across the whole document or varies by brand/category, and only treat
@@ -343,11 +344,12 @@ that volume anyway. For this case:
   for background processing — it does NOT create drafts immediately. Tell the supplier you've
   received the list and it's being processed; don't wait for or claim an immediate result, and
   don't ALSO call create_product_draft for the same items.
-- Below that size, or when the supplier mentions a handful of new products one at a time in
-  chat, use the one-by-one flow below instead — it's cheaper and gives the supplier a real
-  answer immediately, which bulk import deliberately doesn't.
+- When the supplier mentions a new product directly in chat text instead — no document
+  attached at all — use the one-by-one flow below instead; there's no attachment for bulk
+  import to read, and it gives the supplier a real answer immediately, which bulk import
+  deliberately doesn't.
 
-One-by-one flow, for a small number of new products:
+One-by-one flow, for a new product the supplier mentions directly in chat (no document attached):
 1. Ask them for a price (MRP), margin %, and GST % at minimum — all three are required for a
    new product, no "ask once and remember" shortcut applies here since there's nothing on
    file yet. Also ask for a brand, category, SKU, size/variant details, stock quantity, and a
