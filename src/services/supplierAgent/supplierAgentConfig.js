@@ -76,7 +76,7 @@ const tools = [
   {
     name: "create_product_draft",
     description:
-      "Create a new product that isn't in the catalog yet, as an unpublished Shopify draft pending human approval — never goes live on its own. Requires a title, a real MRP, AND both marginPercent and gstPercent (unlike existing products, a brand-new one has nothing already on file, so these can't be skipped) — if you can't get any of these, use escalate_to_human instead of guessing. Call it ONCE per product — if it returns draft_already_exists, that product has already been submitted, don't call it again for the same thing. It also double-checks against Golf Care's whole catalog (not just this supplier's known items) — if it turns out this 'new' product already exists, it links this supplier to it and updates stock/pricing instead of creating a duplicate; you'll get back productAlreadyExisted: true in that case, not an error — just relay that to the supplier normally.",
+      "Create a new product that isn't in the catalog yet, as an unpublished Shopify draft pending human approval — never goes live on its own. Requires a title, a real MRP, AND both marginPercent and gstPercent (unlike existing products, a brand-new one has nothing already on file, so these can't be skipped) — if you can't get any of these, use escalate_to_human instead of guessing. Also requires a brand that's actually on THIS supplier's own allowed-brands list — if it returns brand_not_allowed, this supplier isn't authorized for that brand (or none could be identified at all); don't retry with a guessed brand, tell the supplier and call escalate_to_human so staff can confirm/update their brand list. Call it ONCE per product — if it returns draft_already_exists, that product has already been submitted, don't call it again for the same thing. It also double-checks against Golf Care's whole catalog (not just this supplier's known items) — if it turns out this 'new' product already exists, it links this supplier to it and updates stock/pricing instead of creating a duplicate; you'll get back productAlreadyExisted: true in that case, not an error — just relay that to the supplier normally.",
     input_schema: {
       type: "object",
       properties: {
@@ -383,7 +383,9 @@ One-by-one flow, for a new product the supplier mentions directly in chat (no do
    in this reply, don't say a product is created, live, added, or set up — say what's still
    needed instead (price/margin/GST, or a clarifying question).
 7. Call create_product_draft at most once per product. If it comes back with
-   draft_already_exists, that one's done — move on, don't retry it.
+   draft_already_exists, that one's done — move on, don't retry it. If it comes back with
+   brand_not_allowed, don't retry with a different/guessed brand — tell the supplier this
+   brand isn't yet authorized on their account and call escalate_to_human so staff can confirm.
 8. Check imageIncluded in the result — some external sources block Shopify's own image fetch
    even when a real imageUrl was found and sent (confirmed live: Titleist's own product CDN
    did this silently, no error, just an empty result). If it comes back false, don't tell the

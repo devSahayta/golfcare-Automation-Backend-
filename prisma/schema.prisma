@@ -521,6 +521,12 @@ enum ImportItemStatus {
   // queue/was approved, don't draft it again"). resultProductDraftId
   // points at that existing draft for traceability.
   ALREADY_DRAFTED
+  // This item's brand isn't in the supplier's own Supplier.brands list (or
+  // no brand could be confidently identified at all) — held back for a
+  // human to confirm/update the supplier's brand list rather than let a
+  // supplier draft a brand they're not actually authorized to supply.
+  // Counted in ProductImportBatch.needsBrandReviewCount.
+  NEEDS_BRAND_REVIEW
 }
 
 // A supplier sending a large catalog/price list (many new products at
@@ -541,6 +547,8 @@ model ProductImportBatch {
   // Items extraction couldn't match to any rate rule below — held back,
   // not drafted with a guessed rate. See ImportItemStatus.NEEDS_RATE.
   needsRateCount  Int               @default(0)
+  // See ImportItemStatus.NEEDS_BRAND_REVIEW.
+  needsBrandReviewCount Int         @default(0)
   status          ImportBatchStatus @default(PENDING_EXTRACTION)
   // Set at creation (PENDING_EXTRACTION), consumed once by the scheduler's
   // extraction step (jobs/productImportDrain.js) — the raw document text

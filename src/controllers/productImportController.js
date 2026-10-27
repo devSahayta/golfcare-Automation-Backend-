@@ -268,7 +268,7 @@ async function getSummary(req, res) {
       prisma.productDraft.count({ where: { approvalStatus: "PENDING" } }),
       prisma.productImportBatch.count({ where: { status: { in: ["PENDING_EXTRACTION", "PROCESSING"] } } }),
       prisma.productImportBatch.aggregate({
-        _sum: { draftedCount: true, linkedCount: true, needsRateCount: true, failedCount: true },
+        _sum: { draftedCount: true, linkedCount: true, needsRateCount: true, needsBrandReviewCount: true, failedCount: true },
       }),
       prisma.agentUsage.aggregate({
         where: { agentName: BULK_AGENT_NAME },
@@ -282,6 +282,7 @@ async function getSummary(req, res) {
       totalDrafted: batchTotals._sum.draftedCount || 0,
       totalLinked: batchTotals._sum.linkedCount || 0,
       totalNeedsRate: batchTotals._sum.needsRateCount || 0,
+      totalNeedsBrandReview: batchTotals._sum.needsBrandReviewCount || 0,
       totalFailed: batchTotals._sum.failedCount || 0,
       totalCostUsd: Number(usage._sum.costUsd || 0),
       totalCostInr: Number(usage._sum.costInr || 0),
