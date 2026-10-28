@@ -382,6 +382,23 @@ function buildSupplierAgentTools(context) {
         return { error: "sourceType_required" };
       }
 
+      // A supplier should only ever draft brands on their own
+      // Supplier.brands list (confirmed business rule — see
+      // supplierProductBackfill.js's header comment: "a brand belongs to
+      // exactly one supplier"). An unidentified brand is treated the same
+      // as a disallowed one — never assume it's fine just because it
+      // can't be confirmed. Checked before any DB/Shopify work, same
+      // validate-first posture as the checks above.
+      const brandAllowed = brand && supplier.brands.some((b) => b.toLowerCase() === brand.toLowerCase());
+      if (!brandAllowed) {
+        return {
+          error: "brand_not_allowed",
+          message: brand
+            ? `This supplier isn't set up to supply "${brand}" (not in their allowed brands list) — tell them this brand needs to be added to their account first, and call escalate_to_human so staff can confirm and update it.`
+            : "No brand could be identified for this product — ask the supplier which brand this is before drafting it, or call escalate_to_human if they genuinely can't say.",
+        };
+      }
+
       // The extracted text of a whole sheet sits in conversation history
       // and can get "renoticed" by the model on a later, unrelated turn —
       // this happened for real (the same ~10-item sheet got reconciled
