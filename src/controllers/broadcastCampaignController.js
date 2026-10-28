@@ -1,26 +1,35 @@
 // src/controllers/broadcastCampaignController.js
 //
 // REST endpoints for the broadcast campaign card in the Insights widget.
-// The agent ONLY creates DRAFT rows. Every state transition after that
-// (submit → Meta, send, cancel) is a button click from a logged-in staff
-// member through these endpoints — never the LLM.
+// The agent creates DRAFT rows, and — as of the schedule_campaign_broadcast
+// tool (see insightsAgentTools.js) — can also submit a draft to Meta and
+// lock in a staff-requested send time on the staff member's explicit
+// verbal confirmation, the same way save_campaign_draft already acts on a
+// verbal "save it". "Send now" and "cancel" are still button-only from the
+// dashboard; the agent never sends or cancels.
 //
 // Flow:
-//   DRAFT ──(POST /submit)──► SUBMITTED ──(Meta approves)──► READY
+//   DRAFT ──(POST /submit, or the agent)──► SUBMITTED ──(Meta approves)──► READY
 //   READY ──(POST /send)────► SCHEDULED ──(Samvaadik delivers)──► COMPLETED
+//   DRAFT ──(agent: schedule_campaign_broadcast)──► PENDING_SCHEDULE
+//     ──(Meta approves, picked up by the scheduler's broadcastSchedulePoll
+//        job — see golfcare-scheduler/src/jobs/broadcastSchedulePoll.js)──►
+//     SCHEDULED ──(Samvaadik delivers)──► COMPLETED
 //   Any non-COMPLETED ──(POST /cancel)──► CANCELLED
 //
-// Status is polled by the frontend card via GET /:id — it reads
-// Samvaadik's batch status fresh every time so the card stays live
-// without a background job.
+// Status is polled by the frontend card via GET /:id, which still does a
+// live Meta/send-status check on each view — but that's no longer the
+// only thing advancing a campaign. A campaign sitting in SUBMITTED or
+// PENDING_SCHEDULE with nobody watching the dashboard (the whole point of
+// scheduling by voice through the agent) is now also advanced by the
+// scheduler's background poll, same pattern templateStatusPoll.js already
+// uses for DynamicTemplate.
 
+const { waitUntil } = require("@vercel/functions");
 const { prisma } = require("../lib/prisma");
 const {
-  createTemplate,
   getTemplateStatus,
-  scheduleTemplateMessage,
   listScheduledMessages,
-  uploadMediaFromUrl,
 } = require("../lib/samvaadik/adapter");
 const {
   generateRawProductCampaignImage,
@@ -31,18 +40,26 @@ const {
   getProductPhotosByTitles,
 } = require("../services/productImageMatchService");
 const { logUsage } = require("../services/agentEngine/logger");
+const {
+  submitBroadcastCampaignToMeta,
+  SubmitError,
+} = require("../services/broadcastSubmitService");
+const {
+  prepareFanOut,
+  fanOutBroadcastCampaign,
+  prepareRetry,
+  retryFailedRecipients,
+} = require("../services/broadcastFanOutService");
 
-const BATCH_SIZE = 10; // schedule this many recipients per loop iteration
-const SEND_DELAY_MS = 300; // ms between batches — stay well under Samvaadik rate limits
 const TIMEZONE = process.env.SCHEDULER_TIMEZONE || "Asia/Kolkata";
 const QUIET_HOURS_START = Number(process.env.CAMPAIGN_QUIET_HOURS_START ?? 21);
 const QUIET_HOURS_END = Number(process.env.CAMPAIGN_QUIET_HOURS_END ?? 8);
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+// function sleep(ms) {
+//   return new Promise((r) => setTimeout(r, ms));
+// }
 
 function getLocalHour(timeZone) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -162,7 +179,15 @@ async function getCampaign(req, res) {
     // ── Live Meta approval check while SUBMITTED ──────────────────────
     if (campaign.status === "SUBMITTED" && campaign.samvaadikWtId) {
       try {
-        const tplStatus = await getTemplateStatus(campaign.samvaadikWtId);
+        // Short timeout here — this call runs synchronously inside a
+        // Vercel request handler the dashboard polls every 6s. 5s leaves
+        // headroom under Vercel's 10s function limit for the DB writes and
+        // response below; a slow/hung Samvaadik just means this poll tick
+        // falls through to the catch and returns last-known DB state
+        // instead of risking a platform-level 504.
+        const tplStatus = await getTemplateStatus(campaign.samvaadikWtId, {
+          timeoutMs: 5000,
+        });
         if (
           tplStatus.status === "APPROVED" &&
           campaign.metaStatus !== "META_APPROVED"
@@ -217,22 +242,20 @@ async function getCampaign(req, res) {
     // ── Live send-progress refresh while SCHEDULED ───────────────────
     if (campaign.status === "SCHEDULED" && campaign.id) {
       try {
+        // Same reasoning as the getTemplateStatus call above — short
+        // timeout so a slow Samvaadik degrades to "stale but correct" data
+        // instead of risking Vercel killing the whole function at 10s.
         const { rows } = await listScheduledMessages({
           batchId: campaign.id,
           limit: 200,
+          timeoutMs: 5000,
         });
-        let sentCount = 0,
-          failedCount = 0,
-          pendingCount = 0;
         const smStatusMap = new Map();
-        for (const row of rows) {
-          smStatusMap.set(row.sm_id, row);
-          if (row.status === "sent") sentCount++;
-          else if (row.status === "failed") failedCount++;
-          else pendingCount++;
-        }
+        for (const row of rows) smStatusMap.set(row.sm_id, row);
 
-        // Update individual recipient rows
+        // Update individual recipient rows — scoped to each recipient's
+        // OWN current samvaadikSmId only, so an older superseded sm_id
+        // from a previous failed attempt is never looked at here.
         const recipients = campaign.BroadcastRecipient.filter(
           (r) => r.samvaadikSmId && smStatusMap.has(r.samvaadikSmId),
         );
@@ -257,6 +280,29 @@ async function getCampaign(req, res) {
             });
           }
         }
+
+        // Recompute totals from the DB's current recipient rows, NOT from
+        // the raw Samvaadik batch list above. retryFailedRecipients reuses
+        // the same batchId (=campaignId) on every retry, and Samvaadik's
+        // /v1/messages/schedule?batch_id=... list keeps returning entries
+        // from EARLIER, now-superseded attempts too — summing those raw
+        // rows meant a retried campaign could carry a phantom "pending"
+        // forever and never reach pendingCount === 0, exactly what you're
+        // seeing stuck on SCHEDULED. Counting DB status instead only ever
+        // reflects each recipient's current attempt (already updated
+        // above), so a retry can never leave a stale pending behind. Same
+        // pattern the scheduler's pollBroadcastSendStatus already uses.
+        const [sentCount, failedCount, pendingCount] = await Promise.all([
+          prisma.broadcastRecipient.count({
+            where: { campaignId: campaign.id, status: "SENT" },
+          }),
+          prisma.broadcastRecipient.count({
+            where: { campaignId: campaign.id, status: "FAILED" },
+          }),
+          prisma.broadcastRecipient.count({
+            where: { campaignId: campaign.id, status: "SCHEDULED" },
+          }),
+        ]);
 
         // Update campaign totals
         await prisma.broadcastCampaign.update({
@@ -295,180 +341,26 @@ async function submitCampaign(req, res) {
   const staffId = req.staffUser?.id;
 
   try {
-    const campaign = await prisma.broadcastCampaign.findUnique({
-      where: { id: campaignId },
-    });
-    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
-    if (campaign.status !== "DRAFT") {
-      return res.status(409).json({
-        error: `Cannot submit — campaign is already ${campaign.status}`,
-      });
-    }
-
-    // ── Build template options ────────────────────────────────────────────
-    //
-    // Three possible header paths:
-    //   NONE  — no header at all
-    //   TEXT  — plain text header (already stored in campaign.headerText)
-    //   IMAGE — generate a golf scene via Flux 1.1 Pro, upload to Meta, use
-    //           the returned headerHandle in the template
-
-    const templateOptions = {
-      language: "en_US",
-      bodyExamples: ["Friend"],
-    };
-
-    if (campaign.footerText) {
-      templateOptions.footerText = campaign.footerText;
-    }
-    if (campaign.buttons && campaign.buttons.length > 0) {
-      templateOptions.buttons = campaign.buttons;
-    }
-
-    // ── TEXT header ───────────────────────────────────────────────────────
-    if (campaign.headerType === "TEXT" && campaign.headerText) {
-      templateOptions.headerFormat = "TEXT";
-      templateOptions.headerText = campaign.headerText;
-    }
-
-    // ── IMAGE header ──────────────────────────────────────────────────────
-    else if (campaign.headerType === "IMAGE") {
-      console.log(
-        `[submitCampaign] IMAGE header requested for campaign "${campaign.name}"`,
-      );
-
-      // Step 1: Use pre-generated image if staff already previewed one in the
-      // Insights widget (headerImageUrl stored at draft time). This avoids
-      // regenerating and ensures the submitted image matches what staff saw.
-      // Only regenerate if no preview image was saved.
-      let generatedImageUrl = campaign.headerImageUrl || null;
-
-      if (generatedImageUrl) {
-        console.log(
-          `[submitCampaign] Using pre-generated image from draft: ${generatedImageUrl}`,
-        );
-      } else {
-        console.log(
-          `[submitCampaign] No preview image found — generating now via FLUX.2 Pro`,
-        );
-        // No product titles are persisted on the BroadcastCampaign row (see
-        // prisma/schema.prisma), so a cold-regenerate here can only use the
-        // generic thematic path, same limitation that existed before this
-        // file switched models — staff should normally never hit this,
-        // since the preview step in the widget always saves headerImageUrl
-        // first.
-        // backdropHint = agentPrompt/category only — do NOT append bodyText.
-        // The WhatsApp message body is customer-facing copy, not scene
-        // direction, and injecting it into the image prompt corrupts
-        // generation ("Hi {{1}}, start 2025..." renders as visible text
-        // in the scene).
-        const backdropHint =
-          campaign.agentPrompt || campaign.category || "golf campaign";
-
-        try {
-          const { imageUrl } = await generateAIComposedCampaignImage({
-            campaignName: campaign.name,
-            backdropHint,
-          });
-          generatedImageUrl = imageUrl;
-        } catch (genErr) {
-          console.error(
-            "[submitCampaign] Image generation failed:",
-            genErr.message,
-          );
-          return res.status(500).json({
-            error: "Failed to generate header image",
-            details: genErr.message,
-            hint: "Check REPLICATE_API_TOKEN in .env. The campaign is still a DRAFT — fix the issue and retry.",
-          });
-        }
-      }
-
-      // Step 2: Upload the image URL to Meta via Samvaadik
-      // uploadMediaFromUrl returns { mediaId, headerHandle, headerFormat }
-      let uploadResult;
-      try {
-        const fileName = `${campaign.templateName}_header.jpg`;
-        uploadResult = await uploadMediaFromUrl({
-          url: generatedImageUrl,
-          fileName,
-          fileType: "image/jpeg",
-        });
-        console.log(
-          `[submitCampaign] Image uploaded to Meta — headerHandle: ${uploadResult.headerHandle}`,
-        );
-      } catch (uploadErr) {
-        console.error(
-          "[submitCampaign] Media upload failed:",
-          uploadErr.message,
-        );
-        return res.status(500).json({
-          error: "Failed to upload header image to Meta",
-          details: uploadErr.message,
-          hint: "Image was generated successfully but the Meta upload failed. Retry submission.",
-        });
-      }
-
-      // Step 3: Ensure the generated URL is stored in DB for reference
-      if (!campaign.headerImageUrl) {
-        await prisma.broadcastCampaign.update({
-          where: { id: campaignId },
-          data: { headerImageUrl: generatedImageUrl },
-        });
-      }
-
-      // Step 4: Pass the header handle into the template
-      templateOptions.headerFormat = "IMAGE";
-      templateOptions.headerHandle = uploadResult.headerHandle;
-      if (uploadResult.mediaId) {
-        templateOptions.mediaId = uploadResult.mediaId;
-      }
-    }
-
-    // ── Create the WhatsApp template on Meta via Samvaadik ────────────────
-    const result = await createTemplate(
-      campaign.templateName,
-      campaign.category,
-      campaign.bodyText,
-      templateOptions,
-    );
-
-    await prisma.broadcastCampaign.update({
-      where: { id: campaignId },
-      data: {
-        status: "SUBMITTED",
-        samvaadikWtId: result.wt_id,
-        metaStatus: "SUBMITTED",
-        metaSubmittedAt: new Date(),
-        confirmedAt: new Date(),
-      },
-    });
-
-    await writeAudit(
-      "TEMPLATE_SUBMITTED",
-      campaignId,
-      staffId,
-      { status: "DRAFT" },
-      {
-        status: "SUBMITTED",
-        wt_id: result.wt_id,
-        headerType: campaign.headerType,
-      },
-    );
-
+    const result = await submitBroadcastCampaignToMeta(campaignId, { staffId });
     return res.json({
       success: true,
       message:
         "Template submitted to Meta for approval. Check back in a few minutes.",
-      samvaadikWtId: result.wt_id,
-      metaStatus: result.status,
+      samvaadikWtId: result.samvaadikWtId,
+      metaStatus: result.metaStatus,
     });
   } catch (err) {
-    const detail = err.message;
-    console.error("submitCampaign error:", detail);
-    return res
-      .status(500)
-      .json({ error: "Failed to submit template to Meta", details: detail });
+    console.error("submitCampaign error:", err.message);
+    if (err instanceof SubmitError) {
+      return res.status(err.status).json({
+        error: err.message,
+        ...(err.hint && { hint: err.hint }),
+      });
+    }
+    return res.status(500).json({
+      error: "Failed to submit template to Meta",
+      details: err.message,
+    });
   }
 }
 
@@ -481,175 +373,52 @@ async function sendCampaign(req, res) {
   try {
     const campaign = await prisma.broadcastCampaign.findUnique({
       where: { id: campaignId },
-      include: {
-        BroadcastRecipient: {
-          where: { status: "PENDING" },
-          select: { id: true, phone: true, firstName: true, customerId: true },
-        },
-      },
+      select: { status: true },
     });
-
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
     if (campaign.status !== "READY") {
       return res.status(409).json({
         error: `Cannot send — campaign status is ${campaign.status}. It must be READY (Meta-approved).`,
       });
     }
-    if (!campaign.samvaadikWtId) {
-      return res
-        .status(409)
-        .json({ error: "No Samvaadik template ID — submit to Meta first." });
-    }
 
-    // Re-check consent for every pending recipient (consent may have changed
-    // since draft time — customer may have replied STOP in the interim)
-    const customerIds = campaign.BroadcastRecipient.map((r) => r.customerId);
-    const freshCustomers = await prisma.customer.findMany({
-      where: { id: { in: customerIds } },
-      select: { id: true, consentMarketing: true, optedOutAt: true },
-    });
-    const consentMap = new Map(freshCustomers.map((c) => [c.id, c]));
-
-    const eligible = [];
-    const skipped = [];
-    for (const r of campaign.BroadcastRecipient) {
-      const c = consentMap.get(r.customerId);
-      if (!c) {
-        skipped.push({ id: r.id, reason: "customer_not_found" });
-        continue;
-      }
-      if (c.optedOutAt) {
-        skipped.push({ id: r.id, reason: "opted_out" });
-        continue;
-      }
-      if (!c.consentMarketing) {
-        skipped.push({ id: r.id, reason: "no_consent" });
-        continue;
-      }
-      eligible.push(r);
-    }
-
-    // Mark skipped recipients up front
-    if (skipped.length > 0) {
-      await prisma.$transaction(
-        skipped.map((s) =>
-          prisma.broadcastRecipient.update({
-            where: { id: s.id },
-            data: { status: "SKIPPED", skipReason: s.reason },
-          }),
-        ),
-      );
-    }
-
-    if (eligible.length === 0) {
-      await prisma.broadcastCampaign.update({
-        where: { id: campaignId },
-        data: { status: "CANCELLED", skippedCount: skipped.length },
-      });
-      return res.status(409).json({
-        error:
-          "No eligible recipients remain — all were skipped due to consent/opt-out changes.",
-        skipped: skipped.length,
-      });
-    }
-
-    // Mark campaign SCHEDULED immediately so the card shows progress
     const sendAt = computeSendTime();
-    await prisma.broadcastCampaign.update({
-      where: { id: campaignId },
-      data: {
-        status: "SCHEDULED",
-        scheduledFor: sendAt,
-        skippedCount: skipped.length,
-      },
-    });
-
-    await writeAudit(
-      "SEND_INITIATED",
+    const prep = await prepareFanOut({
       campaignId,
+      sendAt,
+      timezone: TIMEZONE,
+      auditAction: "SEND_INITIATED",
       staffId,
-      { status: "READY" },
-      {
-        status: "SCHEDULED",
-        recipients: eligible.length,
-        skipped: skipped.length,
-      },
-    );
+    });
+    if (!prep.ok) {
+      return res.status(prep.status).json({
+        error: prep.error,
+        ...(prep.skipped != null && { skipped: prep.skipped }),
+      });
+    }
 
-    // Fan out scheduling in batches — don't await the whole loop in the HTTP
-    // response (Vercel 10s timeout). Respond immediately and run via
-    // setImmediate so the response goes out first.
+    // Respond immediately — the actual fan-out (one Samvaadik call per
+    // recipient, batched) runs after, via waitUntil() so Vercel keeps this
+    // invocation alive without holding up the response. See
+    // broadcastFanOutService.js for why plain setImmediate() isn't safe
+    // here.
     res.json({
       success: true,
-      message: `Scheduling ${eligible.length} messages. The card will show live progress.`,
-      scheduled: eligible.length,
-      skipped: skipped.length,
+      message: `Scheduling ${prep.eligible.length} messages. The card will show live progress.`,
+      scheduled: prep.eligible.length,
+      skipped: prep.skipped,
       scheduledFor: sendAt.toISOString(),
     });
 
-    // Fan-out (runs after response is sent)
-    setImmediate(async () => {
-      let scheduledOk = 0;
-      let scheduledFail = 0;
-
-      for (let i = 0; i < eligible.length; i += BATCH_SIZE) {
-        const batch = eligible.slice(i, i + BATCH_SIZE);
-
-        await Promise.all(
-          batch.map(async (r) => {
-            try {
-              const result = await scheduleTemplateMessage({
-                phone: r.phone,
-                contactName: r.firstName || undefined,
-                wtId: campaign.samvaadikWtId,
-                templateVariables: { 1: r.firstName || "there" },
-                scheduledAt: sendAt.toISOString(),
-                timezone: TIMEZONE,
-                batchId: campaignId, // batch_id = campaign id for easy polling
-              });
-
-              await prisma.broadcastRecipient.update({
-                where: { id: r.id },
-                data: { status: "SCHEDULED", samvaadikSmId: result.sm_id },
-              });
-              scheduledOk++;
-            } catch (err) {
-              console.error(
-                `[sendCampaign] schedule failed for recipient ${r.id}:`,
-                err.message,
-              );
-              await prisma.broadcastRecipient.update({
-                where: { id: r.id },
-                data: {
-                  status: "FAILED",
-                  errorMessage: err.message?.slice(0, 500),
-                },
-              });
-              scheduledFail++;
-            }
-          }),
-        );
-
-        if (i + BATCH_SIZE < eligible.length) await sleep(SEND_DELAY_MS);
-      }
-
-      // If everything failed at scheduling time, mark campaign FAILED
-      if (scheduledOk === 0 && scheduledFail > 0) {
-        await prisma.broadcastCampaign.update({
-          where: { id: campaignId },
-          data: { status: "FAILED", failedCount: scheduledFail },
-        });
-      } else {
-        await prisma.broadcastCampaign.update({
-          where: { id: campaignId },
-          data: { failedCount: scheduledFail },
-        });
-      }
-
-      console.log(
-        `[sendCampaign] campaign ${campaignId} fan-out done — ok:${scheduledOk} fail:${scheduledFail}`,
-      );
-    });
+    waitUntil(
+      fanOutBroadcastCampaign({
+        campaignId,
+        samvaadikWtId: prep.samvaadikWtId,
+        eligible: prep.eligible,
+        sendAt,
+        timezone: TIMEZONE,
+      }),
+    );
   } catch (err) {
     console.error("sendCampaign error:", err);
     return res
@@ -1210,184 +979,108 @@ async function scheduleCampaign(req, res) {
   }
 
   try {
-    // ── Load campaign + pending recipients ────────────────────────────────
     const campaign = await prisma.broadcastCampaign.findUnique({
       where: { id: campaignId },
-      include: {
-        BroadcastRecipient: {
-          where: { status: "PENDING" },
-          select: { id: true, phone: true, firstName: true, customerId: true },
-        },
-      },
+      select: { status: true },
     });
-
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
     if (campaign.status !== "READY") {
       return res.status(409).json({
         error: `Cannot schedule — campaign status is ${campaign.status}. It must be READY (Meta-approved).`,
       });
     }
-    if (!campaign.samvaadikWtId) {
-      return res.status(409).json({
-        error: "No Samvaadik template ID — submit to Meta first.",
-      });
-    }
 
-    // ── Re-check consent (same as sendCampaign — consent may have changed) ─
-    const customerIds = campaign.BroadcastRecipient.map((r) => r.customerId);
-    const freshCustomers = await prisma.customer.findMany({
-      where: { id: { in: customerIds } },
-      select: { id: true, consentMarketing: true, optedOutAt: true },
-    });
-    const consentMap = new Map(freshCustomers.map((c) => [c.id, c]));
-
-    const eligible = [];
-    const skipped = [];
-    for (const r of campaign.BroadcastRecipient) {
-      const c = consentMap.get(r.customerId);
-      if (!c) {
-        skipped.push({ id: r.id, reason: "customer_not_found" });
-        continue;
-      }
-      if (c.optedOutAt) {
-        skipped.push({ id: r.id, reason: "opted_out" });
-        continue;
-      }
-      if (!c.consentMarketing) {
-        skipped.push({ id: r.id, reason: "no_consent" });
-        continue;
-      }
-      eligible.push(r);
-    }
-
-    if (skipped.length > 0) {
-      await prisma.$transaction(
-        skipped.map((s) =>
-          prisma.broadcastRecipient.update({
-            where: { id: s.id },
-            data: { status: "SKIPPED", skipReason: s.reason },
-          }),
-        ),
-      );
-    }
-
-    if (eligible.length === 0) {
-      await prisma.broadcastCampaign.update({
-        where: { id: campaignId },
-        data: { status: "CANCELLED", skippedCount: skipped.length },
-      });
-      return res.status(409).json({
-        error:
-          "No eligible recipients remain — all were skipped due to consent/opt-out changes.",
-        skipped: skipped.length,
-      });
-    }
-
-    // ── Mark SCHEDULED immediately so the UI updates ──────────────────────
-    await prisma.broadcastCampaign.update({
-      where: { id: campaignId },
-      data: {
-        status: "SCHEDULED",
-        scheduledFor: effectiveSendAt,
-        skippedCount: skipped.length,
-      },
-    });
-
-    await writeAudit(
-      "SCHEDULE_INITIATED",
+    const prep = await prepareFanOut({
       campaignId,
+      sendAt: effectiveSendAt,
+      timezone: TIMEZONE,
+      auditAction: "SCHEDULE_INITIATED",
       staffId,
-      { status: "READY" },
-      {
-        status: "SCHEDULED",
-        scheduledFor: effectiveSendAt.toISOString(),
-        recipients: eligible.length,
-        skipped: skipped.length,
-        quietHoursAdjusted,
-      },
-    );
+    });
+    if (!prep.ok) {
+      return res.status(prep.status).json({
+        error: prep.error,
+        ...(prep.skipped != null && { skipped: prep.skipped }),
+      });
+    }
 
-    // ── Respond immediately — fan-out runs after ──────────────────────────
+    // ── Respond immediately — fan-out runs after, via waitUntil() (see
+    //    broadcastFanOutService.js) so Vercel can't freeze this instance
+    //    mid-loop the way a bare setImmediate() risked. ──────────────────
     res.json({
       success: true,
-      message: `Scheduled ${eligible.length} messages for ${effectiveSendAt.toISOString()}.`,
-      scheduled: eligible.length,
-      skipped: skipped.length,
+      message: `Scheduled ${prep.eligible.length} messages for ${effectiveSendAt.toISOString()}.`,
+      scheduled: prep.eligible.length,
+      skipped: prep.skipped,
       scheduledFor: effectiveSendAt.toISOString(),
       ...(quietHoursAdjusted && {
         warning: `Your chosen time was in quiet hours (${QUIET_HOURS_START}:00–${QUIET_HOURS_END}:00 IST). Send time moved to ${effectiveSendAt.toLocaleString("en-IN", { timeZone: TIMEZONE })}.`,
       }),
     });
 
-    // ── Fan-out: call Samvaadik for each recipient with scheduled_at ──────
-    //    Samvaadik queues the message and fires it at effectiveSendAt.
-    //    No polling loop, no PENDING_SCHEDULE, no cron needed.
-    setImmediate(async () => {
-      let scheduledOk = 0;
-      let scheduledFail = 0;
-
-      for (let i = 0; i < eligible.length; i += BATCH_SIZE) {
-        const batch = eligible.slice(i, i + BATCH_SIZE);
-
-        await Promise.all(
-          batch.map(async (r) => {
-            try {
-              const result = await scheduleTemplateMessage({
-                phone: r.phone,
-                contactName: r.firstName || undefined,
-                wtId: campaign.samvaadikWtId,
-                templateVariables: { 1: r.firstName || "there" },
-                scheduledAt: effectiveSendAt.toISOString(), // ← Samvaadik holds this
-                timezone: TIMEZONE,
-                batchId: campaignId,
-              });
-
-              await prisma.broadcastRecipient.update({
-                where: { id: r.id },
-                data: { status: "SCHEDULED", samvaadikSmId: result.sm_id },
-              });
-              scheduledOk++;
-            } catch (err) {
-              console.error(
-                `[scheduleCampaign] Samvaadik call failed for recipient ${r.id}:`,
-                err.message,
-              );
-              await prisma.broadcastRecipient.update({
-                where: { id: r.id },
-                data: {
-                  status: "FAILED",
-                  errorMessage: err.message?.slice(0, 500),
-                },
-              });
-              scheduledFail++;
-            }
-          }),
-        );
-
-        if (i + BATCH_SIZE < eligible.length) await sleep(SEND_DELAY_MS);
-      }
-
-      if (scheduledOk === 0 && scheduledFail > 0) {
-        await prisma.broadcastCampaign.update({
-          where: { id: campaignId },
-          data: { status: "FAILED", failedCount: scheduledFail },
-        });
-      } else {
-        await prisma.broadcastCampaign.update({
-          where: { id: campaignId },
-          data: { failedCount: scheduledFail },
-        });
-      }
-
-      console.log(
-        `[scheduleCampaign] campaign ${campaignId} fan-out done — ok:${scheduledOk} fail:${scheduledFail} scheduledFor:${effectiveSendAt.toISOString()}`,
-      );
-    });
+    waitUntil(
+      fanOutBroadcastCampaign({
+        campaignId,
+        samvaadikWtId: prep.samvaadikWtId,
+        eligible: prep.eligible,
+        sendAt: effectiveSendAt,
+        timezone: TIMEZONE,
+      }),
+    );
   } catch (err) {
     console.error("scheduleCampaign error:", err);
     return res
       .status(500)
       .json({ error: "Failed to schedule campaign", details: err.message });
+  }
+}
+
+// ── POST /api/broadcast-campaigns/:id/retry — staff clicks "Retry failed messages" ─
+//
+// Manual only for now (per explicit product decision) — staff reviews the
+// failures and decides whether retrying makes sense (a transient Samvaadik
+// error) vs. not (an invalid number, which will just fail again). Consent
+// is re-checked the same way a fresh send does, since time has passed.
+
+async function retryCampaign(req, res) {
+  const campaignId = req.params.id;
+  const staffId = req.staffUser?.id;
+
+  try {
+    const prep = await prepareRetry({ campaignId, staffId });
+    if (!prep.ok) {
+      return res.status(prep.status).json({
+        error: prep.error,
+        ...(prep.skipped != null && { skipped: prep.skipped }),
+      });
+    }
+
+    const sendAt = computeSendTime();
+
+    // Respond immediately — retry fan-out runs after via waitUntil(), same
+    // Vercel-safety reasoning as sendCampaign/scheduleCampaign above.
+    res.json({
+      success: true,
+      message: `Retrying ${prep.eligible.length} failed message(s).`,
+      retrying: prep.eligible.length,
+      skipped: prep.skipped,
+      atRetryCap: prep.atRetryCap,
+    });
+
+    waitUntil(
+      retryFailedRecipients({
+        campaignId,
+        samvaadikWtId: prep.samvaadikWtId,
+        eligible: prep.eligible,
+        sendAt,
+        timezone: TIMEZONE,
+      }),
+    );
+  } catch (err) {
+    console.error("retryCampaign error:", err);
+    return res
+      .status(500)
+      .json({ error: "Failed to retry campaign", details: err.message });
   }
 }
 
@@ -1402,4 +1095,5 @@ module.exports = {
   updateCampaignTemplate,
   previewCampaignImage,
   resolveProductImage,
+  retryCampaign,
 };

@@ -9,7 +9,7 @@
 const axios = require("axios");
 const { env } = require("../../config/env");
 
-function getClient() {
+function getClient(timeoutMs = 20000) {
   if (!env.samvaadik.baseUrl) {
     throw new Error(
       "Missing SAMVAADIK_API_BASE_URL env var in golfcare-backend.",
@@ -25,17 +25,26 @@ function getClient() {
       "X-API-Key": env.samvaadik.apiKey,
       "Content-Type": "application/json",
     },
-    timeout: 20000,
+    timeout: timeoutMs,
   });
 }
 
 /**
  * Wraps a Samvaadik API call so failures carry Samvaadik's actual error
  * body, not just a generic axios message.
+ *
+ * timeoutMs: override for call sites that run synchronously inside a
+ * Vercel request handler (e.g. getCampaign's live status poll), where the
+ * default 20s is dangerous — Vercel's Hobby plan kills the whole function
+ * at 10s, which is BEFORE axios's own 20s timeout would ever fire, turning
+ * a slow Samvaadik response into a hard 504 instead of a graceful
+ * fallback. Background callers (the scheduler's cron jobs, or anything
+ * wrapped in waitUntil()) aren't time-boxed by Vercel and can keep the
+ * full default.
  */
-async function callSamvaadik(fn) {
+async function callSamvaadik(fn, { timeoutMs } = {}) {
   try {
-    return await fn(getClient());
+    return await fn(getClient(timeoutMs));
   } catch (err) {
     const samvaadikError = err.response?.data;
     const status = err.response?.status;

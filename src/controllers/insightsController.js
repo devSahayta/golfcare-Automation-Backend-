@@ -9,6 +9,8 @@ const insightsAgentConfig = require("../services/insightsAgent/insightsAgentConf
 const { prisma } = require("../lib/prisma");
 const { env } = require("../config/env");
 
+const TIMEZONE = process.env.SCHEDULER_TIMEZONE || "Asia/Kolkata";
+
 const FALLBACK_REPLY =
   "I wasn't able to work that out — try rephrasing, or ask something more specific.";
 
@@ -124,7 +126,29 @@ async function askInsights(req, res) {
   const staffContext = req.staffUser
     ? `\n\nThe staff member talking to you right now is ${req.staffUser.name} (role: ${req.staffUser.role}). Greet them by name if it's their first message.`
     : "";
-  const systemPrompt = insightsAgentConfig.systemPrompt + staffContext;
+
+  // Ground "today", "tomorrow", "Monday 10am" etc. against the REAL current
+  // date/time — without this, STEP 5's scheduling instructions in
+  // insightsAgentConfig.js have nothing to resolve a relative date against,
+  // and the model falls back to guessing from its training distribution.
+  // Confirmed in production: a staff member asked to schedule for
+  // "12:55pm today" and the model resolved "today" to 2025-07-23 (over a
+  // year in the past), which schedule_campaign_broadcast correctly rejected
+  // as not-in-the-future — but the agent then told the staff member the
+  // wrong reason ("12:55pm has already passed") instead of the real one
+  // (it had the wrong date entirely), because it still didn't know the
+  // actual date even after the rejection. Injecting this every turn fixes
+  // both: the model gets the date right the first time, and if it's ever
+  // still off, this is in context so the real cause is visible.
+  const nowIST = new Date().toLocaleString("en-IN", {
+    timeZone: TIMEZONE,
+    dateStyle: "full",
+    timeStyle: "short",
+  });
+  const dateContext = `\n\nThe current date and time is ${nowIST} (${TIMEZONE}). Use this as the ground truth whenever you need to resolve "today", "tomorrow", a weekday name, or any other relative date/time — never guess or assume a date from anywhere else.`;
+
+  const systemPrompt =
+    insightsAgentConfig.systemPrompt + staffContext + dateContext;
 
   try {
     const result = await runToolLoop({
@@ -176,6 +200,31 @@ async function askInsights(req, res) {
       };
     }
 
+    // v2: extract savedCampaignData from save_campaign_draft tool call.
+    // When the agent saves on behalf of the staff member (verbal confirm),
+    // the frontend uses this to render a CampaignSavedCard with a redirect button.
+    let savedCampaignData = null;
+    const saveCall = result.toolCallLog
+      ?.slice()
+      .reverse()
+      .find(
+        (t) =>
+          t.tool === "save_campaign_draft" &&
+          t.output?.success === true &&
+          t.output?.action === "SHOW_SAVED_CAMPAIGN_CARD",
+      );
+    if (saveCall) {
+      savedCampaignData = {
+        id: saveCall.output.campaignId,
+        campaignId: saveCall.output.campaignId,
+        name: saveCall.output.campaignName,
+        campaignName: saveCall.output.campaignName,
+        audienceSize: saveCall.output.audienceSize,
+        headerType: saveCall.output.headerType || null,
+        headerImageUrl: saveCall.output.headerImageUrl || null,
+      };
+    }
+
     console.log(
       "[insights] toolCallLog:",
       JSON.stringify(
@@ -189,8 +238,13 @@ async function askInsights(req, res) {
       ),
     );
     console.log("[insights] contentPicker being returned:", contentPickerData);
+    console.log("[insights] savedCampaign being returned:", savedCampaignData);
 
-    res.json({ reply: result.finalText, contentPicker: contentPickerData });
+    res.json({
+      reply: result.finalText,
+      contentPicker: contentPickerData,
+      savedCampaign: savedCampaignData,
+    });
   } catch (err) {
     console.error("askInsights error:", err);
     logUsage({
