@@ -135,12 +135,67 @@ headline/badge text all designed in by the AI in one pass)?"
 STEP 3 — Call suggest_campaign_content.
 - This tool generates 3 message variants and returns them — it does NOT save anything to the database.
 - The frontend will show the 3 variants as selectable cards for the staff member to pick from or edit.
-- After calling this tool, tell the staff member: "Here are 3 message options — pick one, edit it if you like, then click Save Draft."
-- DO NOT call draft_campaign. The staff member saves the draft themselves by clicking the button.
+- After calling this tool, tell the staff member: "Here are 3 message options — pick one, edit if you like, and either click Save Draft or tell me which one to save."
 
-STEP 4 — draft_campaign is called automatically by the frontend when the staff member clicks Save Draft.
-- You do not call draft_campaign. Ever. The frontend calls it directly via REST.
-- After the staff member saves the draft, the card will update to show "Draft saved" with an Open button.
+STEP 4 — Save the draft when the staff member confirms.
+- If the staff member clicks "Save Draft" on the card, the frontend saves it directly via REST — you do nothing.
+- If the staff member VERBALLY confirms a variant — says things like "save it", "go with option 1", "save the recommended one", "proceed with this" — call save_campaign_draft with that variant's fields.
+- When picking which variant to save: "option 1" / "first one" / "recommended" = variants[0]; "option 2" / "second" / "direct" = variants[1]; "option 3" / "third" / "conversational" = variants[2].
+- IMPORTANT: Each variant returned by suggest_campaign_content includes a headerImageUrl field if an image was pre-generated. 
+You MUST pass that exact headerImageUrl value when calling save_campaign_draft. 
+Do NOT leave it null if the variant had an image — copy it exactly from the suggest_campaign_content result.
+- After calling save_campaign_draft, tell the staff member: "Done — draft saved. Want me to submit
+  it to Meta and schedule it for a specific date/time, or would you rather review it on the
+  Broadcast Campaigns dashboard first? If you do want to schedule it, pick a time at least 10–15
+  minutes from now — Meta needs to approve the template first, and giving it that lead time means
+  it actually sends at the exact minute you asked for instead of just 'as soon as approved.'"
+- Do NOT call save_campaign_draft more than once for the same campaign.
+
+STEP 5 — If the staff member gives (or already gave, in the same message as their save
+confirmation — e.g. "save it and send Monday 10am") a specific date and time to send:
+- Parse it into an ISO 8601 datetime, ALWAYS anchored against the real current date/time given to
+  you earlier in this prompt — never guess "today's date" from anywhere else (this caused a real
+  bug: a staff member asked for "12:55pm today" and the date was resolved more than a year wrong,
+  which only surfaced as a confusing "that time has already passed" message instead of the real
+  problem). If they gave a date/time without a year, assume the nearest future occurrence relative
+  to the real current date. If they gave only a time with no date ("send it at 6pm"), assume today
+  if that time (relative to the real current time) hasn't passed yet, otherwise tomorrow. If
+    genuinely ambiguous (e.g. just "later" or "soon" with no actual time), ask them for a specific
+  date and time — do not guess. You do not need to work out a UTC offset yourself — just pass the
+  plain local (IST) wall-clock date/time as given (e.g. "2026-10-28T10:00:00"); the tool interprets
+  an offset-less value as IST automatically.
+- If the parsed time is LESS than 15 minutes from the real current time given to you in this
+  prompt: tell the staff member before doing anything else — "Heads up — Meta usually needs a few
+  minutes to approve a new template, sometimes longer, and [time] is less than 15 minutes away. If
+  it's not approved by then, I'll send it the moment it IS approved instead of exactly at [time]. Do
+  you want to go ahead anyway, or pick a time a bit further out so it lands exactly when you want?"
+  Wait for their answer — proceed with the near time only if they explicitly say to go ahead anyway;
+  otherwise use whatever later time they give instead. Skip this warning entirely for anything 15
+  minutes or further out — don't mention Meta approval timing for a normal "tomorrow at 10am" or
+  "6pm today" request, only for a genuinely tight one.
+- Confirm back in plain language before calling the tool: "Got it — I'll submit this to Meta now
+  and schedule it for [day, date, time]. It'll go out automatically once Meta approves, you don't
+  need to do anything else." This is your one confirmation step for this action — you already have
+  their save confirmation from STEP 4, so don't ask a second "are you sure?" on top of it.
+- Call schedule_campaign_broadcast with the campaignId returned by save_campaign_draft and the
+  parsed scheduledAt. This submits the template to Meta AND locks in the send time in one call —
+  the campaign does not need to reach READY/Meta-approved status first. Nothing further is needed
+  from you or the staff member; a background job handles the rest once Meta decides.
+- If the tool returns success: tell the staff member something like: "Submitted to Meta for
+  approval — this will automatically go out at [day, date, time] once it's approved. You can check
+  progress or cancel it anytime from the Broadcast Campaigns dashboard."
+- If the tool returns an error (e.g. image generation or Meta submission failed): tell the staff
+  member plainly what went wrong and that the draft is still saved and can be retried — do NOT
+  retry automatically yourself.
+- If the staff member does NOT give a time at all (they just say "save it" / confirm a variant with
+  nothing about timing), do not call schedule_campaign_broadcast — STEP 4's save_campaign_draft
+  message already told them their two options; wait for them to pick one. Leaving the campaign as a
+  plain DRAFT (for the dashboard "Submit to Meta" button) is a completely valid outcome, not a step
+  you failed to complete.
+- Only call schedule_campaign_broadcast once per campaign. If the staff member asks to change the
+  time AFTER you've already called it once (campaign is now PENDING_SCHEDULE, not DRAFT), tell them
+  to cancel the scheduled send from the dashboard and let you know — you cannot reschedule an
+  already-submitted campaign yourself (schedule_campaign_broadcast only works from a fresh DRAFT).
 
 ## Template components (header, footer, buttons)
 WhatsApp templates support optional components beyond the body text:
@@ -171,7 +226,9 @@ When a staff member asks for an "image header", "image template", or "AI image":
 ## Important constraints
 - Max 200 recipients per campaign.
 - Only {{1}} (first name) as a variable — no other template variables.
-- You cannot submit to Meta, you cannot schedule sends, you cannot cancel campaigns.
+- You CAN schedule a send for a specific date/time the staff member gives you — see STEP 5 below
+  and the schedule_campaign_broadcast tool. You cannot send immediately ("send now") and you cannot
+  cancel campaigns — those stay dashboard-button-only.
 - If audienceSize is 0 after preview, do NOT call suggest_campaign_content. Tell the staff member
   why (no consent, no matches) and suggest how to broaden the criteria.
 - If the staff member asks to "just send it" or "skip approval", explain that WhatsApp
@@ -630,6 +687,113 @@ const tools = [
         },
       },
       required: ["campaignName", "intent", "audienceRules", "audienceSize"],
+    },
+  },
+  {
+    name: "save_campaign_draft",
+    description:
+      "Save a campaign as a DRAFT in the database — call this when the staff member " +
+      "verbally confirms they want to save (e.g. 'save it', 'go with option 1', " +
+      "'save the draft', 'proceed with this one'). " +
+      "Pass the chosen variant's fields exactly as returned by suggest_campaign_content. " +
+      "The manual Save Draft button on the picker card still works too — this is an " +
+      "additional path so the agent can save on the staff member's behalf. " +
+      "Do NOT call this before suggest_campaign_content has been called and the staff " +
+      "member has picked or confirmed a specific variant.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Campaign name — same value passed to suggest_campaign_content.",
+        },
+        bodyText: {
+          type: "string",
+          description:
+            "The chosen variant's bodyText. Must start with 'Hi {{1}},'.",
+        },
+        audienceRules: {
+          type: "object",
+          description: "Same audienceRules used in preview_audience.",
+        },
+        audienceSize: {
+          type: "number",
+          description: "eligibleCount from preview_audience.",
+        },
+        agentPrompt: {
+          type: "string",
+          description:
+            "The staff member's original request — stored for reference.",
+        },
+        headerType: {
+          type: "string",
+          enum: ["IMAGE", "TEXT", "NONE"],
+          description: "The chosen variant's headerType.",
+        },
+        headerText: {
+          type: "string",
+          description: "The chosen variant's headerText (for TEXT headers).",
+        },
+        headerImageUrl: {
+          type: "string",
+          description:
+            "The pre-generated image URL if one was already generated during the preview " +
+            "(from suggest_campaign_content flow). Pass it so the saved draft carries the " +
+            "image the staff member already saw. Null for TEXT/NONE headers.",
+        },
+        footerText: {
+          type: "string",
+          description: "The chosen variant's footerText.",
+        },
+        buttons: {
+          type: "array",
+          description: "The chosen variant's buttons array.",
+        },
+        category: {
+          type: "string",
+          enum: ["MARKETING", "UTILITY"],
+          description: "Template category. Default MARKETING.",
+        },
+      },
+      required: ["name", "bodyText", "audienceRules", "audienceSize"],
+    },
+  },
+  {
+    name: "schedule_campaign_broadcast",
+    description:
+      "Submits a freshly-saved DRAFT campaign's template to Meta for approval AND locks in a " +
+      "staff-requested send date/time in one call — see STEP 5 in the system prompt. Unlike " +
+      "sending or cancelling, this one action the agent IS allowed to take on the staff member's " +
+      "explicit verbal confirmation of a specific time, the same way save_campaign_draft already " +
+      "acts on a verbal 'save it'. Call this ONLY after save_campaign_draft has already created " +
+      "the campaign (campaignId required) AND the staff member has given (or confirmed) a specific " +
+      "date and time — never call this to guess or default a time. " +
+      "Does NOT wait for Meta's decision and does NOT send any messages itself — approval can take " +
+      "minutes to hours. A background job picks up the approval and the actual send from here; " +
+      "this call just returns once the submission + time are saved. " +
+      "Only works on a campaign currently in DRAFT status — if the staff member wants to change " +
+      "the time after calling this once, tell them to cancel from the dashboard and start over.",
+    input_schema: {
+      type: "object",
+      properties: {
+        campaignId: {
+          type: "string",
+          description:
+            "The campaignId returned by save_campaign_draft for this campaign.",
+        },
+        scheduledAt: {
+          type: "string",
+          description:
+            "ISO 8601 datetime for when the campaign should send, parsed from the staff " +
+            "member's words (e.g. 'Monday 10am', 'tomorrow at 6pm'), ALWAYS resolved against " +
+            "the real current date/time given to you in the system prompt — never guessed. " +
+            "Pass the plain local (IST) wall-clock value with no timezone suffix, e.g. " +
+            "'2026-10-28T10:00:00' — the tool treats an offset-less value as IST automatically, " +
+            "so do not append 'Z' or a '+hh:mm' offset yourself. Must be in the future.",
+        },
+      },
+      required: ["campaignId", "scheduledAt"],
     },
   },
 ];

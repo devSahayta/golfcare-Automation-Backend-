@@ -229,29 +229,32 @@ async function getOrderStatus(_orderIdOrNumber) {
   );
 }
 
-async function getTemplateStatus(wtId) {
-  return callSamvaadik(async (client) => {
-    // GET /v1/templates returns only APPROVED templates for this account
-    const res = await client.get("/templates");
-    const templates = res.data?.data || [];
-    const match = templates.find((t) => t.wt_id === wtId);
+async function getTemplateStatus(wtId, { timeoutMs } = {}) {
+  return callSamvaadik(
+    async (client) => {
+      // GET /v1/templates returns only APPROVED templates for this account
+      const res = await client.get("/templates");
+      const templates = res.data?.data || [];
+      const match = templates.find((t) => t.wt_id === wtId);
 
-    if (match) {
-      return {
-        wtId,
-        status: "APPROVED",
-        name: match.name,
-        metaStatus: match.status,
-      };
-    }
+      if (match) {
+        return {
+          wtId,
+          status: "APPROVED",
+          name: match.name,
+          metaStatus: match.status,
+        };
+      }
 
-    // Not in the approved list — could be PENDING or REJECTED.
-    // Samvaadik doesn't expose a single-template GET endpoint, so we
-    // treat "not found in approved list" as PENDING for polling purposes.
-    // The controller will keep polling until it appears or the campaign is
-    // manually cancelled.
-    return { wtId, status: "PENDING" };
-  });
+      // Not in the approved list — could be PENDING or REJECTED.
+      // Samvaadik doesn't expose a single-template GET endpoint, so we
+      // treat "not found in approved list" as PENDING for polling purposes.
+      // The controller will keep polling until it appears or the campaign is
+      // manually cancelled.
+      return { wtId, status: "PENDING" };
+    },
+    { timeoutMs },
+  );
 }
 
 /**
@@ -317,20 +320,24 @@ async function listScheduledMessages({
   phone,
   limit = 200,
   offset = 0,
+  timeoutMs,
 } = {}) {
-  return callSamvaadik(async (client) => {
-    const params = { limit, offset };
-    if (batchId) params.batch_id = batchId;
-    if (status) params.status = status;
-    if (phone) params.phone = phone;
+  return callSamvaadik(
+    async (client) => {
+      const params = { limit, offset };
+      if (batchId) params.batch_id = batchId;
+      if (status) params.status = status;
+      if (phone) params.phone = phone;
 
-    const res = await client.get("/messages/schedule", { params });
-    // Response: { success, total, limit, offset, data: [...rows] }
-    return {
-      rows: res.data?.data || [],
-      total: res.data?.total || 0,
-    };
-  });
+      const res = await client.get("/messages/schedule", { params });
+      // Response: { success, total, limit, offset, data: [...rows] }
+      return {
+        rows: res.data?.data || [],
+        total: res.data?.total || 0,
+      };
+    },
+    { timeoutMs },
+  );
 }
 
 module.exports = {

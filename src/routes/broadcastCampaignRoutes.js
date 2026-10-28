@@ -12,6 +12,7 @@ const {
   previewCampaignImage,
   resolveProductImage,
   scheduleCampaign,
+  retryCampaign,
 } = require("../controllers/broadcastCampaignController");
 
 const { prisma } = require("../lib/prisma");
@@ -51,5 +52,8 @@ router.post("/:id/schedule", scheduleCampaign);
 
 // POST /api/campaigns/:id/cancel — cancel at any non-terminal state
 router.post("/:id/cancel", cancelCampaign);
+
+// POST /api/campaigns/:id/retry — staff clicks "Retry failed messages"
+router.post("/:id/retry", retryCampaign);
 
 module.exports = router;

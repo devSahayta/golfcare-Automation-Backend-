@@ -17,6 +17,10 @@ const { prisma } = require("../../lib/prisma");
 const { buildAudience, MAX_AUDIENCE } = require("../broadcastAudienceService");
 const { matchProductImage } = require("../productImageMatchService");
 const { env } = require("../../config/env");
+const {
+  submitBroadcastCampaignToMeta,
+  SubmitError,
+} = require("../broadcastSubmitService");
 
 function daysAgo(n) {
   return new Date(Date.now() - n * 24 * 60 * 60 * 1000);
@@ -706,11 +710,247 @@ function buildInsightsAgentTools({ staffUserId = null } = {}) {
     },
 
     /**
+     * save_campaign_draft — called by the agent when the staff member verbally
+     * confirms a variant (e.g. "save it", "go with option 1", "save the draft").
+     * Saves a DRAFT BroadcastCampaign row with the chosen variant's full template
+     * fields (headerType, headerText, headerImageUrl, footerText, buttons, etc.)
+     * and builds the recipient list.
+     *
+     * The manual "Save Draft" button on the picker card still works exactly as
+     * before — this tool is an ADDITIONAL path, not a replacement.
+     */
+    async save_campaign_draft({
+      name,
+      bodyText,
+      audienceRules,
+      audienceSize,
+      agentPrompt = "",
+      headerType = "NONE",
+      headerText = null,
+      headerImageUrl = null,
+      headerImagePromptHint = null,
+      footerText = null,
+      buttons = null,
+      category = "MARKETING",
+    }) {
+      if (!name || !bodyText || !audienceRules) {
+        return {
+          success: false,
+          error: "name, bodyText, and audienceRules are required",
+        };
+      }
+      if (!bodyText.startsWith("Hi {{1}},")) {
+        return {
+          success: false,
+          error: 'bodyText must start with "Hi {{1}},"',
+        };
+      }
+
+      const audienceResult = await buildAudience(audienceRules);
+      if (audienceResult.customers.length === 0) {
+        return {
+          success: false,
+          error: "No eligible customers match these rules.",
+          excludedNoConsent: audienceResult.excludedNoConsent,
+          excludedOptedOut: audienceResult.excludedOptedOut,
+        };
+      }
+
+      const baseName = name
+        .toLowerCase()
+        .replace(/\s+/g, "_")
+        .replace(/[^a-z0-9_]/g, "")
+        .slice(0, 40);
+      const templateName = `${baseName}_${Date.now()}`;
+
+      const campaign = await prisma.$transaction(async (tx) => {
+        const c = await tx.broadcastCampaign.create({
+          data: {
+            name,
+            templateName,
+            bodyText,
+            audienceRules,
+            audienceSize: audienceResult.customers.length,
+            agentPrompt,
+            createdByStaffId: staffUserId || null,
+            status: "DRAFT",
+            category,
+            headerType,
+            headerText: headerText || null,
+            headerImageUrl: headerImageUrl || null,
+            footerText: footerText || null,
+            buttons: buttons || [],
+          },
+        });
+
+        await tx.broadcastRecipient.createMany({
+          data: audienceResult.customers.map((cust) => ({
+            campaignId: c.id,
+            customerId: cust.id,
+            phone: cust.waPhone,
+            firstName: cust.firstName || null,
+            status: "PENDING",
+          })),
+        });
+
+        return c;
+      });
+
+      return {
+        success: true,
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        templateName: campaign.templateName,
+        audienceSize: audienceResult.customers.length,
+        bodyText: campaign.bodyText,
+        headerType: campaign.headerType,
+        headerImageUrl: campaign.headerImageUrl,
+        action: "SHOW_SAVED_CAMPAIGN_CARD", // ← new action type
+        redirectUrl: `/broadcast-campaigns?id=${campaign.id}`, // ← direct link
+      };
+    },
+
+    /**
+     * schedule_campaign_broadcast — the staff member gave a specific date/
+     * time verbally ("schedule this for Monday 10am") for a campaign that
+     * was just saved as a DRAFT via save_campaign_draft, in the SAME turn
+     * or a later one. This is the one place the agent is allowed to move a
+     * campaign past DRAFT on its own — see the header comment in
+     * broadcastCampaignController.js for the fuller picture of why that
+     * boundary was relaxed only for this specific action, and only on an
+     * explicit, already-confirmed time (never call this to guess a time).
+     *
+     * What it does, synchronously, in this one tool call:
+     *   1. Submits the DRAFT's template to Meta via Samvaadik (same logic
+     *      the "Confirm & submit to Meta" dashboard button runs — see
+     *      broadcastSubmitService.js). This is normally fast: the header
+     *      image (if any) was already generated during
+     *      suggest_campaign_content's preview step and is just reused, not
+     *      regenerated, so this call does NOT pay AI image-generation
+     *      latency in the common case.
+     *   2. Stores the requested time on the campaign row and sets
+     *      status = PENDING_SCHEDULE.
+     *
+     * It deliberately does NOT wait for Meta's approval and does NOT fan
+     * out any messages itself — Meta approval can take minutes to hours,
+     * far longer than this HTTP request (or Vercel's function timeout)
+     * can hold open. The scheduler's broadcastSchedulePoll job (a separate,
+     * long-running process, not a Vercel function) picks up PENDING_SCHEDULE
+     * rows in the background, waits for Meta's decision, and only then does
+     * the actual recipient fan-out at the stored time. See
+     * golfcare-scheduler/src/jobs/broadcastSchedulePoll.js.
+     */
+    async schedule_campaign_broadcast({ campaignId, scheduledAt }) {
+      if (!campaignId || !scheduledAt) {
+        return {
+          success: false,
+          error: "campaignId and scheduledAt are both required.",
+        };
+      }
+
+      // scheduledAt is meant to be the staff member's wall-clock IST time.
+      // A naive datetime string with no "Z"/offset (e.g. the model passing
+      // "2026-10-28T10:00:00" with nothing after the seconds) gets parsed
+      // by `new Date(...)` as the SERVER's local time, not IST — on Vercel
+      // that's UTC, a silent 5.5h drift from what the staff member asked
+      // for. Rather than rely on the model always appending the right
+      // offset, treat an offset-less string as IST explicitly. A string
+      // that already carries "Z" or a "+hh:mm"/"-hh:mm" offset is left
+      // untouched and respected as given.
+      const hasExplicitOffset = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(
+        scheduledAt.trim(),
+      );
+      const normalizedScheduledAt = hasExplicitOffset
+        ? scheduledAt
+        : `${scheduledAt}+05:30`;
+
+      const sendAt = new Date(normalizedScheduledAt);
+      if (isNaN(sendAt.getTime())) {
+        return {
+          success: false,
+          error: "scheduledAt is not a valid date/time.",
+        };
+      }
+      if (sendAt <= new Date()) {
+        return {
+          success: false,
+          error: `scheduledAt (${sendAt.toISOString()}, interpreted as IST) must be in the future. The current time is ${new Date().toISOString()}.`,
+        };
+      }
+
+      const campaign = await prisma.broadcastCampaign.findUnique({
+        where: { id: campaignId },
+      });
+      if (!campaign) {
+        return { success: false, error: "Campaign not found." };
+      }
+      if (campaign.status !== "DRAFT") {
+        return {
+          success: false,
+          error: `This campaign is already ${campaign.status} — it can only be scheduled this way straight from a fresh draft.`,
+        };
+      }
+
+      try {
+        await submitBroadcastCampaignToMeta(campaignId, {
+          staffId: staffUserId || null,
+        });
+      } catch (err) {
+        const detail =
+          err instanceof SubmitError
+            ? err.message
+            : `Failed to submit to Meta: ${err.message}`;
+        return {
+          success: false,
+          error: detail,
+          hint: err instanceof SubmitError ? err.hint : undefined,
+        };
+      }
+
+      await prisma.broadcastCampaign.update({
+        where: { id: campaignId },
+        data: { status: "PENDING_SCHEDULE", scheduledFor: sendAt },
+      });
+
+      await prisma.auditLog.create({
+        data: {
+          actorType: "AGENT",
+          actorId: staffUserId || null,
+          action: "AGENT_SCHEDULED_PENDING_APPROVAL",
+          entityType: "BroadcastCampaign",
+          entityId: campaignId,
+          beforeState: { status: "SUBMITTED" },
+          afterState: {
+            status: "PENDING_SCHEDULE",
+            scheduledFor: sendAt.toISOString(),
+          },
+          source: "insights_agent",
+        },
+      });
+
+      return {
+        success: true,
+        campaignId,
+        scheduledFor: sendAt.toISOString(),
+        message:
+          "Submitted to Meta for approval and the requested send time is saved. It'll go out automatically once Meta approves — no need to come back and click anything.",
+        action: "SHOW_PENDING_SCHEDULE_CARD",
+        redirectUrl: `/broadcast-campaigns?id=${campaignId}`,
+      };
+    },
+
+    /**
+     * draft_campaign — save a DRAFT BroadcastCampaign and its recipient list.
+
+
+
+    /**
      * draft_campaign — save a DRAFT BroadcastCampaign and its recipient list.
      * NOTE: In the NEW flow, this is called by the FRONTEND via REST (POST /api/campaigns/draft),
      * not by the agent. It remains here as a fallback if called, but the agent's system prompt
      * instructs it never to call this.
      */
+
     async draft_campaign({ name, bodyText, audienceRules, agentPrompt = "" }) {
       if (!name || !bodyText || !audienceRules) {
         return {
