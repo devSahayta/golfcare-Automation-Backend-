@@ -168,6 +168,7 @@ async function getCampaign(req, res) {
             skipReason: true,
             errorMessage: true,
             sentAt: true,
+            retryCount: true, // ← surfaced so the UI can show "Retried 2/3" / "limit reached"
           },
           orderBy: { createdAt: "asc" },
         },
