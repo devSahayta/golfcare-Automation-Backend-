@@ -26,16 +26,6 @@ const { prisma } = require("./lib/prisma");
 const { sendCampaign } = require("./controllers/broadcastCampaignController");
 
 const app = express();
-
-// TEMPORARY DIAGNOSTIC LOGGER — logs every single request this server
-// receives, before anything else touches it. Added to find out whether
-// Shopify's webhook calls are reaching this server at all. Remove once
-// the Shopify order/customer sync issue is confirmed fixed.
-app.use((req, res, next) => {
-  console.log(`[incoming] ${req.method} ${req.originalUrl}`);
-  next();
-});
-
 app.use(cors());
 app.use("/webhooks/samvaadik", samvaadikWebhookRouter);
 app.use("/webhooks/shopify", shopifyWebhookRoutes);

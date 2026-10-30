@@ -441,6 +441,42 @@ async function handleOrderUpsert(req, res) {
           source: "shopify_webhook",
         },
       });
+
+      // Roll this genuinely-new order into the linked Customer's aggregate
+      // stats. Gated on `!existing` (first time THIS shopifyOrderId is
+      // seen) so a webhook redelivery — orders/create retried, or
+      // orders/updated arriving for the same order — never double-counts.
+      // Read-then-write rather than Prisma's atomic `increment` for
+      // lifetimeValue/orderCount because avgOrderValue and lastOrderAt are
+      // derived from the post-update values, not simple increments.
+      if (saved.customerId) {
+        const customer = await prisma.customer.findUnique({
+          where: { id: saved.customerId },
+          select: { orderCount: true, lifetimeValue: true, lastOrderAt: true },
+        });
+        if (customer) {
+          const newOrderCount = customer.orderCount + 1;
+          const newLifetimeValue =
+            Number(customer.lifetimeValue) + Number(saved.totalPrice);
+          const newAvgOrderValue =
+            newOrderCount > 0 ? newLifetimeValue / newOrderCount : 0;
+          const newLastOrderAt =
+            !customer.lastOrderAt || saved.placedAt > customer.lastOrderAt
+              ? saved.placedAt
+              : customer.lastOrderAt;
+
+          await prisma.customer.update({
+            where: { id: saved.customerId },
+            data: {
+              orderCount: newOrderCount,
+              lifetimeValue: newLifetimeValue,
+              avgOrderValue: newAvgOrderValue,
+              lastOrderAt: newLastOrderAt,
+              updatedAt: new Date(),
+            },
+          });
+        }
+      }
     } else if (
       existing.financialStatus !== saved.financialStatus ||
       existing.fulfillmentStatus !== saved.fulfillmentStatus
