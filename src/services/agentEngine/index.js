@@ -6,6 +6,68 @@ const { runGuardrails: runDefaultGuardrails } = require("./guardrails");
 const { logMessage, logAudit, logUsage } = require("./logger");
 const { pickModel } = require("./modelRouter");
 
+// NEW — real fix for a confirmed production bug: a customer picking an item
+// by position/name from a list the agent already showed them ("Go with 2",
+// "the 2nd one") kept failing with "Sorry, got a bit tangled up there!"
+// (guardrail `fabricated_product_id`, three turns in a row in the reported
+// case). Root cause: the conversation history rebuilt below used to carry
+// ONLY each message's plain `body` text into the model's context — the real
+// productId/variantId values from that turn's search_products/get_product
+// call are saved on Message.toolCalls (see logger.js's logMessage), but
+// were never fed back to the model on a LATER turn. The system prompt in
+// salesAgentConfig.js explicitly instructs the model to "find that exact
+// product in YOUR OWN earlier search_products tool result in this
+// conversation's history" — which was literally impossible to follow past
+// the turn that produced it, since that data never survived into history.
+// The model's only options were re-searching (discouraged by the prompt)
+// or guessing an ID from memory — exactly what the fabricated_product_id
+// guardrail exists to catch, so it kept firing on every retry too.
+//
+// Fix: append a compact, MODEL-ONLY annotation of the real IDs returned by
+// that turn's search_products/get_product calls onto the history content
+// for AI_AGENT messages. This is never shown to the customer — it was never
+// part of what WhatsApp actually sent (Message.body, logged separately by
+// logMessage, is untouched) — it only exists in the `content` string handed
+// to the Anthropic API as conversation history for THIS turn's reasoning.
+// Capped (6 variants/product, 8 products) to avoid materially growing
+// prompt size on heavy search turns.
+function summarizeKnownIdsForHistory(toolCalls) {
+  if (!Array.isArray(toolCalls) || !toolCalls.length) return "";
+  const lines = [];
+
+  for (const c of toolCalls) {
+    if (c.tool === "search_products" && Array.isArray(c.output?.results)) {
+      for (const r of c.output.results.slice(0, 8)) {
+        if (!r.productId) continue;
+        const variantsStr = (r.variants || [])
+          .slice(0, 6)
+          .map((v) => `${v.variantId}="${v.title}" ₹${v.price}`)
+          .join(", ");
+        lines.push(
+          `productId=${r.productId} "${r.title}"${variantsStr ? ` variants: [${variantsStr}]` : ""}`,
+        );
+      }
+    } else if (c.tool === "get_product" && !c.output?.error) {
+      if (c.output?.variant?.id) {
+        lines.push(
+          `variantId=${c.output.variant.id} "${c.output.variant.title}" (productId=${c.output.product?.id || c.output.variant.productId || "unknown"} "${c.output.product?.title || ""}")`,
+        );
+      } else if (c.output?.product?.id) {
+        const variantsStr = (c.output.product.Variant || [])
+          .slice(0, 10)
+          .map((v) => `${v.id}="${v.title}" ₹${v.price}`)
+          .join(", ");
+        lines.push(
+          `productId=${c.output.product.id} "${c.output.product.title}"${variantsStr ? ` variants: [${variantsStr}]` : ""}`,
+        );
+      }
+    }
+  }
+
+  if (!lines.length) return "";
+  return `\n\n[internal reference only, never shown to the customer — real IDs from this message's tool results, use these exact strings if the customer later refers back to one of these items: ${lines.join(" | ")}]`;
+}
+
 // Kept exactly as before — still the fallback rate for any model not
 // found in MODEL_RATES below (e.g. if env.anthropicModel is set to
 // something not equal to either Sonnet or Haiku's configured string).
@@ -213,10 +275,19 @@ async function runAgent({ conversationId, config, sendFn }) {
     const systemPrompt = config.buildSystemPrompt(context);
     const rawHistory = context.recentMessages
       .filter((m) => m.sender !== "SYSTEM" || m.body)
-      .map((m) => ({
-        role: m.sender === "CUSTOMER" ? "user" : "assistant",
-        content: m.body || "",
-      }));
+      .map((m) => {
+        // NEW — see summarizeKnownIdsForHistory's comment above. Only
+        // AI_AGENT messages carry tool-call data worth surfacing; a
+        // customer message's toolCalls is always empty/irrelevant here.
+        const idNote =
+          m.sender === "AI_AGENT"
+            ? summarizeKnownIdsForHistory(m.toolCalls)
+            : "";
+        return {
+          role: m.sender === "CUSTOMER" ? "user" : "assistant",
+          content: (m.body || "") + idNote,
+        };
+      });
 
     const history = [];
     for (const turn of rawHistory) {
@@ -269,7 +340,11 @@ async function runAgent({ conversationId, config, sendFn }) {
     // Merge in any out-of-band API calls a tool handler made during this
     // attempt (e.g. Supplier Agent's isolated product-research call —
     // see contextAssembler.js's extraUsage comment, productResearch.js).
-    ({ totalUsage, totalCost } = mergeExtraUsage(context, totalUsage, totalCost));
+    ({ totalUsage, totalCost } = mergeExtraUsage(
+      context,
+      totalUsage,
+      totalCost,
+    ));
 
     // NEW — safety net for the specific gap found in testing: during
     // Part A enrolment, Haiku sometimes replies conversationally to an
@@ -309,7 +384,11 @@ async function runAgent({ conversationId, config, sendFn }) {
         estimateCostForModel(repair.usage, repairModel),
       );
       lastModelUsed = repairModel;
-      ({ totalUsage, totalCost } = mergeExtraUsage(context, totalUsage, totalCost));
+      ({ totalUsage, totalCost } = mergeExtraUsage(
+        context,
+        totalUsage,
+        totalCost,
+      ));
     }
 
     if (hitIterationCap) {
@@ -401,7 +480,11 @@ async function runAgent({ conversationId, config, sendFn }) {
         estimateCostForModel(retry.usage, retryModel),
       );
       lastModelUsed = retryModel;
-      ({ totalUsage, totalCost } = mergeExtraUsage(context, totalUsage, totalCost));
+      ({ totalUsage, totalCost } = mergeExtraUsage(
+        context,
+        totalUsage,
+        totalCost,
+      ));
 
       if (retry.hitIterationCap) {
         console.log(
@@ -525,7 +608,9 @@ async function runAgent({ conversationId, config, sendFn }) {
     // it doesn't keep getting surfaced turn after turn once it's already
     // been acknowledged once. Harmless no-op for Supplier Agent turns or
     // any conversation without this tag (intent stays whatever it was).
-    const clearedIntent = context.conversation.intent?.startsWith("campaign_reply:")
+    const clearedIntent = context.conversation.intent?.startsWith(
+      "campaign_reply:",
+    )
       ? null
       : context.conversation.intent;
 

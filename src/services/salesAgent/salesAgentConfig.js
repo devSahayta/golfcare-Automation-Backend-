@@ -149,7 +149,9 @@ function buildSystemPrompt(context) {
   // back — same principle as pendingCheck in supplierAgentConfig.js.
   // agentEngine/index.js clears this after one reply so it doesn't keep
   // getting mentioned turns later once it's no longer relevant.
-  const campaignReplyNote = context.conversation?.intent?.startsWith("campaign_reply:")
+  const campaignReplyNote = context.conversation?.intent?.startsWith(
+    "campaign_reply:",
+  )
     ? `\nThe customer's last message may be a reply to a ${context.conversation.intent.split(":")[1]} campaign message we just sent them (visible in the conversation history below) — open by naturally acknowledging it if their reply reads that way, rather than treating this as a cold, out-of-nowhere message.\n`
     : "";
 
@@ -302,18 +304,25 @@ Rules:
   ("Just to confirm — L as in Large, or do you mean something else?") rather than guessing wrong
   and showing them mismatched results.
 - When the customer picks an item from a list you already showed them ("the 7th one," "the
-  LTDx", "that Cobra one"), find that exact product in YOUR OWN earlier search_products tool
-  result in this conversation's history and use its exact productId/variantId directly (via
-  get_product or check_availability) — do NOT run a brand-new search_products call by name.
-  Re-searching from scratch can miss the exact item due to fuzzy matching, duplicate/similarly-
-  named catalog entries, or ranking differences between calls, even though you already had the
-  correct result moments ago. Only fall back to a fresh search if you genuinely cannot find a
-  matching item in your own prior results for this conversation.
+  LTDx", "that Cobra one," "go with 2," "option 1"), look for the exact real productId/variantId
+  in an "[internal reference only, never shown to the customer — real IDs from this message's
+  tool results...]" note attached to one of YOUR OWN earlier messages further up in this
+  conversation's history — these notes carry forward the exact IDs your own past
+  search_products/get_product calls returned, even though the customer-facing text of that
+  message only showed names/prices. Match the item the customer is referring to (by its number,
+  name, or description) against the titles listed in that note, then use that note's exact
+  productId/variantId string directly (via get_product, check_availability, or
+  create_checkout_link) — do NOT run a brand-new search_products call by name. Re-searching from
+  scratch can miss the exact item due to fuzzy matching, duplicate/similarly-named catalog
+  entries, or ranking differences between calls, even though you already had the correct result
+  moments ago in one of these internal notes. Only fall back to a fresh search if you genuinely
+  cannot find a matching item in any internal-reference note in this conversation's history.
 - NEVER type out a productId or variantId from memory or guess one that "looks right" — these
   are long UUID strings (like "d8c6bf27-cf57-47c4-ac3d-7572b804620a"), not something you can
-  reconstruct. Only ever use an ID exactly as it appeared, character for character, in an
-  actual tool result earlier in this conversation. If you don't have the exact ID handy, search
-  or look it up again — never approximate one.
+  reconstruct. Only ever use an ID exactly as it appeared, character for character, either in an
+  actual tool result earlier THIS turn, or in one of the "[internal reference only...]" notes
+  described above. If you don't have the exact ID in either place, search or look it up again —
+  never approximate one.
 - Never state a price or stock status unless you called a tool this turn that confirms it.
 - You have no discount authority — never offer one.
 - Before calling check_availability or create_checkout_link on a specific product/variant, make
