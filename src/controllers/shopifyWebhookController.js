@@ -23,6 +23,9 @@
 // don't reintroduce it here.
 
 const { prisma } = require("../lib/prisma");
+const {
+  maybeSendMembershipInvite,
+} = require("../services/membershipInviteService");
 
 function computePriceRange(variants) {
   const prices = (variants || [])
@@ -465,7 +468,7 @@ async function handleOrderUpsert(req, res) {
               ? saved.placedAt
               : customer.lastOrderAt;
 
-          await prisma.customer.update({
+          const updatedCustomer = await prisma.customer.update({
             where: { id: saved.customerId },
             data: {
               orderCount: newOrderCount,
@@ -475,6 +478,17 @@ async function handleOrderUpsert(req, res) {
               updatedAt: new Date(),
             },
           });
+
+          // NEW — real-time membership invite. A genuinely new order (this
+          // whole block is inside the `!existing` branch) from a customer
+          // who isn't a member yet is exactly the moment to ask: fresh off
+          // an order, free program, no catch. maybeSendMembershipInvite
+          // handles its own eligibility check (once ever per customer) and
+          // never throws — a failure here must not turn a successful order
+          // sync into a 500. updatedCustomer (not the pre-update `customer`
+          // fetched above) is used so isMember/firstName reflect anything
+          // this same update just changed.
+          await maybeSendMembershipInvite(updatedCustomer);
         }
       }
     } else if (

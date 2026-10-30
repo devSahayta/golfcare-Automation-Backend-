@@ -862,6 +862,7 @@ enum CampaignScenario {
   REVIEW_REMINDER
   CROSS_SELL
   CUSTOM
+  MEMBERSHIP_INVITE
 }
 
 enum CheckStatus {

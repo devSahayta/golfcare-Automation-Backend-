@@ -149,11 +149,24 @@ function buildSystemPrompt(context) {
   // back — same principle as pendingCheck in supplierAgentConfig.js.
   // agentEngine/index.js clears this after one reply so it doesn't keep
   // getting mentioned turns later once it's no longer relevant.
-  const campaignReplyNote = context.conversation?.intent?.startsWith(
+  // NEW — MEMBERSHIP_INVITE gets its own, more directive note than the
+  // generic campaign-reply acknowledgment below. That campaign's template
+  // (see membershipInviteService.js) already served as the bare "have you
+  // thought about joining?" invite — this tells the model explicitly not
+  // to repeat it, and to jump straight to the real STEP 2 benefits
+  // explanation + ask, in THIS reply, if the customer shows any interest.
+  // Every other campaign scenario keeps the original generic phrasing.
+  const campaignScenario = context.conversation?.intent?.startsWith(
     "campaign_reply:",
   )
-    ? `\nThe customer's last message may be a reply to a ${context.conversation.intent.split(":")[1]} campaign message we just sent them (visible in the conversation history below) — open by naturally acknowledging it if their reply reads that way, rather than treating this as a cold, out-of-nowhere message.\n`
-    : "";
+    ? context.conversation.intent.split(":")[1]
+    : null;
+  const campaignReplyNote =
+    campaignScenario === "MEMBERSHIP_INVITE"
+      ? `\nThe customer is replying to a WhatsApp message we sent right after their recent order, asking if they'd like to hear about Golf Care's free membership program. That message already served as the bare "have you thought about joining?" invite — do NOT send another bare invite. If their reply shows any interest at all (yes, tell me more, sure, what's it about, etc.), skip straight to genuinely explaining what membership is — the STEP 2 benefits explanation below — and ask if they'd like to join, in THIS reply. If their reply is a clear no / not interested, acknowledge it warmly, don't push, and move on to whatever else they need.\n`
+      : campaignScenario
+        ? `\nThe customer's last message may be a reply to a ${campaignScenario} campaign message we just sent them (visible in the conversation history below) — open by naturally acknowledging it if their reply reads that way, rather than treating this as a cold, out-of-nowhere message.\n`
+        : "";
 
   let membershipInstruction;
   if (c?.isMember && c.onboardingState === "COMPLETED") {
