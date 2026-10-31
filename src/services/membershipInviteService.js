@@ -77,12 +77,22 @@ async function maybeSendMembershipInvite(customer) {
     // convention as campaignTriggerEval.js's logSendAndCloseTrigger
     // (Meta's exact approved copy isn't fetched back, this is an
     // accurate-enough stand-in so Sales Agent has real text in history).
-    // Kept free of "member pricing"/🏷️ wording on purpose — that phrase is
-    // the hasPitchedMembership/enroll_membership pitchSent marker (see
-    // salesAgentConfig.js), and this template is only the bare STEP-1-style
-    // invite, not the full STEP 2 benefits pitch — that still has to happen
-    // live in chat before enroll_membership will allow enrollment.
-    const messageBody = `Hi ${firstName}, thanks for your order with Golf Care! Quick one — we run a free membership program (member pricing, early access to new stock, a golf expert on WhatsApp whenever you need one). Want to hear more?`;
+    // Must stay byte-identical to scripts/createMembershipTemplateV2.js's
+    // BODY_TEXT (minus the {{1}} placeholder) so this record matches what
+    // Meta actually delivered. The "member pricing"/🏷️ wording here is
+    // fine even though that phrase is also the hasPitchedMembership/
+    // enroll_membership pitchSent marker (see salesAgentConfig.js) —
+    // that guard only scans messages with sender AI_AGENT, and this one is
+    // logged with sender SYSTEM, so it can never satisfy the guard on its
+    // own. The real STEP 2 benefits pitch still has to happen live in chat
+    // before enroll_membership will allow enrollment.
+    //
+    // V2: this invite now also offers two tappable QUICK_REPLY buttons
+    // ("Tell me more" / "Not right now") on the actual WhatsApp message —
+    // a button tap arrives as a normal inbound message with the button's
+    // label as its text (handled by the existing webhook, no code changes
+    // needed), so it flows into the sales agent exactly like a typed reply.
+    const messageBody = `Hi ${firstName}, thanks for your order with Golf Care! 🏌️ Quick one — we've got a free membership program with special pricing, early access to new stock, and a golf expert on WhatsApp whenever you need one. Want to hear more?`;
 
     let sendResult;
     try {
