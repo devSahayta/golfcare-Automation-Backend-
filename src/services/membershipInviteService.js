@@ -32,29 +32,29 @@ const {
   resolveCustomerConversationForSend,
 } = require("../lib/resolveCustomerConversationForSend");
 
-async function alreadyInvited(customerId) {
-  const existing = await prisma.campaignTrigger.findFirst({
-    where: { customerId, scenario: "MEMBERSHIP_INVITE" },
-    select: { id: true },
-  });
-  return Boolean(existing);
-}
-
 // Best-effort, deliberately non-throwing: this runs inside
 // handleOrderUpsert, after the order itself already saved successfully.
 // A failure here (template send error, Samvaadik outage, etc.) must never
 // turn a successful order sync into a 500 — it's logged and the
 // CampaignTrigger is marked SUPPRESSED with the reason, same recovery
 // shape as the scheduler's own send-failure handling.
+//
+// The "once ever" guarantee is now enforced at the DB level: a partial
+// unique index on CampaignTrigger("customerId") WHERE scenario =
+// 'MEMBERSHIP_INVITE' (run manually in Supabase — see
+// scripts/addMembershipTriggerUniqueIndex.sql) means the create() below
+// either wins outright or fails with P2002 if another concurrent call (or
+// a later redelivered webhook) already claimed this customer. This
+// replaces a separate findFirst-then-create pre-check, which was its own
+// check-then-act race — confirmed live on 2026-10-31 (two invite sends for
+// one order, traced to shopifyWebhookController.js's own race, now fixed
+// there too with an advisory lock — this is defense in depth for any other
+// path that can call this function more than once for the same customer).
 async function maybeSendMembershipInvite(customer) {
   try {
     if (!customer || customer.isMember)
       return { sent: false, reason: "already_member" };
     if (!customer.waPhone) return { sent: false, reason: "no_phone" };
-
-    if (await alreadyInvited(customer.id)) {
-      return { sent: false, reason: "already_invited_once" };
-    }
 
     const templateName = env.campaignTemplates.MEMBERSHIP_INVITE;
     if (!templateName) {
@@ -64,13 +64,24 @@ async function maybeSendMembershipInvite(customer) {
       return { sent: false, reason: "template_not_configured" };
     }
 
-    const trigger = await prisma.campaignTrigger.create({
-      data: {
-        customerId: customer.id,
-        scenario: "MEMBERSHIP_INVITE",
-        status: "PENDING",
-      },
-    });
+    let trigger;
+    try {
+      trigger = await prisma.campaignTrigger.create({
+        data: {
+          customerId: customer.id,
+          scenario: "MEMBERSHIP_INVITE",
+          status: "PENDING",
+        },
+      });
+    } catch (err) {
+      if (err.code === "P2002") {
+        // Someone else (a concurrent call, or a prior attempt) already
+        // claimed this customer — exactly the "once ever" guarantee
+        // working as intended, not a real error.
+        return { sent: false, reason: "already_invited_once" };
+      }
+      throw err;
+    }
 
     const firstName = customer.firstName || "there";
     // Our own locally-composed record of what the customer saw — same

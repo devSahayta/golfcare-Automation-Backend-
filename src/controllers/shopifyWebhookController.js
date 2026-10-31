@@ -398,120 +398,159 @@ async function handleOrderUpsert(req, res) {
       email: order.customer?.email || order.email || null,
     });
 
-    // Read the previous state so we can tell create from update, and log
-    // only real changes (Shopify re-delivers webhooks).
-    const existing = await prisma.order.findUnique({
-      where: { shopifyOrderId: String(order.id) },
-      select: { id: true, financialStatus: true, fulfillmentStatus: true },
-    });
+    // Shopify commonly fires orders/create and orders/updated for the SAME
+    // order within ~1-2s of each other, as two separate, concurrent
+    // serverless invocations. Everything below decides "is this order
+    // genuinely new?" by reading first (findUnique) and upserting after —
+    // a classic check-then-act race: both invocations can run their read
+    // before either has committed its write, so both see `existing = null`
+    // and both take the "new order" branch, double-applying the audit log,
+    // the Customer stats rollup, AND the membership invite send. Confirmed
+    // live on 2026-10-31 (two membership-invite WhatsApp messages for one
+    // order; also at risk of silently double-counting orderCount/
+    // lifetimeValue on every order, not just this feature).
+    //
+    // Fix: take a Postgres advisory lock keyed on this shopifyOrderId
+    // before reading anything. A second concurrent invocation for the same
+    // order blocks on this line until the first one's transaction commits
+    // (the lock is transaction-scoped — pg_advisory_xact_lock — so it
+    // releases automatically, no explicit unlock needed), at which point
+    // its own findUnique correctly sees the row the first invocation just
+    // wrote. Two invocations for two DIFFERENT orders never block each
+    // other — hashtext(shopifyOrderId) only collides key-for-key.
+    const saved = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${String(order.id)}))`;
 
-    const saved = await prisma.order.upsert({
-      where: { shopifyOrderId: String(order.id) },
-      create: {
-        shopifyOrderId: String(order.id),
-        customerId,
-        orderNumber: String(order.name || order.order_number || order.id),
-        totalPrice: parseFloat(order.total_price || 0),
-        currency: order.currency || "INR",
-        financialStatus: order.financial_status || "unknown",
-        fulfillmentStatus: order.fulfillment_status || null,
-        lineItems: order.line_items || [],
-        discountCodes: (order.discount_codes || []).map((d) => d.code),
-        placedAt: order.created_at ? new Date(order.created_at) : new Date(),
-      },
-      update: {
-        customerId,
-        financialStatus: order.financial_status || "unknown",
-        fulfillmentStatus: order.fulfillment_status || null,
-        lineItems: order.line_items || [],
-        discountCodes: (order.discount_codes || []).map((d) => d.code),
-      },
-    });
+      // Read the previous state so we can tell create from update, and log
+      // only real changes (Shopify re-delivers webhooks).
+      const existing = await tx.order.findUnique({
+        where: { shopifyOrderId: String(order.id) },
+        select: { id: true, financialStatus: true, fulfillmentStatus: true },
+      });
 
-    if (!existing) {
-      await prisma.auditLog.create({
-        data: {
-          actorType: "SYSTEM",
-          action: "order_created",
-          entityType: "Order",
-          entityId: saved.id,
-          afterState: {
-            orderNumber: saved.orderNumber,
-            financialStatus: saved.financialStatus,
-            fulfillmentStatus: saved.fulfillmentStatus,
-            totalPrice: saved.totalPrice,
-          },
-          source: "shopify_webhook",
+      const saved = await tx.order.upsert({
+        where: { shopifyOrderId: String(order.id) },
+        create: {
+          shopifyOrderId: String(order.id),
+          customerId,
+          orderNumber: String(order.name || order.order_number || order.id),
+          totalPrice: parseFloat(order.total_price || 0),
+          currency: order.currency || "INR",
+          financialStatus: order.financial_status || "unknown",
+          fulfillmentStatus: order.fulfillment_status || null,
+          lineItems: order.line_items || [],
+          discountCodes: (order.discount_codes || []).map((d) => d.code),
+          placedAt: order.created_at ? new Date(order.created_at) : new Date(),
+        },
+        update: {
+          customerId,
+          financialStatus: order.financial_status || "unknown",
+          fulfillmentStatus: order.fulfillment_status || null,
+          lineItems: order.line_items || [],
+          discountCodes: (order.discount_codes || []).map((d) => d.code),
         },
       });
 
-      // Roll this genuinely-new order into the linked Customer's aggregate
-      // stats. Gated on `!existing` (first time THIS shopifyOrderId is
-      // seen) so a webhook redelivery — orders/create retried, or
-      // orders/updated arriving for the same order — never double-counts.
-      // Read-then-write rather than Prisma's atomic `increment` for
-      // lifetimeValue/orderCount because avgOrderValue and lastOrderAt are
-      // derived from the post-update values, not simple increments.
-      if (saved.customerId) {
-        const customer = await prisma.customer.findUnique({
-          where: { id: saved.customerId },
-          select: { orderCount: true, lifetimeValue: true, lastOrderAt: true },
+      if (!existing) {
+        await tx.auditLog.create({
+          data: {
+            actorType: "SYSTEM",
+            action: "order_created",
+            entityType: "Order",
+            entityId: saved.id,
+            afterState: {
+              orderNumber: saved.orderNumber,
+              financialStatus: saved.financialStatus,
+              fulfillmentStatus: saved.fulfillmentStatus,
+              totalPrice: saved.totalPrice,
+            },
+            source: "shopify_webhook",
+          },
         });
-        if (customer) {
-          const newOrderCount = customer.orderCount + 1;
-          const newLifetimeValue =
-            Number(customer.lifetimeValue) + Number(saved.totalPrice);
-          const newAvgOrderValue =
-            newOrderCount > 0 ? newLifetimeValue / newOrderCount : 0;
-          const newLastOrderAt =
-            !customer.lastOrderAt || saved.placedAt > customer.lastOrderAt
-              ? saved.placedAt
-              : customer.lastOrderAt;
 
-          const updatedCustomer = await prisma.customer.update({
+        // Roll this genuinely-new order into the linked Customer's aggregate
+        // stats. Gated on `!existing` (first time THIS shopifyOrderId is
+        // seen) so a webhook redelivery — orders/create retried, or
+        // orders/updated arriving for the same order — never double-counts.
+        // Read-then-write rather than Prisma's atomic `increment` for
+        // lifetimeValue/orderCount because avgOrderValue and lastOrderAt are
+        // derived from the post-update values, not simple increments.
+        // Safe from the race now — see the advisory lock above.
+        if (saved.customerId) {
+          const customer = await tx.customer.findUnique({
             where: { id: saved.customerId },
-            data: {
-              orderCount: newOrderCount,
-              lifetimeValue: newLifetimeValue,
-              avgOrderValue: newAvgOrderValue,
-              lastOrderAt: newLastOrderAt,
-              updatedAt: new Date(),
+            select: {
+              orderCount: true,
+              lifetimeValue: true,
+              lastOrderAt: true,
             },
           });
+          if (customer) {
+            const newOrderCount = customer.orderCount + 1;
+            const newLifetimeValue =
+              Number(customer.lifetimeValue) + Number(saved.totalPrice);
+            const newAvgOrderValue =
+              newOrderCount > 0 ? newLifetimeValue / newOrderCount : 0;
+            const newLastOrderAt =
+              !customer.lastOrderAt || saved.placedAt > customer.lastOrderAt
+                ? saved.placedAt
+                : customer.lastOrderAt;
 
-          // NEW — real-time membership invite. A genuinely new order (this
-          // whole block is inside the `!existing` branch) from a customer
-          // who isn't a member yet is exactly the moment to ask: fresh off
-          // an order, free program, no catch. maybeSendMembershipInvite
-          // handles its own eligibility check (once ever per customer) and
-          // never throws — a failure here must not turn a successful order
-          // sync into a 500. updatedCustomer (not the pre-update `customer`
-          // fetched above) is used so isMember/firstName reflect anything
-          // this same update just changed.
-          await maybeSendMembershipInvite(updatedCustomer);
+            const updatedCustomer = await tx.customer.update({
+              where: { id: saved.customerId },
+              data: {
+                orderCount: newOrderCount,
+                lifetimeValue: newLifetimeValue,
+                avgOrderValue: newAvgOrderValue,
+                lastOrderAt: newLastOrderAt,
+                updatedAt: new Date(),
+              },
+            });
+
+            // NEW — real-time membership invite. A genuinely new order (this
+            // whole block is inside the `!existing` branch, which the
+            // advisory lock above now guarantees only ONE concurrent
+            // invocation ever enters per order) from a customer who isn't a
+            // member yet is exactly the moment to ask: fresh off an order,
+            // free program, no catch. Stashed on `saved` and sent AFTER this
+            // transaction commits (see below the $transaction call) — a
+            // network call has no business holding the DB lock open.
+            saved.__updatedCustomerForInvite = updatedCustomer;
+          }
         }
+      } else if (
+        existing.financialStatus !== saved.financialStatus ||
+        existing.fulfillmentStatus !== saved.fulfillmentStatus
+      ) {
+        await tx.auditLog.create({
+          data: {
+            actorType: "SYSTEM",
+            action: "order_status_changed",
+            entityType: "Order",
+            entityId: saved.id,
+            beforeState: {
+              financialStatus: existing.financialStatus,
+              fulfillmentStatus: existing.fulfillmentStatus,
+            },
+            afterState: {
+              financialStatus: saved.financialStatus,
+              fulfillmentStatus: saved.fulfillmentStatus,
+            },
+            source: "shopify_webhook",
+          },
+        });
       }
-    } else if (
-      existing.financialStatus !== saved.financialStatus ||
-      existing.fulfillmentStatus !== saved.fulfillmentStatus
-    ) {
-      await prisma.auditLog.create({
-        data: {
-          actorType: "SYSTEM",
-          action: "order_status_changed",
-          entityType: "Order",
-          entityId: saved.id,
-          beforeState: {
-            financialStatus: existing.financialStatus,
-            fulfillmentStatus: existing.fulfillmentStatus,
-          },
-          afterState: {
-            financialStatus: saved.financialStatus,
-            fulfillmentStatus: saved.fulfillmentStatus,
-          },
-          source: "shopify_webhook",
-        },
-      });
+
+      return saved;
+    });
+
+    // Fires only for the invocation that actually won the lock race and
+    // found a genuinely new order with a resolved Customer (see
+    // __updatedCustomerForInvite above) — outside the transaction since
+    // sendTemplate is a real network call and shouldn't hold the DB
+    // transaction/lock open while it runs.
+    if (saved.__updatedCustomerForInvite) {
+      await maybeSendMembershipInvite(saved.__updatedCustomerForInvite);
     }
 
     // deliveredAt = first observed fulfilled; set once only.
