@@ -3,8 +3,15 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // DATABASE_URL (port 6543) is Supabase's pooled PgBouncer connection,
+  // transaction mode — it doesn't support the session-level features
+  // (advisory locks) `prisma db push`/`migrate` need, which made those
+  // commands hang indefinitely with no error. directUrl (port 5432,
+  // non-pooled) is used by Prisma only for push/migrate; the app's own
+  // runtime queries keep going through the pooled url above.
+  directUrl = env("DIRECT_URL")
 }
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
@@ -489,6 +496,11 @@ model Supplier {
   isActive         Boolean           @default(true)
   reliabilityScore Int               @default(100)
   avgResponseMins  Int?
+  // Auth for the public supplier stock-check portal page — the token
+  // itself is the auth, same posture as ProductDraft.approvalToken, but
+  // long-lived (not single-use) since a supplier revisits this every
+  // check-in cycle. Regenerable from the dashboard if it ever leaks.
+  portalToken      String?           @unique
   Conversation     Conversation[]
   ProductDraft     ProductDraft[]
   SupplierCheck    SupplierCheck[]
@@ -766,6 +778,14 @@ model BroadcastCampaign {
   headerText          String?
   footerText          String?
   buttons             Json?    @default("[]")
+  // Restored — this repo's schema.prisma had silently dropped this field
+  // even though the live column (and the scheduler repo's own schema,
+  // which actively reads/writes it in jobs/campaignImageCleanup.js) still
+  // has it, with 12 real non-null values. A `prisma db push` from this
+  // repo would have DROPPED it — caught before that happened because the
+  // pooled-connection hang (see datasource block above) blocked every
+  // db push attempt until now.
+  imageDeletedAt      DateTime? @db.Timestamptz(6)
 
   @@index([status], map: "idx_broadcastcampaign_status")
 }

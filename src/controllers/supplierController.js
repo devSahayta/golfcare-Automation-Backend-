@@ -4,9 +4,14 @@
 // deactivate added so staff can onboard real suppliers and manage their
 // brand assignments from the dashboard instead of hand-editing the DB.
 
+const crypto = require("crypto");
 const { prisma } = require("../lib/prisma");
 const { backfillSupplierProductsByBrand } = require("../services/supplierProductBackfill");
 const { validateBrandAssignment, cleanupUnlinkedBrandProducts } = require("../services/supplierBrandRules");
+
+function generatePortalToken() {
+  return crypto.randomBytes(24).toString("hex");
+}
 
 async function listSuppliers(req, res) {
   const { search, isActive, limit, offset } = req.query;
@@ -147,6 +152,9 @@ async function createSupplier(req, res) {
         checkDayOfWeek: checkDayOfWeek ?? null,
         checkHour: checkHour ?? 10,
         isActive: isActive ?? true,
+        // Generated up front so the stock-check portal link exists
+        // immediately — no extra staff step before it can be shared.
+        portalToken: generatePortalToken(),
       },
     });
 
@@ -359,6 +367,38 @@ async function deleteSupplierPermanently(req, res) {
   }
 }
 
+// POST /api/suppliers/:id/portal-token/regenerate — issues a fresh stock-
+// check portal token, invalidating the old link (e.g. if it leaked).
+async function regenerateSupplierPortalToken(req, res) {
+  const { id } = req.params;
+
+  try {
+    const existing = await prisma.supplier.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ error: "Supplier not found" });
+
+    const supplier = await prisma.supplier.update({
+      where: { id },
+      data: { portalToken: generatePortalToken() },
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        actorType: "STAFF",
+        actorId: req.staffUser.id,
+        action: "SUPPLIER_PORTAL_TOKEN_REGENERATED",
+        entityType: "Supplier",
+        entityId: id,
+        source: "suppliers_dashboard",
+      },
+    });
+
+    res.json({ supplier });
+  } catch (err) {
+    console.error("regenerateSupplierPortalToken error:", err);
+    res.status(500).json({ error: "Failed to regenerate portal link" });
+  }
+}
+
 module.exports = {
   listSuppliers,
   getSupplierById,
@@ -367,4 +407,5 @@ module.exports = {
   updateSupplier,
   deactivateSupplier,
   deleteSupplierPermanently,
+  regenerateSupplierPortalToken,
 };
