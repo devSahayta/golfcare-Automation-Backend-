@@ -2,12 +2,12 @@
 const crypto = require("crypto");
 const { prisma } = require("../../lib/prisma");
 const { env } = require("../../config/env");
-const { setAvailability, bulkSetAvailabilityDbOnly } = require("../availabilityService");
 const { createDraftProduct } = require("../shopifyProductCreate");
 const { sendProductDraftApprovalEmail } = require("../emailService");
-const { updateVariantPrice, updateInventoryItemCost } = require("../shopifyInventory");
+const { updateInventoryItemCost } = require("../shopifyInventory");
 const { computeCostPrice } = require("../pricingCalculator");
 const { researchProductSpecs } = require("./productResearch");
+const { getOpenCheckin, applyConfirmation, confirmAllPendingItems } = require("../supplierCheckinService");
 
 function buildSupplierAgentTools(context) {
   const supplier = context.supplier;
@@ -166,10 +166,7 @@ function buildSupplierAgentTools(context) {
     // with a huge tool result, regardless of what the model decides to do.
     async list_pending_items() {
       if (!supplier) return { error: "no_supplier_on_conversation" };
-      const check = await prisma.supplierCheck.findFirst({
-        where: { supplierId: supplier.id, status: "SENT" },
-        orderBy: { sentAt: "desc" },
-      });
+      const check = await getOpenCheckin({ supplierId: supplier.id });
       const items = Array.isArray(check?.items) ? check.items : [];
       if (items.length === 0) return { error: "no_open_check_in" };
 
@@ -215,106 +212,7 @@ function buildSupplierAgentTools(context) {
     // logged to AuditLog as deferred rather than silently dropped.
     async confirm_all_pending_items({ status, leadTimeDays }) {
       if (!supplier) return { error: "no_supplier_on_conversation" };
-
-      const check = await prisma.supplierCheck.findFirst({
-        where: { supplierId: supplier.id, status: "SENT" },
-        orderBy: { sentAt: "desc" },
-      });
-      if (!check) return { error: "no_open_check_in" };
-
-      const items = Array.isArray(check.items) ? check.items : [];
-      const supplierProductIds = items.map((i) => i.supplierProductId).filter(Boolean);
-      if (supplierProductIds.length === 0) return { error: "check_in_has_no_items" };
-
-      const supplierProducts = await prisma.supplierProduct.findMany({
-        where: { id: { in: supplierProductIds }, supplierId: supplier.id },
-      });
-
-      await prisma.supplierProduct.updateMany({
-        where: { id: { in: supplierProducts.map((sp) => sp.id) } },
-        data: { lastConfirmedStatus: status, lastConfirmedAt: new Date() },
-      });
-
-      // Module 2's fan-in policy: only the primary supplier's confirmation
-      // drives the actual storefront-facing AvailabilityState.
-      const primaryTargets = supplierProducts.filter((sp) => sp.isPrimary && sp.variantId);
-      const syncCap = env.bulkConfirmShopifySyncCap;
-
-      // Sequential + paced, not concurrent, for the small inline-Shopify
-      // slice — confirmed live: concurrency 3 here meant up to 3 variants'
-      // worth of Shopify calls in flight at once, and each variant sync is
-      // itself up to 3 sequential Admin API calls, so this was really
-      // bursting far more than 3 req/sec against a ~2 req/sec limit
-      // ("Exceeded 2 calls per second" on 18 of 100). Any call that still
-      // fails (rate limit or otherwise) now gets queued for retry too (see
-      // availabilityService.js), so this doesn't need to be perfectly
-      // rate-safe, just not actively hostile to it.
-      const deferredTargets = primaryTargets.slice(syncCap);
-      const [syncedResults] = await Promise.all([
-        mapSequentialPaced(primaryTargets.slice(0, syncCap), env.shopifySyncPaceMs, (sp) =>
-          setAvailability({
-            variantId: sp.variantId,
-            productId: sp.productId,
-            status,
-            source: "SUPPLIER_CONFIRMED",
-            changedBy: supplier.id,
-            leadTimeDays: leadTimeDays ?? null,
-          }),
-        ),
-        // Bulk, not one setAvailability() transaction per item — confirmed
-        // live this matters, not just in theory: even DB-only (no Shopify
-        // call) at a conservative concurrency of 5, ~2,200 variants took
-        // 22.9 minutes over a real network connection to Postgres, useless
-        // for anything replying to a WhatsApp message. bulkSetAvailabilityDbOnly
-        // does the same three writes (AvailabilityState, AvailabilityLog,
-        // Event) as a handful of bulk queries instead of thousands of
-        // individual transactions, and always queues every target for the
-        // scheduler's Shopify sync.
-        bulkSetAvailabilityDbOnly({
-          targets: deferredTargets.map((sp) => ({ variantId: sp.variantId, productId: sp.productId })),
-          status,
-          source: "SUPPLIER_CONFIRMED",
-          changedBy: supplier.id,
-          leadTimeDays: leadTimeDays ?? null,
-        }),
-      ]);
-
-      if (deferredTargets.length > 0) {
-        await prisma.auditLog.create({
-          data: {
-            actorType: "SYSTEM",
-            action: "shopify_inventory_sync_deferred_bulk_confirm",
-            entityType: "SupplierCheck",
-            entityId: check.id,
-            afterState: {
-              supplierId: supplier.id,
-              status,
-              deferredCount: deferredTargets.length,
-            },
-            source: "supplier_agent",
-          },
-        });
-      }
-
-      await prisma.supplierCheck.update({
-        where: { id: check.id },
-        data: {
-          status: "ANSWERED",
-          respondedAt: new Date(),
-          parsedBy: "supplier_agent",
-          rawReplies: {
-            ...(check.rawReplies || {}),
-            blanketConfirmation: { status, confirmedAt: new Date().toISOString() },
-          },
-        },
-      });
-
-      return {
-        totalItems: items.length,
-        confirmedCount: supplierProducts.length,
-        shopifySynced: syncedResults.length,
-        shopifyDeferred: deferredTargets.length,
-      };
+      return confirmAllPendingItems({ supplier, status, leadTimeDays });
     },
 
     // Runs the actual web research in its OWN isolated Anthropic call (see
@@ -763,150 +661,6 @@ async function findExistingPendingDraft(supplierId, title) {
   );
 }
 
-// Shared by confirm_availability and reconcile_stock_list — updates the
-// SupplierProduct's own record, conditionally drives AvailabilityState
-// (module 2's fan-in policy: only isPrimary && variantId), handles the
-// margin/GST cost-price calculation (see pricingCalculator.js) when an
-// mrp is given, and closes out the open check-in's bookkeeping.
-//
-// Pricing behaviour: margin/GST are asked for once per SupplierProduct,
-// then remembered — if they're already on file (or given again this
-// call), the cost price is recomputed from the new mrp and the live
-// Shopify price is updated to match (Golf Care is pure dropship — it
-// doesn't set retail prices independently of suppliers). If they're
-// NOT on file and weren't given, nothing is guessed: the status/leadTime
-// side of the confirmation still goes through, but needsPricingInfo comes
-// back true so the caller knows to ask the supplier specifically about
-// this item, not the whole batch.
-async function applyConfirmation({
-  supplier,
-  supplierProduct,
-  status,
-  leadTimeDays,
-  mrp,
-  marginPercent,
-  gstPercent,
-}) {
-  await prisma.supplierProduct.update({
-    where: { id: supplierProduct.id },
-    data: {
-      lastConfirmedStatus: status,
-      lastConfirmedAt: new Date(),
-    },
-  });
-
-  let appliedToAvailability = false;
-  if (supplierProduct.isPrimary && supplierProduct.variantId) {
-    await setAvailability({
-      variantId: supplierProduct.variantId,
-      productId: supplierProduct.productId,
-      status,
-      source: "SUPPLIER_CONFIRMED",
-      changedBy: supplier.id,
-      leadTimeDays: leadTimeDays ?? null,
-    });
-    appliedToAvailability = true;
-  }
-
-  await recordConfirmationOnOpenCheck({
-    supplierId: supplier.id,
-    supplierProductId: supplierProduct.id,
-    status,
-    leadTimeDays: leadTimeDays ?? null,
-  });
-
-  let pricingUpdated = false;
-  let needsPricingInfo = false;
-  if (mrp != null) {
-    const resolvedMargin =
-      marginPercent != null ? marginPercent : numberOrNull(supplierProduct.marginPercent);
-    const resolvedGst =
-      gstPercent != null ? gstPercent : numberOrNull(supplierProduct.gstPercent);
-
-    if (resolvedMargin != null && resolvedGst != null) {
-      const costPrice = computeCostPrice({
-        mrp,
-        marginPercent: resolvedMargin,
-        gstPercent: resolvedGst,
-      });
-      await prisma.supplierProduct.update({
-        where: { id: supplierProduct.id },
-        data: { costPrice, marginPercent: resolvedMargin, gstPercent: resolvedGst },
-      });
-
-      if (supplierProduct.variantId) {
-        const variant = await prisma.variant.findUnique({
-          where: { id: supplierProduct.variantId },
-          select: { shopifyVariantId: true },
-        });
-        if (variant) {
-          const [priceResult, costResult] = await Promise.all([
-            updateVariantPrice(variant.shopifyVariantId, mrp),
-            updateInventoryItemCost(variant.shopifyVariantId, costPrice),
-          ]);
-          if (!priceResult.ok) {
-            console.error(
-              `[supplierAgentTools] Shopify price sync failed for variant ${supplierProduct.variantId}:`,
-              priceResult.error,
-            );
-            await prisma.auditLog.create({
-              data: {
-                actorType: "SYSTEM",
-                action: "shopify_price_sync_failed",
-                entityType: "Variant",
-                entityId: supplierProduct.variantId,
-                afterState: { mrp, error: priceResult.error },
-                source: "supplier_agent",
-              },
-            });
-          }
-          if (!costResult.ok) {
-            console.error(
-              `[supplierAgentTools] Shopify cost sync failed for variant ${supplierProduct.variantId}:`,
-              costResult.error,
-            );
-            await prisma.auditLog.create({
-              data: {
-                actorType: "SYSTEM",
-                action: "shopify_cost_sync_failed",
-                entityType: "Variant",
-                entityId: supplierProduct.variantId,
-                afterState: { costPrice, error: costResult.error },
-                source: "supplier_agent",
-              },
-            });
-          }
-        }
-      }
-      pricingUpdated = true;
-    } else {
-      needsPricingInfo = true;
-    }
-  }
-
-  return { appliedToAvailability, pricingUpdated, needsPricingInfo };
-}
-
-function numberOrNull(value) {
-  return value == null ? null : Number(value);
-}
-
-// confirm_all_pending_items' pacing helper for the small inline-Shopify
-// slice — one at a time, with a real delay between each. Shopify's rate
-// limit is per-request, not per-variant, and each variant sync here is
-// itself up to 3 sequential requests, so even bounded concurrency
-// (confirmed live, at 3) still bursts several times that in requests/sec.
-async function mapSequentialPaced(items, delayMs, fn) {
-  const results = [];
-  for (let i = 0; i < items.length; i++) {
-    results.push(await fn(items[i]));
-    if (i < items.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-  return results;
-}
-
 // --- reconcile_stock_list matching (v1 heuristic — see the note on
 // search_products in salesAgentTools.js; same "no embedding pipeline
 // decided yet" situation applies here) ---
@@ -1081,55 +835,6 @@ async function findExistingCatalogMatch({ title, sku, variantOptions }) {
   if (variantScored.length > 1 && variantScored[1].score >= variantScored[0].score) return null;
 
   return { product, variant: variantScored[0].variant };
-}
-
-// Appends this confirmation to the currently-open SupplierCheck's
-// rawReplies, and flips it to ANSWERED once every item in `items` has a
-// matching confirmation. Re-reads the check fresh rather than trusting
-// context.pendingCheck, since a supplier can confirm several items across
-// several tool calls within the same turn.
-async function recordConfirmationOnOpenCheck({
-  supplierId,
-  supplierProductId,
-  status,
-  leadTimeDays,
-}) {
-  const check = await prisma.supplierCheck.findFirst({
-    where: { supplierId, status: "SENT" },
-    orderBy: { sentAt: "desc" },
-  });
-  if (!check) return; // e.g. supplier volunteering a status update outside any open check-in
-
-  const rawReplies = check.rawReplies || {};
-  const confirmations = Array.isArray(rawReplies.confirmations)
-    ? rawReplies.confirmations.filter(
-        (c) => c.supplierProductId !== supplierProductId,
-      )
-    : [];
-  confirmations.push({
-    supplierProductId,
-    status,
-    leadTimeDays,
-    confirmedAt: new Date().toISOString(),
-  });
-
-  const items = Array.isArray(check.items) ? check.items : [];
-  const allConfirmed =
-    items.length > 0 &&
-    items.every((item) =>
-      confirmations.some(
-        (c) => c.supplierProductId === item.supplierProductId,
-      ),
-    );
-
-  await prisma.supplierCheck.update({
-    where: { id: check.id },
-    data: {
-      rawReplies: { ...rawReplies, confirmations },
-      parsedBy: "supplier_agent",
-      ...(allConfirmed && { status: "ANSWERED", respondedAt: new Date() }),
-    },
-  });
 }
 
 // PendingProductLead upsert/resolve — see the model's schema comment for

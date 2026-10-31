@@ -10,6 +10,7 @@ const {
   updateSupplier,
   deactivateSupplier,
   deleteSupplierPermanently,
+  regenerateSupplierPortalToken,
 } = require("../controllers/supplierController");
 
 const router = Router();
@@ -24,5 +25,6 @@ router.get("/:id", getSupplierById);
 router.patch("/:id", requireStaffAuth, updateSupplier);
 router.delete("/:id", requireStaffAuth, deactivateSupplier);
 router.delete("/:id/permanent", requireStaffAuth, deleteSupplierPermanently);
+router.post("/:id/portal-token/regenerate", requireStaffAuth, regenerateSupplierPortalToken);
 
 module.exports = router;
