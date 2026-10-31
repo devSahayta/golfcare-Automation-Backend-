@@ -140,6 +140,12 @@ const env = {
   campaignTemplates: {
     BIRTHDAY: process.env.BIRTHDAY_TEMPLATE_NAME || "",
     REPLENISHMENT: process.env.REPLENISHMENT_TEMPLATE_NAME || "",
+    // NEW — pre-approved Meta/Samvaadik template for the real-time
+    // post-order membership invite (see membershipInviteService.js). Same
+    // "static lane" pattern as the two above: one fixed, pre-approved
+    // template, created and approved outside this codebase, referenced
+    // here only by name.
+    MEMBERSHIP_INVITE: process.env.MEMBERSHIP_INVITE_TEMPLATE_NAME || "",
   },
 };
 

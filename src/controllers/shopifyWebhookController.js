@@ -23,6 +23,9 @@
 // don't reintroduce it here.
 
 const { prisma } = require("../lib/prisma");
+const {
+  maybeSendMembershipInvite,
+} = require("../services/membershipInviteService");
 
 function computePriceRange(variants) {
   const prices = (variants || [])
@@ -30,6 +33,38 @@ function computePriceRange(variants) {
     .filter((p) => !Number.isNaN(p));
   if (prices.length === 0) return { priceMin: 0, priceMax: 0 };
   return { priceMin: Math.min(...prices), priceMax: Math.max(...prices) };
+}
+
+// Normalizes a raw phone string from Shopify into the same bare-digits,
+// country-code-prefixed format already used for waPhone everywhere else in
+// the system (confirmed from a real Customer row: "916382592767" — digits
+// only, "91" + 10-digit number, no "+", no spaces/dashes). Shopify can hand
+// back "+91 63825 92767", "+916382592767", a bare 10-digit local number, or
+// occasionally a leading-0 STD-style number, depending on how the customer
+// entered it at checkout — all four collapse to the same normalized form.
+//
+// Deliberately conservative: if the digit count doesn't match a recognizable
+// Indian mobile number, this returns null rather than guessing — creating a
+// Customer row with a wrong waPhone would silently break future WhatsApp
+// sends to them (wrong recipient, or simply undeliverable) and would never
+// self-correct, since nothing else in the system re-derives waPhone later.
+function normalizePhone(raw) {
+  if (!raw) {
+    console.log(
+      `[shopify webhook] normalizePhone called with no value (null/undefined/empty) — nothing to normalize.`,
+    );
+    return null;
+  }
+  const digits = String(raw).replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.length === 10) return `91${digits}`;
+  if (digits.length === 12 && digits.startsWith("91")) return digits;
+  if (digits.length === 11 && digits.startsWith("0"))
+    return `91${digits.slice(1)}`;
+  console.log(
+    `[shopify webhook] phone "${raw}" didn't normalize to a recognizable Indian number — skipping.`,
+  );
+  return null;
 }
 
 // Module 6 — category-based defaults for isConsumable/replenishDays/
@@ -243,24 +278,125 @@ async function handleInventoryLevelUpdate(req, res) {
   res.status(200).send("ok");
 }
 
+/* ─── shared: resolve-or-create a Customer from a Shopify "customer" blob ── */
+//
+// Used by both handleOrderUpsert (fallback) and handleCustomerUpsert
+// (primary path). Centralized so both handlers agree on exactly what
+// counts as "the same customer" and how a brand-new one gets created —
+// previously handleCustomerUpsert had its own copy of this logic and
+// simply never created anything on a miss (see handleCustomerUpsert's
+// comment below for why that was a real bug for website-only customers).
+//
+// Returns the Customer's internal id, or null if there's no usable phone
+// to key off (waPhone is required + unique on the schema, so a Customer
+// row can never be created without one).
+async function resolveOrCreateCustomerFromShopify({
+  shopifyCustomerId,
+  phoneRaw,
+  firstName,
+  lastName,
+  email,
+}) {
+  // 1. Already linked by shopifyCustomerId — nothing to do.
+  if (shopifyCustomerId) {
+    const byShopifyId = await prisma.customer.findUnique({
+      where: { shopifyCustomerId: String(shopifyCustomerId) },
+      select: { id: true },
+    });
+    if (byShopifyId) return byShopifyId.id;
+  }
+
+  const phone = normalizePhone(phoneRaw);
+  if (!phone) return null;
+
+  // 2. An existing Customer (e.g. onboarded via the WhatsApp agent) with
+  //    this phone but no shopifyCustomerId yet — link it.
+  const byPhone = await prisma.customer.findUnique({
+    where: { waPhone: phone },
+    select: { id: true, shopifyCustomerId: true },
+  });
+  if (byPhone) {
+    if (shopifyCustomerId && !byPhone.shopifyCustomerId) {
+      await prisma.customer.update({
+        where: { id: byPhone.id },
+        data: {
+          shopifyCustomerId: String(shopifyCustomerId),
+          updatedAt: new Date(),
+        },
+      });
+    }
+    return byPhone.id;
+  }
+
+  // 3. No match anywhere — this is a genuinely new, website-only customer.
+  //    Create them so they're visible in the Customers table and reachable
+  //    by the sales agent for follow-up, same as a WhatsApp-onboarded one.
+  try {
+    const created = await prisma.customer.create({
+      data: {
+        shopifyCustomerId: shopifyCustomerId ? String(shopifyCustomerId) : null,
+        waPhone: phone,
+        firstName: firstName || null,
+        lastName: lastName || null,
+        email: email || null,
+      },
+    });
+    console.log(
+      `[shopify webhook] created new Customer ${created.id} from Shopify data (phone ${phone}).`,
+    );
+    return created.id;
+  } catch (err) {
+    // Unique constraint race — another webhook for the same customer
+    // (e.g. customers/create and orders/create arriving back-to-back)
+    // created the row a moment ago. Look it up instead of failing.
+    if (err.code === "P2002") {
+      const retried = await prisma.customer.findUnique({
+        where: { waPhone: phone },
+        select: { id: true },
+      });
+      return retried?.id || null;
+    }
+    throw err;
+  }
+}
+
 /* ─── orders/create, orders/updated ─────────────────────────────────────── */
 
-// REPLACE handleOrderUpsert in controllers/shopifyWebhookController.js with this.
-// Adds audit logging for order creation and status changes.
 // All DB work is awaited BEFORE res.send() (serverless constraint).
-
 async function handleOrderUpsert(req, res) {
   const order = req.body;
 
+  // Unconditional entry log — fires every time this handler runs, regardless
+  // of what happens downstream, so a "nothing happened" test case is always
+  // visible in the logs rather than looking identical to "handler never ran."
+  console.log(
+    `[shopify webhook] orders webhook received — shopifyOrderId=${order.id}, name=${order.name}, customer.id=${order.customer?.id ?? "none"}, phone candidates: customer.phone=${order.customer?.phone ?? "none"}, customer.default_address.phone=${order.customer?.default_address?.phone ?? "none"}, order.phone=${order.phone ?? "none"}, billing_address.phone=${order.billing_address?.phone ?? "none"}, shipping_address.phone=${order.shipping_address?.phone ?? "none"}`,
+  );
+
   try {
-    let customerId = null;
-    if (order.customer?.id) {
-      const matched = await prisma.customer.findUnique({
-        where: { shopifyCustomerId: String(order.customer.id) },
-        select: { id: true },
-      });
-      customerId = matched?.id || null;
-    }
+    // Resolve the Customer from Shopify's own numeric id first (fast path,
+    // works once customers/create has run for this buyer at some point).
+    //
+    // Fallback: Shopify does NOT guarantee orders/create arrives after
+    // customers/create for the same checkout, and a guest checkout can
+    // omit the customer webhook entirely — so if the id lookup misses,
+    // resolve-or-create from the order's own embedded customer/contact
+    // data instead. This is what makes order sync self-sufficient for a
+    // pure website buyer: the order is never left permanently orphaned
+    // just because another webhook didn't fire first (or at all).
+    const customerId = await resolveOrCreateCustomerFromShopify({
+      shopifyCustomerId: order.customer?.id || null,
+      phoneRaw:
+        order.customer?.phone ||
+        order.customer?.default_address?.phone ||
+        order.phone ||
+        order.billing_address?.phone ||
+        order.shipping_address?.phone ||
+        null,
+      firstName: order.customer?.first_name || null,
+      lastName: order.customer?.last_name || null,
+      email: order.customer?.email || order.email || null,
+    });
 
     // Read the previous state so we can tell create from update, and log
     // only real changes (Shopify re-delivers webhooks).
@@ -308,6 +444,53 @@ async function handleOrderUpsert(req, res) {
           source: "shopify_webhook",
         },
       });
+
+      // Roll this genuinely-new order into the linked Customer's aggregate
+      // stats. Gated on `!existing` (first time THIS shopifyOrderId is
+      // seen) so a webhook redelivery — orders/create retried, or
+      // orders/updated arriving for the same order — never double-counts.
+      // Read-then-write rather than Prisma's atomic `increment` for
+      // lifetimeValue/orderCount because avgOrderValue and lastOrderAt are
+      // derived from the post-update values, not simple increments.
+      if (saved.customerId) {
+        const customer = await prisma.customer.findUnique({
+          where: { id: saved.customerId },
+          select: { orderCount: true, lifetimeValue: true, lastOrderAt: true },
+        });
+        if (customer) {
+          const newOrderCount = customer.orderCount + 1;
+          const newLifetimeValue =
+            Number(customer.lifetimeValue) + Number(saved.totalPrice);
+          const newAvgOrderValue =
+            newOrderCount > 0 ? newLifetimeValue / newOrderCount : 0;
+          const newLastOrderAt =
+            !customer.lastOrderAt || saved.placedAt > customer.lastOrderAt
+              ? saved.placedAt
+              : customer.lastOrderAt;
+
+          const updatedCustomer = await prisma.customer.update({
+            where: { id: saved.customerId },
+            data: {
+              orderCount: newOrderCount,
+              lifetimeValue: newLifetimeValue,
+              avgOrderValue: newAvgOrderValue,
+              lastOrderAt: newLastOrderAt,
+              updatedAt: new Date(),
+            },
+          });
+
+          // NEW — real-time membership invite. A genuinely new order (this
+          // whole block is inside the `!existing` branch) from a customer
+          // who isn't a member yet is exactly the moment to ask: fresh off
+          // an order, free program, no catch. maybeSendMembershipInvite
+          // handles its own eligibility check (once ever per customer) and
+          // never throws — a failure here must not turn a successful order
+          // sync into a 500. updatedCustomer (not the pre-update `customer`
+          // fetched above) is used so isMember/firstName reflect anything
+          // this same update just changed.
+          await maybeSendMembershipInvite(updatedCustomer);
+        }
+      }
     } else if (
       existing.financialStatus !== saved.financialStatus ||
       existing.fulfillmentStatus !== saved.fulfillmentStatus
@@ -347,51 +530,46 @@ async function handleOrderUpsert(req, res) {
 }
 
 /* ─── customers/create, customers/update ────────────────────────────────── */
+
+// Previously: on a miss (no existing Customer with a matching
+// shopifyCustomerId OR phone), this handler just logged
+// "not creating one from Shopify data" and returned 200 — meaning a
+// customer who buys directly on the website and has never contacted you
+// over WhatsApp was silently never added to the Customers table at all,
+// and so was invisible to the sales agent for any follow-up. Now routed
+// through the same resolve-or-create helper handleOrderUpsert's fallback
+// uses, so this case actually creates the row.
 async function handleCustomerUpsert(req, res) {
   const customer = req.body;
 
+  console.log(
+    `[shopify webhook] customers webhook received — shopifyCustomerId=${customer.id}, phone=${customer.phone ?? "none"}, default_address.phone=${customer.default_address?.phone ?? "none"}`,
+  );
+
   try {
-    const byShopifyId = await prisma.customer.findUnique({
-      where: { shopifyCustomerId: String(customer.id) },
-      select: { id: true },
+    const customerId = await resolveOrCreateCustomerFromShopify({
+      shopifyCustomerId: customer.id,
+      phoneRaw: customer.phone || customer.default_address?.phone || null,
+      firstName: customer.first_name || null,
+      lastName: customer.last_name || null,
+      email: customer.email || null,
     });
 
-    if (byShopifyId) {
-      await prisma.customer.update({
-        where: { id: byShopifyId.id },
-        data: { email: customer.email || undefined, updatedAt: new Date() },
-      });
-      res.status(200).send("ok");
-      return;
-    }
-
-    const phone = customer.phone || customer.default_address?.phone;
-    if (!phone) {
+    if (!customerId) {
       console.log(
-        `[shopify webhook] customer ${customer.id} has no phone — can't match to a Customer record, skipping.`,
+        `[shopify webhook] customer ${customer.id} has no usable phone — can't create or match a Customer record, skipping.`,
       );
       res.status(200).send("ok");
       return;
     }
 
-    const byPhone = await prisma.customer.findUnique({
-      where: { waPhone: phone },
-      select: { id: true },
-    });
-
-    if (byPhone) {
+    // Keep email fresh on repeat customers/update deliveries even when no
+    // create/link branch above ran (e.g. already matched by shopifyCustomerId).
+    if (customer.email) {
       await prisma.customer.update({
-        where: { id: byPhone.id },
-        data: {
-          shopifyCustomerId: String(customer.id),
-          email: customer.email || undefined,
-          updatedAt: new Date(),
-        },
+        where: { id: customerId },
+        data: { email: customer.email, updatedAt: new Date() },
       });
-    } else {
-      console.log(
-        `[shopify webhook] no existing Customer matches phone ${phone} — not creating one from Shopify data.`,
-      );
     }
 
     res.status(200).send("ok");
