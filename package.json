@@ -25,6 +25,7 @@
     "jsonwebtoken": "^9.0.3",
     "jszip": "^3.10.2",
     "jwks-rsa": "^4.1.0",
+    "multer": "^2.5.0",
     "pdfjs-dist": "^6.3.289",
     "prisma": "^5.19.0",
     "replicate": "^1.4.0",

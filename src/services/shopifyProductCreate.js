@@ -217,4 +217,19 @@ async function deleteProduct(shopifyProductId) {
   }
 }
 
-module.exports = { createDraftProduct, publishProduct, publishToAllChannels, deleteProduct };
+// Adds an image to an EXISTING product — used by
+// supplierImageSubmissionService.js when staff approves a supplier-submitted
+// photo (see SupplierImageSubmission). Unlike createDraftProduct's image
+// handling, there's no "retry without image" fallback here: if Shopify can't
+// fetch imageUrl (it's our own Supabase Storage URL, not a supplier's
+// short-lived WhatsApp media link, so this should be rare), the caller
+// should surface the failure rather than silently approving with no image.
+async function addProductImage(shopifyProductId, imageUrl) {
+  const client = await shopifyClient();
+  const res = await client.post(`/products/${shopifyProductId}/images.json`, {
+    image: { src: imageUrl },
+  });
+  return res.data.image;
+}
+
+module.exports = { createDraftProduct, publishProduct, publishToAllChannels, deleteProduct, addProductImage };

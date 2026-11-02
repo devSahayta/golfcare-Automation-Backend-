@@ -398,6 +398,7 @@ model Product {
   AvailabilityState AvailabilityState[]
   SupplierProduct   SupplierProduct[]
   Variant           Variant[]
+  SupplierImageSubmission SupplierImageSubmission[]
 
   @@index([embedding], map: "idx_product_embedding")
   @@index([shopifyProductId], map: "idx_product_shopify_id")
@@ -454,6 +455,30 @@ model ProductDraft {
   @@index([approvalStatus])
 }
 
+/// A supplier-submitted photo for a product that currently has NO Shopify
+/// images (see supplierPortalController.js's uploadItemImage — the
+/// zero-images gate is enforced server-side at submission time, not just
+/// hidden in the UI). Staged in Supabase Storage, never auto-published —
+/// same email-approval-by-token posture as ProductDraft above, reusing its
+/// DraftApprovalStatus/ApprovalChannel enums since the shape is identical.
+model SupplierImageSubmission {
+  id             String              @id @default(dbgenerated("(gen_random_uuid())::text"))
+  productId      String
+  supplierId     String
+  imageUrl       String
+  status         DraftApprovalStatus @default(PENDING)
+  approvalToken  String              @unique
+  tokenExpiresAt DateTime            @db.Timestamptz(6)
+  decidedAt      DateTime?           @db.Timestamptz(6)
+  decidedVia     ApprovalChannel?
+  createdAt      DateTime            @default(now()) @db.Timestamptz(6)
+  Product        Product             @relation(fields: [productId], references: [id])
+  Supplier       Supplier            @relation(fields: [supplierId], references: [id])
+
+  @@index([status])
+  @@index([productId])
+}
+
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model Segment {
   id              String            @id @default(dbgenerated("(gen_random_uuid())::text"))
@@ -506,6 +531,7 @@ model Supplier {
   SupplierCheck    SupplierCheck[]
   SupplierProduct  SupplierProduct[]
   ProductImportBatch ProductImportBatch[]
+  SupplierImageSubmission SupplierImageSubmission[]
 }
 
 enum ImportBatchStatus {

@@ -134,6 +134,12 @@ const env = {
   productDraftTokenExpiryDays: Number(
     process.env.PRODUCT_DRAFT_TOKEN_EXPIRY_DAYS || 7,
   ),
+  // Same concept as productDraftTokenExpiryDays, kept as its own knob since
+  // it's a separate approval flow (SupplierImageSubmission, see
+  // supplierImageSubmissionService.js) even though the default matches.
+  supplierImageApprovalTokenExpiryDays: Number(
+    process.env.SUPPLIER_IMAGE_APPROVAL_TOKEN_EXPIRY_DAYS || 7,
+  ),
   // Module 6 — the pre-approved Samvaadik templates used by the static
   // campaign lanes. Same names the scheduler sends with; shown read-only
   // on the Campaigns page.

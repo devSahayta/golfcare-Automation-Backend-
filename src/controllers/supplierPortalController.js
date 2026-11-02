@@ -7,8 +7,12 @@
 // exact same confirmation logic the Supplier Agent uses, just without the
 // chat-specific item-count cap (this is a scrollable page, not a WhatsApp
 // message) and without exposing pricing fields (v1 is stock status only).
+const crypto = require("crypto");
 const { prisma } = require("../lib/prisma");
+const { env } = require("../config/env");
 const { getOpenCheckin, applyConfirmation, confirmAllPendingItems } = require("../services/supplierCheckinService");
+const { uploadSupplierImage } = require("../services/supabaseStorageService");
+const { sendSupplierImageApprovalEmail } = require("../services/emailService");
 
 // GET /api/supplier-portal/:token/items
 //
@@ -106,4 +110,76 @@ async function confirmItem(req, res) {
   }
 }
 
-module.exports = { getPortalItems, confirmAll, confirmItem };
+// POST /api/supplier-portal/:token/items/:supplierProductId/image — multipart, field "image"
+//
+// Zero-images-only gate is enforced here, fresh from the DB — not trusted
+// from what the page happened to show, since the page's own data could be
+// stale by the time this request lands. Never touches Shopify directly:
+// stages the file in Supabase, creates a PENDING SupplierImageSubmission,
+// and emails staff for approval (see supplierImageSubmissionService.js /
+// supplierImageApprovalController.js) — same "agent proposes, human
+// decides" posture as ProductDraft.
+async function uploadItemImage(req, res) {
+  const supplier = req.supplier;
+  const { supplierProductId } = req.params;
+
+  if (!req.file) return res.status(400).json({ error: "image file is required" });
+
+  try {
+    const supplierProduct = await prisma.supplierProduct.findFirst({
+      where: { id: supplierProductId, supplierId: supplier.id },
+      include: { Product: true },
+    });
+    if (!supplierProduct) return res.status(404).json({ error: "Item not found" });
+
+    const product = supplierProduct.Product;
+    if (product.imageUrls.length > 0) {
+      return res.status(409).json({ error: "product_already_has_image" });
+    }
+
+    const existingPending = await prisma.supplierImageSubmission.findFirst({
+      where: { productId: product.id, status: "PENDING" },
+    });
+    if (existingPending) {
+      return res.status(409).json({ error: "submission_already_pending" });
+    }
+
+    const imageUrl = await uploadSupplierImage(req.file.buffer, product.id, req.file.mimetype);
+
+    const approvalToken = crypto.randomBytes(24).toString("hex");
+    const tokenExpiresAt = new Date(
+      Date.now() + env.supplierImageApprovalTokenExpiryDays * 24 * 60 * 60 * 1000,
+    );
+
+    await prisma.supplierImageSubmission.create({
+      data: {
+        productId: product.id,
+        supplierId: supplier.id,
+        imageUrl,
+        approvalToken,
+        tokenExpiresAt,
+      },
+    });
+
+    try {
+      await sendSupplierImageApprovalEmail({
+        token: approvalToken,
+        productTitle: product.title,
+        imageUrl,
+        supplierName: supplier.name,
+      });
+    } catch (emailErr) {
+      // Submission is saved either way — staff can still find it via the
+      // DB if the email itself failed to send (e.g. STAFF_APPROVAL_EMAIL
+      // misconfigured). Don't fail the supplier's upload over it.
+      console.error("uploadItemImage: approval email failed:", emailErr.message);
+    }
+
+    res.json({ status: "pending_review" });
+  } catch (err) {
+    console.error("uploadItemImage error:", err);
+    res.status(500).json({ error: "Failed to upload image" });
+  }
+}
+
+module.exports = { getPortalItems, confirmAll, confirmItem, uploadItemImage };

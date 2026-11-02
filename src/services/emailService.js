@@ -96,4 +96,48 @@ async function sendProductDraftApprovalEmail({
   return { sentTo: env.staffApprovalEmail };
 }
 
-module.exports = { sendProductDraftApprovalEmail };
+/**
+ * Approval email for a supplier-submitted product photo (SupplierImageSubmission
+ * — see supplierPortalController.js's uploadItemImage). Same shape/posture as
+ * sendProductDraftApprovalEmail: a safe GET review page, no direct
+ * approve/reject link (avoids email-scanner prefetch auto-approving).
+ *
+ * @param {object} input
+ * @param {string} input.token - SupplierImageSubmission.approvalToken
+ * @param {string} input.productTitle
+ * @param {string} input.imageUrl
+ * @param {string} [input.supplierName]
+ */
+async function sendSupplierImageApprovalEmail({ token, productTitle, imageUrl, supplierName }) {
+  if (!env.staffApprovalEmail) {
+    throw new Error("Missing STAFF_APPROVAL_EMAIL env var.");
+  }
+
+  const reviewUrl = `${env.approvalLinkBaseUrl}/api/supplier-image-submissions/${token}`;
+
+  const html = `
+    <div style="font-family: sans-serif; max-width: 480px;">
+      <h2>New product photo pending approval</h2>
+      <p><strong>${escapeHtml(productTitle)}</strong></p>
+      <p style="color:#666;font-size:13px;">Submitted by ${escapeHtml(supplierName || "a supplier")} — this product currently has no Shopify image.</p>
+      <img src="${escapeHtml(imageUrl)}" alt="" style="max-width:100%;border-radius:8px;" />
+      <p>
+        <a href="${reviewUrl}" style="display:inline-block;padding:10px 20px;background:#111;color:#fff;text-decoration:none;border-radius:6px;">
+          Review this photo
+        </a>
+      </p>
+    </div>
+  `;
+
+  const resend = getClient();
+  await resend.emails.send({
+    from: env.email.fromAddress,
+    to: [env.staffApprovalEmail],
+    subject: `Approve product photo: ${productTitle}`,
+    html,
+  });
+
+  return { sentTo: env.staffApprovalEmail };
+}
+
+module.exports = { sendProductDraftApprovalEmail, sendSupplierImageApprovalEmail };
