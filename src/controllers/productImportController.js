@@ -58,13 +58,53 @@ function normalizeDraft(d) {
 
 const DRAFT_INCLUDE = { Supplier: { select: { id: true, name: true } } };
 
-// GET /api/product-imports/drafts?status=&supplierId=&page=&limit=
+// imageUrl/specs live inside rawPayload (a JSON blob), not real columns, so
+// they can't be pushed into a Prisma `where` the way approvalStatus/
+// supplierId can — see the imageFilter branch below.
+function hasImage(payload) {
+  return Boolean(payload?.imageUrl);
+}
+function hasDescription(payload) {
+  return Boolean(payload?.specs && String(payload.specs).trim());
+}
+const IMAGE_FILTERS = {
+  both: (p) => hasImage(p) && hasDescription(p),
+  image_only: (p) => hasImage(p) && !hasDescription(p),
+  description_only: (p) => !hasImage(p) && hasDescription(p),
+  none: (p) => !hasImage(p) && !hasDescription(p),
+};
+
+// GET /api/product-imports/drafts?status=&supplierId=&page=&limit=&imageFilter=
 async function listDrafts(req, res) {
   try {
     const { page, limit, skip } = parsePaging(req.query);
     const where = {};
     if (req.query.status) where.approvalStatus = req.query.status;
     if (req.query.supplierId) where.supplierId = req.query.supplierId;
+
+    const filterFn = IMAGE_FILTERS[req.query.imageFilter];
+    if (filterFn) {
+      // Can't skip/take at the DB level when the filter lives in JSON —
+      // fetch every row matching the real-column filters, filter in JS,
+      // then paginate the filtered set. Fine at pending-queue scale; this
+      // path is only hit when imageFilter is actually passed (the "All
+      // drafts" tab's plain status filter still goes through the fast
+      // DB-paginated branch below, unchanged).
+      const allRows = await prisma.productDraft.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        include: DRAFT_INCLUDE,
+      });
+      const filtered = allRows.filter((d) => filterFn(d.rawPayload || {}));
+      const total = filtered.length;
+      return res.json({
+        data: filtered.slice(skip, skip + limit).map(normalizeDraft),
+        page,
+        limit,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+      });
+    }
 
     const [rows, total] = await Promise.all([
       prisma.productDraft.findMany({
