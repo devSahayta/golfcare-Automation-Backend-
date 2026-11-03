@@ -513,8 +513,9 @@ function buildSupplierAgentTools(context) {
     // (same "isolated call, not the main loop" pattern as
     // research_product_specs), then the normal per-item draining already
     // built proceeds exactly as before.
-    async start_bulk_product_import({ rates }) {
+    async start_bulk_product_import({ rates, defaultBrand }) {
       if (!supplier) return { error: "no_supplier_on_conversation" };
+      const cleanDefaultBrand = typeof defaultBrand === "string" && defaultBrand.trim() ? defaultBrand.trim() : null;
       const cleanRates = (Array.isArray(rates) ? rates : [])
         .filter((r) => r?.marginPercent != null && r?.gstPercent != null)
         .map((r) => ({
@@ -587,6 +588,7 @@ function buildSupplierAgentTools(context) {
           supplierId: supplier.id,
           conversationId: context.conversation.id,
           rateRules: cleanRates,
+          defaultBrand: cleanDefaultBrand,
           rawDocumentText: documentText,
           sourceMediaUrl: attachmentMsg.mediaUrl || null,
           status: "PENDING_EXTRACTION",
