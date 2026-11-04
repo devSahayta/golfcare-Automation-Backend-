@@ -665,12 +665,17 @@ async function getLatestInboundImageUrl(conversationId) {
 
 // start_bulk_product_import's resend-after-rejection check — true only if
 // every item the matching prior batch produced ended up with no live or
-// pending outcome (REJECTED/EXPIRED draft, or a hard FAILED extraction).
-// Any item that's still pending a decision, already live (LINKED_EXISTING,
-// an APPROVED draft, a resolved resultMatchedProductId), or stuck waiting
-// on a human for an unrelated reason (NEEDS_RATE/NEEDS_BRAND_REVIEW/
-// ALREADY_DRAFTED) keeps the dedup block in place — only a clean, final
-// "no" across the board clears it.
+// pending outcome. Covers both ways an item can be a dead end: an actual
+// REJECTED/EXPIRED draft decision, and a held-back NEEDS_RATE/
+// NEEDS_BRAND_REVIEW/FAILED item that never became a draft at all (confirmed
+// live: a 71-item batch that was entirely NEEDS_BRAND_REVIEW — nothing
+// drafted, nothing pending — still silently blocked a resend after the
+// supplier's brands list was corrected, with the old version of this check
+// only recognizing a REJECTED draft as "safe to retry"). Any item that's
+// still pending a decision, already live (LINKED_EXISTING, an APPROVED
+// draft, a resolved resultMatchedProductId), or already drafted elsewhere
+// (ALREADY_DRAFTED) keeps the dedup block in place — only a clean, final
+// "nothing came of this" across the board clears it.
 async function previousAttemptFullyRejected(batchId) {
   const items = await prisma.productImportItem.findMany({
     where: { batchId },
@@ -678,10 +683,11 @@ async function previousAttemptFullyRejected(batchId) {
   });
   if (items.length === 0) return false;
 
+  const DEAD_END_STATUSES = new Set(["FAILED", "NEEDS_RATE", "NEEDS_BRAND_REVIEW"]);
   for (const item of items) {
     if (item.resultMatchedProductId) return false;
-    if (item.status === "FAILED") continue;
-    if (item.status !== "DRAFTED") return false; // PENDING/RESEARCHING/LINKED_EXISTING/ALREADY_DRAFTED/NEEDS_RATE/NEEDS_BRAND_REVIEW
+    if (DEAD_END_STATUSES.has(item.status)) continue;
+    if (item.status !== "DRAFTED") return false; // PENDING/RESEARCHING/LINKED_EXISTING/ALREADY_DRAFTED
     if (!item.resultProductDraftId) return false;
     const draft = await prisma.productDraft.findUnique({
       where: { id: item.resultProductDraftId },
