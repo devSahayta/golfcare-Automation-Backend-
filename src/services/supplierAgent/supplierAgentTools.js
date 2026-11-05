@@ -513,8 +513,9 @@ function buildSupplierAgentTools(context) {
     // (same "isolated call, not the main loop" pattern as
     // research_product_specs), then the normal per-item draining already
     // built proceeds exactly as before.
-    async start_bulk_product_import({ rates }) {
+    async start_bulk_product_import({ rates, defaultBrand }) {
       if (!supplier) return { error: "no_supplier_on_conversation" };
+      const cleanDefaultBrand = typeof defaultBrand === "string" && defaultBrand.trim() ? defaultBrand.trim() : null;
       const cleanRates = (Array.isArray(rates) ? rates : [])
         .filter((r) => r?.marginPercent != null && r?.gstPercent != null)
         .map((r) => ({
@@ -552,17 +553,34 @@ function buildSupplierAgentTools(context) {
       // because the first attempt's reply text failed a guardrail even
       // though its tool call had already succeeded. Block on the document
       // text itself, not on the caller somehow being idempotent.
+      //
+      // But this must not block FOREVER: confirmed live that a supplier
+      // resent an identical document 8 days after staff explicitly
+      // rejected every item it produced — this matched that old, finished
+      // batch and silently no-op'd, telling the supplier "being processed"
+      // when really nothing was happening and nothing ever would. Only
+      // short-circuit when the earlier attempt is still in flight, or
+      // actually resulted in something live/pending (see
+      // previousAttemptFullyRejected below) — a resend of a fully rejected
+      // document starts a fresh batch so staff can reconsider it.
       const existingBatch = await prisma.productImportBatch.findFirst({
         where: { supplierId: supplier.id, rawDocumentText: documentText },
         orderBy: { createdAt: "desc" },
       });
       if (existingBatch) {
-        return {
-          batchId: existingBatch.id,
-          alreadyQueued: true,
-          status: existingBatch.status,
-          message: `This exact document was already queued (batch ${existingBatch.id}, status ${existingBatch.status}) — not creating a duplicate. Just tell the supplier it's received and being processed.`,
-        };
+        const canRetry =
+          existingBatch.status === "DONE" && (await previousAttemptFullyRejected(existingBatch.id));
+        if (!canRetry) {
+          return {
+            batchId: existingBatch.id,
+            alreadyQueued: true,
+            status: existingBatch.status,
+            message: `This exact document was already queued (batch ${existingBatch.id}, status ${existingBatch.status}) — not creating a duplicate. Just tell the supplier it's received and being processed.`,
+          };
+        }
+        // Falls through to create a fresh batch — every item from the
+        // matching prior batch was rejected or expired, so there's nothing
+        // live or pending left to collide with.
       }
 
       const batch = await prisma.productImportBatch.create({
@@ -570,6 +588,7 @@ function buildSupplierAgentTools(context) {
           supplierId: supplier.id,
           conversationId: context.conversation.id,
           rateRules: cleanRates,
+          defaultBrand: cleanDefaultBrand,
           rawDocumentText: documentText,
           sourceMediaUrl: attachmentMsg.mediaUrl || null,
           status: "PENDING_EXTRACTION",
@@ -642,6 +661,41 @@ async function getLatestInboundImageUrl(conversationId) {
     orderBy: { createdAt: "desc" },
   });
   return message?.mediaUrl || null;
+}
+
+// start_bulk_product_import's resend-after-rejection check — true only if
+// every item the matching prior batch produced ended up with no live or
+// pending outcome. Covers both ways an item can be a dead end: an actual
+// REJECTED/EXPIRED draft decision, and a held-back NEEDS_RATE/
+// NEEDS_BRAND_REVIEW/FAILED item that never became a draft at all (confirmed
+// live: a 71-item batch that was entirely NEEDS_BRAND_REVIEW — nothing
+// drafted, nothing pending — still silently blocked a resend after the
+// supplier's brands list was corrected, with the old version of this check
+// only recognizing a REJECTED draft as "safe to retry"). Any item that's
+// still pending a decision, already live (LINKED_EXISTING, an APPROVED
+// draft, a resolved resultMatchedProductId), or already drafted elsewhere
+// (ALREADY_DRAFTED) keeps the dedup block in place — only a clean, final
+// "nothing came of this" across the board clears it.
+async function previousAttemptFullyRejected(batchId) {
+  const items = await prisma.productImportItem.findMany({
+    where: { batchId },
+    select: { status: true, resultProductDraftId: true, resultMatchedProductId: true },
+  });
+  if (items.length === 0) return false;
+
+  const DEAD_END_STATUSES = new Set(["FAILED", "NEEDS_RATE", "NEEDS_BRAND_REVIEW"]);
+  for (const item of items) {
+    if (item.resultMatchedProductId) return false;
+    if (DEAD_END_STATUSES.has(item.status)) continue;
+    if (item.status !== "DRAFTED") return false; // PENDING/RESEARCHING/LINKED_EXISTING/ALREADY_DRAFTED
+    if (!item.resultProductDraftId) return false;
+    const draft = await prisma.productDraft.findUnique({
+      where: { id: item.resultProductDraftId },
+      select: { approvalStatus: true },
+    });
+    if (!draft || draft.approvalStatus === "PENDING" || draft.approvalStatus === "APPROVED") return false;
+  }
+  return true;
 }
 
 // See create_product_draft's call site — the same document staying in

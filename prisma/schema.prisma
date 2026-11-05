@@ -651,6 +651,15 @@ model ProductImportBatch {
   // product photos per page/variant (see pdfImageExtractor.js, scheduler
   // repo). Null for batches created before this existed.
   sourceMediaUrl  String?
+  // Set when the supplier tells the live agent (in chat) that this whole
+  // document is one brand, even though the document's own text never
+  // names it (confirmed live: a supplier's own catalog just listed
+  // product names like "Fineline Polo", no brand column at all). Used by
+  // the scheduler's extraction step as a fallback ONLY for items where it
+  // couldn't find a brand on the page itself — never overrides a brand
+  // the document actually states. Independent of rateRules below (that's
+  // margin/GST matching; this is purely brand identification).
+  defaultBrand    String?
   // Margin/GST are NOT one blanket rate for the whole document — a
   // supplier catalog commonly spans several brands/categories with
   // different rates each. rateRules: [{brand, category, marginPercent,
