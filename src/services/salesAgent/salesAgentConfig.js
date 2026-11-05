@@ -142,19 +142,19 @@ const tools = [
       required: ["variantIds", "quantities"],
     },
   },
-  {
-    name: "escalate_to_human",
-    description:
-      "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
-    input_schema: {
-      type: "object",
-      properties: {
-        reason: { type: "string" },
-        urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
-      },
-      required: ["reason", "urgency"],
-    },
-  },
+  // {
+  //   name: "escalate_to_human",
+  //   description:
+  //     "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
+  //   input_schema: {
+  //     type: "object",
+  //     properties: {
+  //       reason: { type: "string" },
+  //       urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
+  //     },
+  //     required: ["reason", "urgency"],
+  //   },
+  // },
   {
     name: "enroll_membership",
     description:
