@@ -173,6 +173,88 @@ const DISCOUNT_RE = /(\d+)\s?%\s?(off|discount)/i;
 const MEMBERSHIP_CLAIM_RE =
   /you'?re (now )?a member|membership (is )?active|enrolled you/i;
 
+// NEW — Member Pricing Engine Phase 3. Catches the model saying words
+// that reveal internal cost/margin reasoning to the customer — the one
+// thing get_price_envelope/make_offer are built to keep away from the
+// agent entirely. Deliberately NOT blocking on the word "price" or
+// "discount" alone — those are normal words a human agent uses
+// constantly; only the specific leak-risk terms below.
+const MARGIN_LEAK_RE =
+  /\bmargin\b|\bcost price\b|\bfloor price\b|\bthe floor\b|\bold stock\b|\baged stock\b|\bsystem won'?t let me\b/i;
+function leaksMarginLanguage(draftText) {
+  return MARGIN_LEAK_RE.test(draftText);
+}
+
+function extractRupeeFigures(draftText) {
+  const matches = [...draftText.matchAll(/₹\s?([\d,]+)/g)];
+  return matches.map((m) => Number(m[1].replace(/,/g, "")));
+}
+
+// Every number this turn's pricing tool calls actually returned —
+// anything in the reply that isn't one of these is unbacked, i.e. the
+// model stated or computed a price itself instead of relaying a real
+// tool result.
+function collectBackedPriceNumbers(toolCallLog) {
+  const numbers = new Set();
+  for (const call of toolCallLog) {
+    if (call.tool === "get_price_envelope" && Array.isArray(call.output)) {
+      for (const line of call.output) {
+        if (line.error) continue;
+        numbers.add(line.listPrice);
+        numbers.add(line.memberPrice);
+        numbers.add(line.lowestAgentPrice);
+        (line.suggestedSteps || []).forEach((s) => numbers.add(s));
+      }
+    }
+    if (call.tool === "make_offer" && call.output && !call.output.error) {
+      numbers.add(call.output.price);
+    }
+    if (call.tool === "create_checkout_link" && call.output?.totalInr != null) {
+      numbers.add(call.output.totalInr);
+    }
+  }
+  return numbers;
+}
+
+// Scoped to turns that actually touched pricing — a reply in a
+// conversation that never called get_price_envelope/make_offer this
+// turn isn't asserting a negotiated price at all, and is already
+// covered by the existing unverified_stock_or_price_claim check above.
+function hasUnbackedPriceFigure(draftText, toolCallLog) {
+  const touchedPricing = toolCallLog.some(
+    (c) => c.tool === "get_price_envelope" || c.tool === "make_offer",
+  );
+  if (!touchedPricing) return false;
+  const backed = collectBackedPriceNumbers(toolCallLog);
+  const stated = extractRupeeFigures(draftText);
+  return stated.some((n) => !backed.has(n));
+}
+
+// A price below member price is only legitimate right after a
+// successful make_offer call for that exact price THIS turn — anything
+// else means the model is quoting a concession it never actually
+// recorded/validated server-side.
+function hasPriceBelowMemberWithoutOffer(draftText, toolCallLog) {
+  const envelopeCall = toolCallLog.find((c) => c.tool === "get_price_envelope");
+  if (!envelopeCall || !Array.isArray(envelopeCall.output)) return false;
+
+  const memberPrices = envelopeCall.output
+    .filter((line) => !line.error)
+    .map((line) => line.memberPrice);
+  if (!memberPrices.length) return false;
+
+  const offeredPricesThisTurn = new Set(
+    toolCallLog
+      .filter((c) => c.tool === "make_offer" && c.output && !c.output.error)
+      .map((c) => c.output.price),
+  );
+
+  const stated = extractRupeeFigures(draftText);
+  return stated.some(
+    (n) => memberPrices.some((mp) => n < mp) && !offeredPricesThisTurn.has(n),
+  );
+}
+
 // Heuristic for "this response is recommending/describing specific products":
 // *bold*-style segments (WhatsApp formatting for product names) with no
 // product lookup this turn OR earlier in the visible conversation history.
@@ -320,6 +402,23 @@ function runGuardrails({ draftText, toolCallLog, context }) {
     !calledAnyProductLookup(toolCallLog, context.recentMessages)
   ) {
     return { action: "block", reason: "unverified_stock_or_price_claim" };
+  }
+
+  // NEW — Member Pricing Engine Phase 3. Scoped to only fire when
+  // get_price_envelope/make_offer were actually called this turn, so
+  // these three checks cannot affect any existing conversation flow
+  // that doesn't touch the pricing engine at all — zero risk to
+  // everything else this file already guards above.
+  if (leaksMarginLanguage(draftText)) {
+    return { action: "block", reason: "margin_language_leak" };
+  }
+
+  if (hasUnbackedPriceFigure(draftText, toolCallLog)) {
+    return { action: "block", reason: "unbacked_price_figure" };
+  }
+
+  if (hasPriceBelowMemberWithoutOffer(draftText, toolCallLog)) {
+    return { action: "block", reason: "price_below_member_without_offer" };
   }
 
   if (revealsMemberCode(draftText, context)) {

@@ -55,6 +55,75 @@ const tools = [
       required: ["variantId"],
     },
   },
+
+  {
+    name: "get_price_envelope",
+    description:
+      "Get the member price, lowest price you're allowed to offer, and suggested negotiation steps for one or more cart lines. ALWAYS call this before quoting ANY price to a member who might negotiate — never state a discounted price from memory or by estimating a percentage yourself. Only state the ₹ amounts this tool returns; never say or compute a discount percentage out loud.",
+    input_schema: {
+      type: "object",
+      properties: {
+        lines: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              variantId: { type: "string" },
+              qty: { type: "number" },
+            },
+            required: ["variantId"],
+          },
+        },
+      },
+      required: ["lines"],
+    },
+  },
+  {
+    name: "make_offer",
+    description:
+      "Record a price you are offering the customer for one variant. REQUIRED before quoting or confirming any price below that variant's member price — do this the moment you decide to offer a concession, not after the customer accepts. Rejects and returns the real lowest valid price if you try to go below it, or if you try to skip ahead in the negotiation steps.",
+    input_schema: {
+      type: "object",
+      properties: {
+        variantId: { type: "string" },
+        price: { type: "number" },
+        step: {
+          type: "number",
+          description:
+            "0 = member price, 1-3 = concession steps in order, 9 = owner-approved (only after escalate_to_human was approved)",
+        },
+      },
+      required: ["variantId", "price", "step"],
+    },
+  },
+
+  // ============================================================================
+  // escalate_to_human — UPDATE the existing entry's input_schema to add
+  // offerContext (keep reason/urgency exactly as they are):
+  // ============================================================================
+
+  {
+    name: "escalate_to_human",
+    description:
+      "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
+    input_schema: {
+      type: "object",
+      properties: {
+        reason: { type: "string" },
+        urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
+        offerContext: {
+          type: "object",
+          description:
+            "Pass this when escalating a pricing conversation — gives the human the current state so they don't have to re-ask the customer.",
+          properties: {
+            variantId: { type: "string" },
+            currentOfferId: { type: "string" },
+          },
+        },
+      },
+      required: ["reason", "urgency"],
+    },
+  },
   {
     name: "get_customer_profile",
     description:

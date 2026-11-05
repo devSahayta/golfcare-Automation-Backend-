@@ -52,6 +52,9 @@ app.use("/api/audit-logs", auditLogRouter);
 app.use("/api/agent-usage", agentUsageRouter);
 app.use("/api/broadcast-campaigns", broadcastCampaignRouter);
 app.use("/api/campaigns", campaignRouter);
+app.use("/api/pricing-config", require("./routes/pricingConfigRoutes"));
+app.use("/api/offers", require("./routes/offerRoutes"));
+app.use("/api/escalations", require("./routes/escalationRoutes"));
 
 app.get("/", (_req, res) => {
   res.json({ service: "Golf Care OS API", status: "running" });
