@@ -129,7 +129,7 @@ function buildSalesAgentTools(context) {
       // co-occurring generic word ("cap", "shoe") matches nearly the
       // whole category regardless of color. Declared up here (used by
       // the `words` filter below) even though the actual colorFilter
-      // condition is built further down, once lowerCombined exists.
+      // condition is built further down, once lowerCombined is available.
       const COLOR_WORDS = [
         "black",
         "white",
@@ -319,6 +319,15 @@ function buildSalesAgentTools(context) {
         ...genderConditions,
       ];
 
+      // Candidate pool size for the DB query — deliberately much bigger
+      // than the requested `limit`. The old code took `limit` rows
+      // directly from the DB with no ordering, so whichever rows Postgres
+      // returned first silently won even if a better match existed further
+      // down. Pulling a generous pool here and ranking/truncating in JS
+      // below (after scoreProduct) fixes that without touching the actual
+      // filter conditions at all.
+      const candidatePoolSize = Math.min(Math.max(limit * 10, 50), 100);
+
       // Attribute filters, in priority order — LAST item is dropped
       // FIRST when a search returns zero results. This is the
       // generalized replacement for what used to be two separate,
@@ -346,7 +355,7 @@ function buildSalesAgentTools(context) {
       };
       let products = await prisma.product.findMany({
         where: usedWhere,
-        take: Math.min(limit, 15),
+        take: candidatePoolSize,
         include: { Variant: { take: 25 } },
       });
 
@@ -369,7 +378,7 @@ function buildSalesAgentTools(context) {
         };
         products = await prisma.product.findMany({
           where: usedWhere,
-          take: Math.min(limit, 15),
+          take: candidatePoolSize,
           include: { Variant: { take: 25 } },
         });
       }
@@ -397,7 +406,7 @@ function buildSalesAgentTools(context) {
         };
         products = await prisma.product.findMany({
           where: usedWhere,
-          take: Math.min(limit, 15),
+          take: candidatePoolSize,
           include: { Variant: { take: 25 } },
         });
       }
@@ -406,6 +415,38 @@ function buildSalesAgentTools(context) {
       // honestly offer "want to see more?" instead of guessing whether
       // more exist, or worse, implying these 5 are all there is.
       const totalCount = await prisma.product.count({ where: usedWhere });
+
+      // Rank the candidate pool by how well each one actually matches —
+      // title match weighted highest, then vendor/productType, then tags.
+      // This is the fix for the live bug: without this, "JPX 923 Hot Metal
+      // irons" returned "JPX 923 Forged" instead of the exact Hot Metal HL
+      // product, purely because nothing ranked candidates by relevance
+      // before truncating to the first few rows. Scored in JS rather than
+      // in SQL since there's no full-text search index set up yet — this
+      // is the same "no embedding pipeline yet" situation as the OR-based
+      // matching above, just extended to also rank, not only filter.
+      function scoreProduct(p) {
+        const title = (p.title || "").toLowerCase();
+        const vendorLower = (p.vendor || "").toLowerCase();
+        const typeLower = (p.productType || "").toLowerCase();
+        const tagsLower = (p.tags || []).map((t) => t.toLowerCase());
+        let score = 0;
+        for (const w of wordForms) {
+          const wl = w.toLowerCase();
+          if (title.includes(wl)) score += 3;
+          if (vendorLower.includes(wl)) score += 2;
+          if (typeLower.includes(wl)) score += 2;
+          if (tagsLower.some((t) => t.includes(wl))) score += 1;
+        }
+        // Small tie-break: prefer a tighter, more specific title over a
+        // longer one when the word-match score is otherwise equal.
+        score -= title.split(/\s+/).length * 0.01;
+        return score;
+      }
+
+      products = [...products]
+        .sort((a, b) => scoreProduct(b) - scoreProduct(a))
+        .slice(0, Math.min(limit, 15));
 
       // When a color was requested AND actually satisfied (not
       // relaxed), trim each product's variant list down to only the
