@@ -330,7 +330,7 @@ function buildSalesAgentTools(context) {
       // down. Pulling a generous pool here and ranking/truncating in JS
       // below (after scoreProduct) fixes that without touching the actual
       // filter conditions at all.
-      const candidatePoolSize = Math.min(Math.max(limit * 10, 50), 100);
+      const candidatePoolSize = 500;
 
       // Attribute filters, in priority order — LAST item is dropped
       // FIRST when a search returns zero results. This is the
