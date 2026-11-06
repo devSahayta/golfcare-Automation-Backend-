@@ -212,6 +212,12 @@ function collectBackedPriceNumbers(toolCallLog) {
     if (call.tool === "create_checkout_link" && call.output?.totalInr != null) {
       numbers.add(call.output.totalInr);
     }
+    if (
+      call.tool === "create_checkout_link" &&
+      call.output?.savingsInr != null
+    ) {
+      numbers.add(call.output.savingsInr);
+    }
   }
   return numbers;
 }
