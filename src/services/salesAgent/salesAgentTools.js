@@ -39,6 +39,10 @@ function buildSalesAgentTools(context) {
       priceMax,
       limit = 5,
     }) {
+      console.log(
+        "[search_products] called with:",
+        JSON.stringify({ query, category, vendor, priceMin, priceMax, limit }),
+      );
       // No embedding pipeline has been decided/built yet (open item —
       // the spec calls for pgvector similarity search, but nobody's
       // picked an embedding provider). This falls back to a keyword
