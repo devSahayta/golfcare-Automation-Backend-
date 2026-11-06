@@ -415,6 +415,14 @@ function runGuardrails({ draftText, toolCallLog, context }) {
   }
 
   if (hasUnbackedPriceFigure(draftText, toolCallLog)) {
+    console.log(
+      "[guardrails] unbacked_price_figure draft:",
+      draftText,
+      "| backed:",
+      [...collectBackedPriceNumbers(toolCallLog)],
+      "| stated:",
+      extractRupeeFigures(draftText),
+    );
     return { action: "block", reason: "unbacked_price_figure" };
   }
 
