@@ -368,6 +368,7 @@ function runGuardrails({ draftText, toolCallLog, context }) {
   }
 
   if (leaksInternalJargon(draftText)) {
+    console.log("[guardrails] internal_jargon_leak draft:", draftText);
     return { action: "block", reason: "internal_jargon_leak" };
   }
 
