@@ -222,12 +222,26 @@ function extractRupeeFigures(draftText) {
 // quoted to the customer is always bolded in this reply style.
 function extractAssertedRupeeFigures(draftText) {
   const boldSegments = draftText.match(/\*[^*\n]+\*/g) || [];
-  const numbers = [];
+  const boldNumbers = [];
   for (const seg of boldSegments) {
     const found = [...seg.matchAll(/₹\s?([\d,]+)/g)];
-    found.forEach((m) => numbers.push(Number(m[1].replace(/,/g, ""))));
+    found.forEach((m) => boldNumbers.push(Number(m[1].replace(/,/g, ""))));
   }
-  return numbers;
+  if (boldNumbers.length) return boldNumbers;
+
+  // No bold price at all — fall back to the LAST rupee figure in the
+  // whole text. Confirmed in production: a checkout message quoting an
+  // unbolded price ("Here's your checkout link at ₹78,700") that didn't
+  // match what create_checkout_link actually charged (₹76,600) slipped
+  // past the bold-only check entirely. A single asserted price is
+  // usually stated once, and in a correction the real number always
+  // comes last — so checking just the final figure here catches an
+  // unbolded claim without reviving the "mentioning a retracted number
+  // blocks a correction" problem.
+  const allMatches = [...draftText.matchAll(/₹\s?([\d,]+)/g)];
+  if (!allMatches.length) return [];
+  const last = allMatches[allMatches.length - 1];
+  return [Number(last[1].replace(/,/g, ""))];
 }
 
 // Every number this turn's pricing tool calls actually returned —
