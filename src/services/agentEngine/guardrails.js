@@ -27,6 +27,25 @@ function hasHallucinatedDomain(draftText) {
   );
 }
 
+// NEW — catches the model reusing a real checkout/discount URL from
+// earlier in conversation HISTORY instead of generating a fresh one.
+// Confirmed in production: a reply claiming "here's your link at
+// ₹78,700" that was actually just the OLD checkout URL (and price)
+// copied verbatim from a prior turn, with create_checkout_link never
+// called again this turn — the real checkout page still charged the
+// old, pre-negotiation amount. Any reply containing a checkout/discount
+// link MUST have a fresh create_checkout_link call this turn backing
+// it; a link with no fresh call behind it is unverifiable and
+// potentially stale/wrong.
+const CHECKOUT_LINK_RE = /\/(discount|cart)\//i;
+function hasUnverifiedCheckoutLink(draftText, toolCallLog) {
+  if (!CHECKOUT_LINK_RE.test(draftText) || !URL_RE.test(draftText))
+    return false;
+  return !toolCallLog.some(
+    (c) => c.tool === "create_checkout_link" && !c.output?.error,
+  );
+}
+
 // NEW — catches internal tool-output plumbing leaking straight into the
 // customer-facing message. Confirmed in production: a reply that opened
 // with "I see the results came back with `orientationRelaxed: true`,
@@ -371,6 +390,10 @@ function runGuardrails({ draftText, toolCallLog, context }) {
 
   if (hasHallucinatedDomain(draftText)) {
     return { action: "block", reason: "hallucinated_url_domain" };
+  }
+
+  if (hasUnverifiedCheckoutLink(draftText, toolCallLog)) {
+    return { action: "block", reason: "unverified_checkout_link" };
   }
 
   if (leaksInternalJargon(draftText)) {
