@@ -345,6 +345,32 @@ function hasPriceBelowMemberWithoutOffer(draftText, toolCallLog, context) {
   return stated.some((n) => n < memberPrice && !offeredPrices.has(n));
 }
 
+// NEW — catches the agent proactively telegraphing that more negotiating
+// room exists (confirmed in live testing: "...Does that work, or should I
+// escalate to see if there's any more room?"). The system prompt already
+// tells the model negotiation is reactive, never proactive, but a prompt
+// instruction alone didn't hold up against this phrasing in production —
+// same lesson as the internal-reference-note leak above. Scoped to turns
+// where make_offer actually ran, so it can never fire on an ordinary reply
+// that happens to mention "the team" or "room" for an unrelated reason.
+const PROACTIVE_ESCALATION_PATTERNS = [
+  /should i escalate/i,
+  /shall i escalate/i,
+  /escalate (it )?to see if/i,
+  /want me to (escalate|check (with|for))/i,
+  /see if there'?s (any )?more room/i,
+  /any more room\b/i,
+  /more room\?/i,
+  /check with (the|my|our) (team|manager)/i,
+  /still a stretch,? let me know/i,
+  /ask for more\b/i,
+  /push for more\b/i,
+];
+function hasProactiveEscalationOffer(draftText, toolCallLog) {
+  if (!calledTool(toolCallLog, "make_offer")) return false;
+  return PROACTIVE_ESCALATION_PATTERNS.some((re) => re.test(draftText));
+}
+
 // Heuristic for "this response is recommending/describing specific products":
 // *bold*-style segments (WhatsApp formatting for product names) with no
 // product lookup this turn OR earlier in the visible conversation history.
@@ -522,6 +548,10 @@ function runGuardrails({ draftText, toolCallLog, context }) {
 
   if (hasPriceBelowMemberWithoutOffer(draftText, toolCallLog, context)) {
     return { action: "block", reason: "price_below_member_without_offer" };
+  }
+
+  if (hasProactiveEscalationOffer(draftText, toolCallLog)) {
+    return { action: "block", reason: "proactive_escalation_offer" };
   }
 
   if (revealsMemberCode(draftText, context)) {

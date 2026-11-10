@@ -1,540 +1,588 @@
-// src/services/salesAgent/salesAgentConfig.js
-const { buildSalesAgentTools } = require("./salesAgentTools");
-const { ENROLMENT_QUESTIONS } = require("./enrolmentQuestions");
+// src/services/agentEngine/guardrails.js
+//
+// Runs after the tool loop, before send. Each rule can only block for now
+// (no auto-rewrite yet — safer to escalate to a human than to have the
+// engine silently rewrite what the model said). Rules read the tool call
+// log to check claims are actually backed by data, not just plausible
+// text. This file is Sales-Agent-specific today (the rules reference
+// Sales tools by name); when Supplier/Lifecycle agents are built, give
+// each its own guardrail rule list rather than overloading this one.
 
-// Must match CONSENT_NOTICE_V1 in salesAgentTools.js — kept as two
-// constants (one per file) rather than a shared import to avoid a
-// circular require between config and tools; if you ever change the
-// wording, update both.
-const CONSENT_NOTICE_LINE =
-  "Membership is free — it gets you member pricing, first access to new stock, and a golf expert on this number whenever you need one. May we send you occasional offers and reminders on WhatsApp? You can stop any time by replying STOP.";
+const { env } = require("../../config/env");
 
-// Self-identifies for AgentUsage cost tracking (see agentEngine/index.js) —
-// lets cost be grouped/queried per agent type once more than one config
-// exists (sales, supplier, future ones), without agentEngine needing to
-// guess which agent ran from conversation shape. Every agent config should
-// export this same field with its own name.
-const agentName = "sales";
+const STOCK_CLAIM_RE = /\b(in stock|out of stock|available|sold out)\b/i;
 
-const tools = [
-  {
-    name: "search_products",
-    description:
-      "Search the product catalog by free-text query, optionally filtered by category, brand/vendor, or price range. ALWAYS pass vendor as its own argument whenever the customer names a specific brand (FootJoy, Callaway, Cobra, TaylorMade, etc.) — brand names almost never appear inside this catalog's product titles, so folding a brand into query alone will NOT reliably filter by it and can silently return other brands.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        category: { type: "string" },
-        vendor: { type: "string" },
-        priceMin: { type: "number" },
-        priceMax: { type: "number" },
-        limit: { type: "number" },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "get_product",
-    description: "Get full details for a known product or variant.",
-    input_schema: {
-      type: "object",
-      properties: {
-        productId: { type: "string" },
-        variantId: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "check_availability",
-    description:
-      "Check the confirmed availability status of a variant. Never assume stock without calling this.",
-    input_schema: {
-      type: "object",
-      properties: { variantId: { type: "string" } },
-      required: ["variantId"],
-    },
-  },
+// Catches hallucinated/reconstructed URLs — the model has seen "golfcare.in"
+// in its own persona description and can invent plausible-looking links
+// using that domain instead of copying the real productUrl from tool
+// output. Any http(s) link in the reply must point to the actual live
+// domain; anything else is treated the same as an unverified price claim.
+const URL_RE = /https?:\/\/([^\/\s]+)/gi;
+function hasHallucinatedDomain(draftText) {
+  const allowedDomain =
+    process.env.SHOPIFY_SHOP_DOMAIN || "y3tzk0-4d.myshopify.com";
+  const matches = [...draftText.matchAll(URL_RE)];
+  return matches.some(
+    (m) => m[1].toLowerCase() !== allowedDomain.toLowerCase(),
+  );
+}
 
-  {
-    name: "get_price_envelope",
-    description:
-      "Get the member price, lowest price you're allowed to offer, and suggested negotiation steps for one or more cart lines. ALWAYS call this before quoting ANY price to a member who might negotiate — never state a discounted price from memory or by estimating a percentage yourself. Only state the ₹ amounts this tool returns; never say or compute a discount percentage out loud.",
-    input_schema: {
-      type: "object",
-      properties: {
-        lines: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              variantId: { type: "string" },
-              qty: { type: "number" },
-            },
-            required: ["variantId"],
-          },
-        },
-      },
-      required: ["lines"],
-    },
-  },
-  {
-    name: "make_offer",
-    description:
-      "Record a price you are offering the customer for one variant. REQUIRED before quoting or confirming any price below that variant's member price — do this the moment you decide to offer a concession, not after the customer accepts. Rejects and returns the real lowest valid price if you try to go below it, or if you try to skip ahead in the negotiation steps. Once the customer has agreed to a specific price and you call this again later in the same negotiation (e.g. right before create_checkout_link), pass the EXACT SAME price and step you already recorded for them — never a new, lower price, even if you recall a deeper lowestAgentPrice or suggestedStep from an earlier get_price_envelope call. Re-submitting the same price is a safe no-op (it returns the existing offer); submitting a different, deeper price silently changes what the customer is charged below what they actually agreed to, which is never correct at this stage. Only offer a price the customer hasn't already accepted when they are still actively negotiating, not when they've said yes and are moving to checkout.",
-    input_schema: {
-      type: "object",
-      properties: {
-        variantId: { type: "string" },
-        price: { type: "number" },
-        step: {
-          type: "number",
-          description:
-            "0 = member price, 1-3 = concession steps in order, 9 = owner-approved (only after escalate_to_human was approved)",
-        },
-      },
-      required: ["variantId", "price", "step"],
-    },
-  },
+// NEW — catches the model reusing a real checkout/discount URL from
+// earlier in conversation HISTORY instead of generating a fresh one.
+// Confirmed in production: a reply claiming "here's your link at
+// ₹78,700" that was actually just the OLD checkout URL (and price)
+// copied verbatim from a prior turn, with create_checkout_link never
+// called again this turn — the real checkout page still charged the
+// old, pre-negotiation amount. Any reply containing a checkout/discount
+// link MUST have a fresh create_checkout_link call this turn backing
+// it; a link with no fresh call behind it is unverifiable and
+// potentially stale/wrong.
+const CHECKOUT_LINK_RE = /\/(discount|cart)\//i;
+function hasUnverifiedCheckoutLink(draftText, toolCallLog) {
+  if (!CHECKOUT_LINK_RE.test(draftText) || !URL_RE.test(draftText))
+    return false;
+  return !toolCallLog.some(
+    (c) => c.tool === "create_checkout_link" && !c.output?.error,
+  );
+}
 
-  // ============================================================================
-  // escalate_to_human — UPDATE the existing entry's input_schema to add
-  // offerContext (keep reason/urgency exactly as they are):
-  // ============================================================================
+// NEW — catches internal tool-output plumbing leaking straight into the
+// customer-facing message. Confirmed in production: a reply that opened
+// with "I see the results came back with `orientationRelaxed: true`,
+// which means the catalog doesn't separately tag right-hand as a
+// filter..." — the model narrating its own tool schema/field names to
+// the customer instead of just using the information silently. This is
+// not a phrasing nuance to leave to prompt instructions alone (same
+// class of thing as hasHallucinatedDomain above) — a customer should
+// never see a raw field name, boolean, or internal reasoning-about-the-
+// tool-output in their message, regardless of how the surrounding
+// sentence is worded. Field names are the actual JSON keys returned by
+// search_products (see salesAgentTools.js) plus a few generic internal-
+// sounding terms; deliberately NOT blocking on words like "variant" or
+// "available" alone since those are normal English a human agent would
+// also say.
+const INTERNAL_JARGON_RE =
+  /\b(orientationRelaxed|colorRelaxed|vendorRelaxed|moreAvailable|totalCount|variantId|productId|toolCalls|tool_use|tool_result|AGENT_INFERRED|SUPPLIER_CONFIRMED|MANUAL_OWNER)\b|`[a-zA-Z]+Relaxed`|\bthe results came back with\b/i;
+function leaksInternalJargon(draftText) {
+  return INTERNAL_JARGON_RE.test(draftText);
+}
 
-  {
-    name: "escalate_to_human",
-    description:
-      "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
-    input_schema: {
-      type: "object",
-      properties: {
-        reason: { type: "string" },
-        urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
-        offerContext: {
-          type: "object",
-          description:
-            "Pass this when escalating a pricing conversation — gives the human the current state so they don't have to re-ask the customer.",
-          properties: {
-            variantId: { type: "string" },
-            currentOfferId: { type: "string" },
-          },
-        },
-      },
-      required: ["reason", "urgency"],
-    },
-  },
-  {
-    name: "get_customer_profile",
-    description:
-      "Get the current customer's profile, membership status, and unanswered onboarding questions.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "create_checkout_link",
-    description: "Generate a Shopify checkout link for one or more variants.",
-    input_schema: {
-      type: "object",
-      properties: {
-        variantIds: { type: "array", items: { type: "string" } },
-        quantities: { type: "array", items: { type: "number" } },
-      },
-      required: ["variantIds", "quantities"],
-    },
-  },
-  // {
-  //   name: "escalate_to_human",
-  //   description:
-  //     "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
-  //   input_schema: {
-  //     type: "object",
-  //     properties: {
-  //       reason: { type: "string" },
-  //       urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
-  //     },
-  //     required: ["reason", "urgency"],
-  //   },
-  // },
-  {
-    name: "enroll_membership",
-    description:
-      "Enroll the current customer as a Golf Care member. Call this as soon as they agree to join — no need to ask anything first, marketing consent is captured later as the final setup question. The tool result includes a `nextStep` field with the exact next question to ask — follow it in the SAME reply. NEVER state the member code from this tool's result; the code is only for revealing later, once record_profile_answer eventually returns enrolmentCompleted: true.",
-    input_schema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "complete_enrolment",
-    description:
-      "Call once every Part A enrolment question has been answered or explicitly skipped.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "record_profile_answer",
-    description:
-      "Record the customer's answer to one onboarding/profiling question.",
-    input_schema: {
-      type: "object",
-      properties: { fieldKey: { type: "string" }, answer: { type: "string" } },
-      required: ["fieldKey", "answer"],
-    },
-  },
+// NEW — catches a record_profile_answer call whose answer text has no
+// traceable connection to what the customer actually said this turn.
+// Confirmed in testing: during enrolment, the model recorded a fake
+// homeClub answer ("Bangalore Golf Club") the customer never mentioned,
+// one question ahead of what was actually asked — the customer had only
+// answered firstName. Since the tool call genuinely succeeds (it's not
+// a missing call), this needs its own check: for every
+// record_profile_answer call in the log, the answer text must appear
+// (loosely) in the customer's own most recent message. A field the
+// model invents whole-cloth won't have any overlap with what the
+// customer actually typed.
+function normalizeForOverlapCheck(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, "")
+    .trim();
+}
+
+// Only checked for genuinely free-text fields where a fabricated answer
+// is possible and would be a real, novel fact the model invented —
+// firstName and homeClub are the fields this was actually built to
+// catch (confirmed: a fabricated "Bangalore Golf Club" homeClub
+// answer). Fields with mapper functions in enrolmentQuestions.js
+// (skillLevel, playFrequency, gloveHand, marketingConsent) are
+// EXCLUDED — those are meant to be normalized/paraphrased from the
+// customer's raw words ("yea ok" -> "yes", "weekly once" -> "weekly"),
+// and applying literal word-overlap there produces false positives on
+// completely correct interpretations, which is what happened in
+// testing ("Yea ok" -> recorded "yes" got wrongly flagged as
+// hallucinated). gloveSize and currentBallModel are borderline free
+// text but low fabrication risk in practice, left out for now — add
+// back in if a real fabrication is observed there.
+const FREE_TEXT_FIELDS_TO_CHECK = new Set(["firstName", "homeClub"]);
+
+function hasHallucinatedProfileAnswer(toolCallLog, context) {
+  const recordCalls = toolCallLog.filter(
+    (c) =>
+      c.tool === "record_profile_answer" &&
+      !c.output?.error &&
+      FREE_TEXT_FIELDS_TO_CHECK.has(c.input?.fieldKey),
+  );
+  if (!recordCalls.length) return false;
+
+  const lastCustomerMsg = [...(context.recentMessages || [])]
+    .reverse()
+    .find((m) => m.sender === "CUSTOMER");
+  const customerText = normalizeForOverlapCheck(lastCustomerMsg?.body);
+  if (!customerText) return false;
+
+  return recordCalls.some((call) => {
+    const answer = normalizeForOverlapCheck(call.input?.answer);
+    if (!answer) return false;
+    const answerWords = answer.split(/\s+/).filter((w) => w.length > 1);
+    if (!answerWords.length) return false;
+    return !answerWords.some((w) => customerText.includes(w));
+  });
+}
+
+// NEW — catches a get_product/check_availability/create_checkout_link
+// call using a productId/variantId that was never actually returned by
+// a search_products or get_product call earlier in this turn or in
+// recent history. Confirmed in testing: Haiku called check_availability
+// with a fabricated variantId that appeared nowhere in the
+// conversation's real tool results — the real ID from a prior search
+// was available but not used. This is dangerous specifically because
+// check_availability doesn't error on an unknown ID, it just returns
+// UNKNOWN, making the mistake indistinguishable from a real
+// out-of-stock item to both the model and the customer.
+const ID_LOOKUP_TOOLS = [
+  "get_product",
+  "check_availability",
+  "create_checkout_link",
 ];
 
-function buildSystemPrompt(context) {
-  const c = context.customer;
-  const gp = context.golferProfile;
+function collectKnownIds(toolCallLog, recentMessages) {
+  const ids = new Set();
+  const scanResult = (output) => {
+    if (!output) return;
+    if (Array.isArray(output.results)) {
+      output.results.forEach((r) => {
+        if (r.productId) ids.add(r.productId);
+        (r.variants || []).forEach((v) => v.variantId && ids.add(v.variantId));
+      });
+    }
+    if (output.product?.id) ids.add(output.product.id);
+    if (output.variant?.id) ids.add(output.variant.id);
+    if (Array.isArray(output.product?.Variant)) {
+      output.product.Variant.forEach((v) => v.id && ids.add(v.id));
+    }
+  };
+  toolCallLog.forEach((c) => {
+    if (["search_products", "get_product"].includes(c.tool))
+      scanResult(c.output);
+  });
+  (recentMessages || []).forEach((m) => {
+    (m.toolCalls || []).forEach((c) => {
+      if (["search_products", "get_product"].includes(c.tool))
+        scanResult(c.output);
+    });
+  });
+  return ids;
+}
 
-  // memberCode is exposed here specifically so it's still available to
-  // the model on the LAST enrolment turn, several messages after
-  // enroll_membership actually ran — tool results from earlier turns
-  // aren't visible to the model on later turns, only plain conversation
-  // text is, so this card is how the code survives across that gap.
-  const customerCard = c
-    ? `Customer: ${c.firstName || "unknown name"} | Member: ${c.isMember} | Member code: ${c.memberCode || "none yet"} | Tier: ${c.tier} | ` +
-      `Budget tier: ${gp?.budgetTier || "unknown"} | Handicap: ${gp?.handicap ?? "unknown"} | ` +
-      `Preferred brands: ${(gp?.preferredBrands || []).join(", ") || "none noted"}`
-    : "New customer, no profile yet.";
+function hasFabricatedId(toolCallLog, context) {
+  const idLookupCalls = toolCallLog.filter(
+    (c) =>
+      ID_LOOKUP_TOOLS.includes(c.tool) &&
+      (c.input?.productId || c.input?.variantId),
+  );
+  if (!idLookupCalls.length) return false;
 
-  const unanswered = context.unansweredQuestions.length
-    ? context.unansweredQuestions
-        .map((q) => `${q.fieldKey}: ${q.promptText}`)
-        .join("; ")
-    : "none";
+  const knownIds = collectKnownIds(toolCallLog, context.recentMessages);
+  if (!knownIds.size) return false; // nothing to cross-check against yet, don't false-positive on turn 1
 
-  const priorSummary = context.priorSummary
-    ? `Earlier in this relationship: ${context.priorSummary}`
-    : "";
+  return idLookupCalls.some((c) => {
+    const usedId = c.input?.productId || c.input?.variantId;
+    return usedId && !knownIds.has(usedId);
+  });
+}
 
-  // Module 6 — Lifecycle Agent is a compose-and-dispatch function, not a
-  // conversational agent (it has no tools for checkout/discount/handover,
-  // and shouldn't duplicate what this agent already owns) — so when a
-  // customer replies to a birthday/replenishment/cross-sell message, it
-  // lands here, not with Lifecycle Agent. The actual campaign message is
-  // already visible in the conversation history below (Lifecycle now logs
-  // a real body, not a blank placeholder), but this tag makes the "why"
-  // explicit rather than relying on the model to infer it from scrolling
-  // back — same principle as pendingCheck in supplierAgentConfig.js.
-  // agentEngine/index.js clears this after one reply so it doesn't keep
-  // getting mentioned turns later once it's no longer relevant.
-  // NEW — MEMBERSHIP_INVITE gets its own, more directive note than the
-  // generic campaign-reply acknowledgment below. That campaign's template
-  // (see membershipInviteService.js) already served as the bare "have you
-  // thought about joining?" invite — this tells the model explicitly not
-  // to repeat it, and to jump straight to the real STEP 2 benefits
-  // explanation + ask, in THIS reply, if the customer shows any interest.
-  // Every other campaign scenario keeps the original generic phrasing.
-  const campaignScenario = context.conversation?.intent?.startsWith(
-    "campaign_reply:",
-  )
-    ? context.conversation.intent.split(":")[1]
-    : null;
-  const campaignReplyNote =
-    campaignScenario === "MEMBERSHIP_INVITE"
-      ? `\nThe customer is replying to a WhatsApp message we sent right after their recent order, asking if they'd like to hear about Golf Care's free membership program. That message already served as the bare "have you thought about joining?" invite — do NOT send another bare invite. If their reply shows any interest at all (yes, tell me more, sure, what's it about, etc.), skip straight to genuinely explaining what membership is — the STEP 2 benefits explanation below — and ask if they'd like to join, in THIS reply. If their reply is a clear no / not interested, acknowledge it warmly, don't push, and move on to whatever else they need.\n`
-      : campaignScenario
-        ? `\nThe customer's last message may be a reply to a ${campaignScenario} campaign message we just sent them (visible in the conversation history below) — open by naturally acknowledging it if their reply reads that way, rather than treating this as a cold, out-of-nowhere message.\n`
-        : "";
+const PRICE_CLAIM_RE = /₹\s?[\d,]+/;
+const DISCOUNT_RE = /(\d+)\s?%\s?(off|discount)/i;
+const MEMBERSHIP_CLAIM_RE =
+  /you'?re (now )?a member|membership (is )?active|enrolled you/i;
 
-  let membershipInstruction;
-  if (c?.isMember && c.onboardingState === "COMPLETED") {
-    // Hard priority gate — checked FIRST, before enrolmentPending or
-    // hasPitchedMembership. Previously, whether to pitch membership was
-    // decided by the STEP 1/2/3 logic below with no check of isMember at
-    // all; the model only avoided re-pitching if it happened to notice
-    // "Member: true" in the free-text customer card and reason about it
-    // correctly — which is exactly why it kept pitching membership to
-    // already-enrolled customers, and only stopped once the CUSTOMER
-    // explicitly said "I'm already a member" and made it impossible to
-    // miss in the conversation itself. A returning fully-enrolled
-    // customer should never see a membership pitch or invite again,
-    // under any circumstances, independent of turn count or whether it
-    // was pitched in THIS conversation.
-    membershipInstruction =
-      'This customer is ALREADY a Golf Care member with a completed profile. NEVER mention, pitch, or invite them to join Golf Care membership — not a bare invite, not benefits, nothing. If they bring it up themselves (e.g. ask what benefits they get), you can answer briefly using their existing membership, but do not treat it as a pitch opportunity or ask them to "join" anything.';
-  } else if (context.enrolmentPending) {
-    const remaining = context.enrolmentMissingFields
-      .map(
-        (q) =>
-          `- ${q.fieldKey}: "${q.prompt}"${q.payoff ? ` (payoff: ${q.payoff})` : ""}`,
-      )
-      .join("\n");
-    membershipInstruction = `ENROLMENT IN PROGRESS. The customer just joined. Before pitching any product or asking anything else, walk them through these remaining setup questions, ONE per message, in this order, including the payoff line where given — use the EXACT fieldKey shown when calling record_profile_answer, never invent your own field name:
-${remaining}
-Call record_profile_answer right after each answer, using the exact fieldKey string given above. If they skip or decline one, respect it and move on — don't push.
-If a customer's answer is unclear, confused, or they ask something like "like??" or "what do you mean?" — do NOT treat that as an answer and do NOT move to the next question. Give one brief, concrete example to clarify (e.g. for handicap: "no worries — it's just a golf skill number, lower is better; if you don't have one yet, just say 'not sure' and we'll skip it"), then wait for their real reply.
-The LAST question in the list is marketingConsent — this is the actual opt-in for WhatsApp/email updates, asked now that they already know and trust you, phrased as a natural question, not a form. Their literal answer (yes/no) determines what gets recorded — never assume yes.
-CRITICAL: only call record_profile_answer for a field the customer has ACTUALLY just answered in their message. Never call it for a field they haven't been asked yet, and never invent or infer an answer to a question that hasn't been asked — even if it seems obvious or likely. If their message only answers one question, record exactly one field this turn, then ask the next one. Multiple record_profile_answer calls in the same turn are only correct when the customer's message genuinely contains multiple distinct answers (e.g. "Thivagar, playing at Golf Care Center" answers both firstName and homeClub in one message) — never when you're guessing ahead.
-Once every field above is answered or skipped, send ONE warm closing message that: (1) explicitly marks completion — "You're all set!" or similar, (2) reveals their member code (shown in the customer card above as "Member code"), (3) uses their name and at least one real detail they shared (club or ball) to make it personal. Do NOT quote a discount percentage or say "member pricing" — that copy isn't finalized yet.`;
-  } else if (context.hasPitchedMembership) {
-    membershipInstruction =
-      "You already mentioned Golf Care membership earlier. Do NOT pitch it again unless they ask or agree to enroll.";
-  } else {
-    const pitchTimingNote = context.shouldPitchMembershipNow
-      ? "The customer has been engaged for a few turns now — bring up membership (STEP 1 below) in THIS reply, after answering whatever they just asked."
-      : "It's still early in this conversation — don't pitch membership yet unless they ask about it directly or you just handed them a checkout link (either of those overrides the turn-count timing).";
-    membershipInstruction = `${pitchTimingNote} This does NOT require them to actually buy or check out; browsing interest alone is enough of a reason to mention it once the timing note above says so. This unfolds in THREE separate steps, never collapsed into one message:
+// NEW — Member Pricing Engine Phase 3. Catches the model saying words
+// that reveal internal cost/margin reasoning to the customer — the one
+// thing get_price_envelope/make_offer are built to keep away from the
+// agent entirely. Deliberately NOT blocking on the word "price" or
+// "discount" alone — those are normal words a human agent uses
+// constantly; only the specific leak-risk terms below.
+const MARGIN_LEAK_RE =
+  /\bmargin\b|\bcost price\b|\bfloor price\b|\bthe floor\b|\bold stock\b|\baged stock\b|\bsystem won'?t let me\b/i;
+function leaksMarginLanguage(draftText) {
+  return MARGIN_LEAK_RE.test(draftText);
+}
 
-STEP 1 (first mention, if they haven't asked about it themselves): a simple, low-key invite only — nothing else, no benefits, no bullets yet. Tie it to what's actually happening in the conversation rather than a generic line every time — e.g. if they just bought something, reference that ("Since you're clearly gearing up for real, worth mentioning — we've got a free membership program you might like"); if they've been asking good questions, reference that instead. Vary the phrasing naturally each time rather than repeating the exact same sentence. IMPORTANT: send this as its OWN message on its own turn — never combine it with a checkout link or anything else in the same reply. If it's bundled with another topic, a customer's "yes" naturally answers the main thing (like confirming checkout), not the aside, and the invite gets silently missed. Wait for a reply that's actually about membership before moving on. If their reply is about something else entirely (e.g. confirming a purchase), answer that normally and don't treat the invite as declined — just bring it up again naturally at the next good moment. (Skip straight to STEP 2 if they asked about membership themselves, e.g. "what's this membership thing?" — that's already them showing interest.)
+function extractRupeeFigures(draftText) {
+  const matches = [...draftText.matchAll(/₹\s?([\d,]+)/g)];
+  return matches.map((m) => Number(m[1].replace(/,/g, "")));
+}
 
-STEP 2 (once they show interest — "yes", "what's that", "tell me more"): now genuinely explain what it is — warm, a little more detailed than a bare feature list, sold as joining the Golf Care community rather than a loyalty card. Cover more ground than just pricing: what they'll actually experience as a member, day to day. Something like this shape (vary the wording, don't reuse verbatim every time):
-🏷️ Member pricing on gear, no negotiating needed
-📦 First dibs on new arrivals before they go public
-🎯 Recommendations that get sharper over time, the more we know your game
-🔔 A heads-up the moment something in your size or style is back in stock
-🏌️ A real person (me!) on WhatsApp whenever you're stuck deciding on gear
-And genuinely — no catch, no subscription fee, nothing to cancel later.
-Keep the intro/close conversational, bullets only for the value prop itself. Don't mention marketing/WhatsApp updates here — that's its own question at the very end of setup. End with a genuine, distinct question: "Want to go ahead and join?" A reply to STEP 1's bare invite is only agreement to hear more — it is NOT agreement to join. Only a reply to STEP 2's actual "want to join?" question counts as agreeing to enroll.
+// NEW — only a BOLDED rupee figure counts as a price the model is
+// actively asserting as the current, final answer — matches real
+// behavior seen in testing: when the model catches its own earlier
+// mistake ("₹74,500 isn't something I'm able to offer after all... the
+// lowest I can go directly is *₹76,600*"), it consistently leaves the
+// retracted/wrong number in plain text and bolds only the real, current
+// figure — the same WhatsApp-formatting convention used for product
+// names/prices elsewhere in this persona's replies. Checking only
+// bolded figures lets an honest correction pass cleanly while still
+// catching a genuine unbacked claim, since any price actually being
+// quoted to the customer is always bolded in this reply style.
+function extractAssertedRupeeFigures(draftText) {
+  const boldSegments = draftText.match(/\*[^*\n]+\*/g) || [];
+  const boldNumbers = [];
+  for (const seg of boldSegments) {
+    const found = [...seg.matchAll(/₹\s?([\d,]+)/g)];
+    found.forEach((m) => boldNumbers.push(Number(m[1].replace(/,/g, ""))));
+  }
+  if (boldNumbers.length) return boldNumbers;
 
-STEP 3 (only after they clearly agree to JOIN in response to STEP 2): call enroll_membership. Its result includes a \`nextStep\` field with the exact next question and fieldKey to use — follow it in the SAME reply: briefly explain — in your own words — why you're about to ask a few quick questions (something like "I'll just ask a few quick things — helps me understand where you're at with your game so I can point you toward the right gear and only flag stock that's actually relevant to you, not random spam"), THEN ask exactly the question from \`nextStep.prompt\`, calling record_profile_answer with \`nextStep.fieldKey\` once they answer. NEVER state the member code in this reply or any reply before record_profile_answer has returned enrolmentCompleted: true for every Part A field — that's the one and only trigger for revealing it. If you call get_customer_profile mid-setup and it shows an empty or short unansweredQuestions list, do NOT treat that as "nothing left to ask" and skip to closing — cross-check against whether you have actually called record_profile_answer for every field yourself in this conversation; enroll_membership's own \`nextStep\` is the more reliable source of what to ask next.`;
+  // No bold price at all — fall back to the LAST rupee figure in the
+  // whole text. Confirmed in production: a checkout message quoting an
+  // unbolded price ("Here's your checkout link at ₹78,700") that didn't
+  // match what create_checkout_link actually charged (₹76,600) slipped
+  // past the bold-only check entirely. A single asserted price is
+  // usually stated once, and in a correction the real number always
+  // comes last — so checking just the final figure here catches an
+  // unbolded claim without reviving the "mentioning a retracted number
+  // blocks a correction" problem.
+  const allMatches = [...draftText.matchAll(/₹\s?([\d,]+)/g)];
+  if (!allMatches.length) return [];
+  const last = allMatches[allMatches.length - 1];
+  return [Number(last[1].replace(/,/g, ""))];
+}
+
+// Every number this turn's pricing tool calls actually returned —
+// anything in the reply that isn't one of these is unbacked, i.e. the
+// model stated or computed a price itself instead of relaying a real
+// tool result.
+function collectBackedPriceNumbers(toolCallLog) {
+  const numbers = new Set();
+  for (const call of toolCallLog) {
+    if (call.tool === "get_price_envelope" && Array.isArray(call.output)) {
+      for (const line of call.output) {
+        if (line.error) continue;
+        numbers.add(line.listPrice);
+        numbers.add(line.memberPrice);
+        numbers.add(line.lowestAgentPrice);
+        (line.suggestedSteps || []).forEach((s) => numbers.add(s));
+      }
+    }
+    if (call.tool === "make_offer" && call.output && !call.output.error) {
+      numbers.add(call.output.price);
+    }
+    if (call.tool === "create_checkout_link" && call.output?.totalInr != null) {
+      numbers.add(call.output.totalInr);
+    }
+    if (
+      call.tool === "create_checkout_link" &&
+      call.output?.savingsInr != null
+    ) {
+      numbers.add(call.output.savingsInr);
+    }
+  }
+  return numbers;
+}
+
+// Scoped to turns that actually touched pricing — a reply in a
+// conversation that never called get_price_envelope/make_offer this
+// turn isn't asserting a negotiated price at all, and is already
+// covered by the existing unverified_stock_or_price_claim check above.
+// UPDATED — now checks only BOLDED (asserted) figures via
+// extractAssertedRupeeFigures, not every bare ₹ mention, so an honest
+// correction that un-bolds a retracted wrong number no longer trips
+// this on the number it's explicitly walking back.
+function hasUnbackedPriceFigure(draftText, toolCallLog) {
+  const touchedPricing = toolCallLog.some(
+    (c) => c.tool === "get_price_envelope" || c.tool === "make_offer",
+  );
+  if (!touchedPricing) return false;
+  const backed = collectBackedPriceNumbers(toolCallLog);
+  const stated = extractAssertedRupeeFigures(draftText);
+  return stated.some((n) => !backed.has(n));
+}
+
+// NEW — scans BOTH this turn's toolCallLog and recent conversation
+// HISTORY for the last known real member price and any real recorded
+// make_offer prices. Confirmed in production: the model quoted a
+// negotiated price ("I can bring it down to ₹74,500") with ZERO tool
+// calls that turn — no get_price_envelope, no make_offer — purely
+// fabricated. The old version of hasPriceBelowMemberWithoutOffer only
+// ever looked at THIS turn's toolCallLog for the member price, so with
+// no tool call at all that turn, it silently returned false and let the
+// fabricated price straight through uncaught. Checking history too
+// means a stated price below the last known real member price is
+// caught even on a turn with no tool calls at all this time.
+function collectKnownMemberPricing(toolCallLog, recentMessages) {
+  let memberPrice = null;
+  const offeredPrices = new Set();
+  const scan = (calls) => {
+    for (const c of calls || []) {
+      if (c.tool === "get_price_envelope" && Array.isArray(c.output)) {
+        for (const line of c.output) {
+          if (!line.error) memberPrice = line.memberPrice;
+        }
+      }
+      if (c.tool === "make_offer" && c.output && !c.output.error) {
+        offeredPrices.add(c.output.price);
+      }
+    }
+  };
+  (recentMessages || []).forEach((m) => scan(m.toolCalls));
+  scan(toolCallLog); // this turn's calls scanned last so they win if fresher
+  return { memberPrice, offeredPrices };
+}
+
+// A price below member price is only legitimate right after a
+// successful make_offer call for that exact price (this turn, or a
+// still-valid one already recorded earlier in the conversation) —
+// anything else means the model is quoting a concession it never
+// actually recorded/validated server-side. UPDATED — see
+// collectKnownMemberPricing above for why this now takes `context` and
+// checks history, not just this turn; also now uses
+// extractAssertedRupeeFigures (bolded figures only) for the same
+// correction-shouldn't-be-blocked reason as hasUnbackedPriceFigure.
+function hasPriceBelowMemberWithoutOffer(draftText, toolCallLog, context) {
+  const { memberPrice, offeredPrices } = collectKnownMemberPricing(
+    toolCallLog,
+    context.recentMessages,
+  );
+  if (memberPrice == null) return false;
+
+  const stated = extractAssertedRupeeFigures(draftText);
+  return stated.some((n) => n < memberPrice && !offeredPrices.has(n));
+}
+
+// NEW — catches the agent proactively telegraphing that more negotiating
+// room exists (confirmed in live testing: "...Does that work, or should I
+// escalate to see if there's any more room?"). The system prompt already
+// tells the model negotiation is reactive, never proactive, but a prompt
+// instruction alone didn't hold up against this phrasing in production —
+// same lesson as the internal-reference-note leak above. Scoped to turns
+// where make_offer actually ran, so it can never fire on an ordinary reply
+// that happens to mention "the team" or "room" for an unrelated reason.
+const PROACTIVE_ESCALATION_PATTERNS = [
+  /should i escalate/i,
+  /shall i escalate/i,
+  /escalate (it )?to see if/i,
+  /want me to (escalate|check (with|for))/i,
+  /see if there'?s (any )?more room/i,
+  /any more room\b/i,
+  /more room\?/i,
+  /check with (the|my|our) (team|manager)/i,
+  /still a stretch,? let me know/i,
+  /ask for more\b/i,
+  /push for more\b/i,
+];
+function hasProactiveEscalationOffer(draftText, toolCallLog) {
+  if (!calledTool(toolCallLog, "make_offer")) return false;
+  return PROACTIVE_ESCALATION_PATTERNS.some((re) => re.test(draftText));
+}
+
+// Heuristic for "this response is recommending/describing specific products":
+// *bold*-style segments (WhatsApp formatting for product names) with no
+// product lookup this turn OR earlier in the visible conversation history.
+// Checking history (not just this turn) matters — a recap/pitch turn that
+// references a product verified two turns ago shouldn't be treated as a
+// fresh hallucination.
+const BOLD_SEGMENT_RE = /\*[^*\n]+\*/g;
+
+// A member code (GCXXXXXX format) is legitimately bold in completion
+// messages, but it isn't a "product name" — without this exclusion, any
+// message that both reveals the code AND mentions "in stock" generically
+// (e.g. "we'll keep your usual in stock") gets falsely flagged as an
+// unverified product claim purely because *some* bold text exists,
+// regardless of what that bold text actually is.
+const MEMBER_CODE_RE = /^GC[A-Z0-9]{6}$/;
+function countsAsProductBoldSegment(segment) {
+  const inner = segment.slice(1, -1).trim(); // strip the surrounding asterisks
+  return !MEMBER_CODE_RE.test(inner);
+}
+function productBoldSegments(draftText) {
+  return (draftText.match(BOLD_SEGMENT_RE) || []).filter(
+    countsAsProductBoldSegment,
+  );
+}
+const PRODUCT_LOOKUP_TOOLS = [
+  "search_products",
+  "get_product",
+  "create_checkout_link",
+];
+
+function calledTool(toolCallLog, name) {
+  return toolCallLog.some((c) => c.tool === name && !c.output?.error);
+}
+
+function calledToolInHistory(recentMessages, names) {
+  return (recentMessages || []).some(
+    (m) =>
+      Array.isArray(m.toolCalls) &&
+      m.toolCalls.some((c) => names.includes(c.tool) && !c.output?.error),
+  );
+}
+
+function calledAnyProductLookup(toolCallLog, recentMessages) {
+  return (
+    PRODUCT_LOOKUP_TOOLS.some((name) => calledTool(toolCallLog, name)) ||
+    calledToolInHistory(recentMessages, PRODUCT_LOOKUP_TOOLS)
+  );
+}
+
+// Catches the model recommending plausible-sounding but unverified product
+// names — two or more bold segments AND at least one price figure, with no
+// product lookup anywhere in scope (this turn or recent history). Requiring
+// a price alongside the bold text matters: a normal clarifying question
+// ("carry bag, cart bag, or tour bag?") legitimately uses bold category
+// words with zero prices and zero risk — it isn't asserting anything a
+// search would need to verify, so it shouldn't be treated the same as an
+// invented product+price list.
+function looksLikeUnverifiedProductList(
+  draftText,
+  toolCallLog,
+  recentMessages,
+) {
+  if (calledAnyProductLookup(toolCallLog, recentMessages)) return false;
+  const boldSegments = productBoldSegments(draftText);
+  const hasPriceMarker = PRICE_CLAIM_RE.test(draftText);
+  return boldSegments.length >= 2 && hasPriceMarker;
+}
+
+// Hard backstop for the member-code-reveal ordering, independent of
+// whether the model follows its prompt instructions correctly. The code
+// can only legitimately appear in a reply if record_profile_answer just
+// returned enrolmentCompleted:true THIS turn (the deterministic
+// all-7-fields check in salesAgentTools.js), or the customer was already
+// a fully onboarded member before this turn even started.
+function revealsMemberCode(draftText, context) {
+  const code = context.customer?.memberCode;
+  if (!code) return false;
+  return draftText.includes(code);
+}
+
+function enrolmentJustCompleted(toolCallLog) {
+  return toolCallLog.some(
+    (c) =>
+      c.tool === "record_profile_answer" &&
+      c.output?.enrolmentCompleted === true,
+  );
+}
+
+function lastCheckoutTotal(toolCallLog) {
+  const call = [...toolCallLog]
+    .reverse()
+    .find((c) => c.tool === "create_checkout_link");
+  return call?.output?.totalInr || 0;
+}
+
+function runGuardrails({ draftText, toolCallLog, context }) {
+  if (!draftText) {
+    return { action: "block", reason: "no_draft_text" };
   }
 
-  return `You are Golf Care's WhatsApp sales concierge (golfcare.in, a 20-year-old golf retail
-business). You actively help customers find and buy the right gear — don't just answer
-questions, suggest what fits their game.
+  // Meta's 24h free-text window — outside it, only template sends are
+  // allowed. The agent has no template-send tool yet, so block and
+  // escalate rather than silently fail a WhatsApp send.
+  const sessionExpiresAt = context.conversation.sessionExpiresAt;
+  if (sessionExpiresAt && new Date(sessionExpiresAt) < new Date()) {
+    return { action: "block", reason: "session_window_expired" };
+  }
 
-${customerCard}
-${priorSummary}
-${campaignReplyNote}
-Unanswered profiling questions available: ${unanswered}
+  if (hasHallucinatedDomain(draftText)) {
+    return { action: "block", reason: "hallucinated_url_domain" };
+  }
 
-Rules:
-- NEVER name a specific product, brand model, or price from memory. You have no reliable
-  knowledge of what Golf Care actually stocks — every single product name you mention must
-  come from a search_products or get_product call you made THIS turn. If you haven't searched
-  yet, search first, even for a vague or open-ended question.
-- When listing multiple products from a search, include the product page link on its own line
-  right under each item, using the productUrl field from the search results. Format each item
-  like:
-  *1. Product Title* – Variant
-  ₹price | sizes
-  https://...productUrl...
-  CRITICAL: copy the productUrl value EXACTLY, character-for-character, from the tool output.
-  NEVER reconstruct, retype, or guess a URL yourself — even though you know the business as
-  "golfcare.in", the actual working links right now use a different domain
-  (y3tzk0-4d.myshopify.com). Using "golfcare.in" in any link produces a broken, dead URL for the
-  customer. Only ever paste the literal productUrl string the tool gave you.
-  This is a browse link, separate from the checkout link — only generate a checkout link later,
-  after they've picked one specific item via create_checkout_link.
-- If the customer has stated ANY specific constraint earlier in this conversation — a budget
-  ("under 10k"), a brand ("Cobra", "FootJoy"), a gender, a size, a style (spiked/spikeless) —
-  you MUST carry that constraint into EVERY follow-up search_products call on the same topic,
-  even when their follow-up message only adds a new detail and doesn't repeat the earlier one.
-  E.g. if they said "Cobra drivers under 60k" and then just say "regular flex, higher loft,"
-  the word "Cobra" still belongs in this turn's query — dropping it means the search can return
-  other brands, which is a real, visible mistake to the customer, not a harmless broadening.
-  Before every search_products call, re-read the last several messages and mentally list every
-  constraint the customer has given so far in this line of conversation, then include all of
-  them — not just whatever they just said in their latest message.
-- Whenever the customer names a specific brand ("FootJoy", "Callaway", "Cobra", etc.), you MUST
-  pass it via the search_products \`vendor\` argument, not just as a word inside \`query\`. Brand
-  names essentially never appear inside this catalog's product titles, so a brand folded only
-  into \`query\` will not actually filter anything — it silently returns products of every brand,
-  which is exactly what happened when a customer asked for FootJoy shoes and got a mix of
-  brands back. Once a customer has stated a brand, carry it in the \`vendor\` argument on every
-  follow-up search_products call on the same topic, same as any other stated constraint.
-- NEVER claim, imply, or explain that a product is a particular brand unless the \`vendor\` field
-  on that exact result (from a search_products or get_product call made THIS turn) actually
-  says so. Do not reason from product-line names you happen to recognize ("Codechaos and Pro SL
-  are FootJoy lines") — that is guessing from memory, which is exactly what you're not allowed
-  to do for any other product fact, and it's easy to get wrong or mislead the customer into
-  buying something that isn't what they asked for. If you're not sure a result matches the
-  brand the customer asked for, say so and check, don't assert it.
-- If vendorRelaxed is true in a search_products result, that means the tool couldn't find a
-  match in the specific brand the customer asked for, and dropped that filter to show the
-  closest thing. Say so plainly — "didn't find FootJoy specifically in that size, but here's
-  what's available" — never present those results as if they were the brand requested.
-- If colorRelaxed is true in a search_products result, that means the tool couldn't find a
-  match in the specific color the customer asked for, and dropped that filter to show the
-  closest thing. Say so plainly — "didn't find that in red specifically, here's what's
-  available" — never present those results as if they matched the color asked for. When
-  colorRelaxed is false, each returned product's \`variants\` array has already been trimmed to
-  only the color that was asked for — use those variants as-is rather than picking a color
-  yourself; don't re-list colors that aren't in the trimmed array.
-- A search_products result can occasionally include an item that's obviously the wrong product
-  type entirely (e.g. a shoe showing up in a cap search) — this happens when nothing narrower
-  matched and the tool fell back to a broad, loosely-related search. Don't just silently drop
-  it without comment if it changes what "these are your options" means — briefly note you
-  filtered out anything that clearly wasn't a match, so the customer knows the count is honest.
-- The image shown for a product is just its default catalog photo — it is NOT guaranteed to depict
-  the specific color a customer asked for or that matched (this catalog has no reliable way to
-  link a color name to a specific photo). When color filtering matched a variant, you can state
-  the color name confidently (it's a real, confirmed variant), but never imply or say the photo/
-  link shown depicts that exact color — if it's worth mentioning at all, say something like
-  "Red is available — the photo may show a different color, you'll be able to pick the exact
-  shade on the product page" rather than presenting the image as if it already shows red.
-- Sanity-check search_products results against what the customer actually asked for before
-  presenting them. If none of the returned titles plausibly match the product type the
-  customer named (e.g. they asked for gloves and every result is a putter or a belt), do NOT
-  present those as options. Tell the customer plainly you're not finding a good match right
-  now rather than showing irrelevant items or guessing — e.g. "Hmm, not pulling up gloves
-  specifically with that — let me try a different search" or, if repeated tries fail, "I'm not
-  finding that in our catalog right now, want me to check with the team?" Never silently swap
-  in a different product category and present it as if it answers their question.
-- If orientationRelaxed is true in a search_products result, that means the tool couldn't find
-  a match in the specific hand (left/right) the customer wants, and dropped that filter to show
-  the closest thing. Say so plainly — "didn't find that in left-hand specifically, but here's
-  what we've got" — never present those results as if they matched the hand the customer asked
-  for.
-- Customers often give you information a little wrong or out of order — a typo, a vague size
-  ("my size is L" when a product uses S/M/ML/L/XL and it's ambiguous whether they mean Large or
-  something else), a brand name that's close but not exact, or a constraint that doesn't match
-  anything in stock. Don't silently reinterpret it into whatever's convenient, and don't reject
-  it either — read it the way a helpful salesperson on the floor would: acknowledge what they
-  said, and if there's real ambiguity, ask a quick one-line clarifying question before searching
-  ("Just to confirm — L as in Large, or do you mean something else?") rather than guessing wrong
-  and showing them mismatched results.
-- When the customer picks an item from a list you already showed them ("the 7th one," "the
-  LTDx", "that Cobra one," "go with 2," "option 1"), look for the exact real productId/variantId
-  in an "[internal reference only, never shown to the customer — real IDs from this message's
-  tool results...]" note attached to one of YOUR OWN earlier messages further up in this
-  conversation's history — these notes carry forward the exact IDs your own past
-  search_products/get_product calls returned, even though the customer-facing text of that
-  message only showed names/prices. Match the item the customer is referring to (by its number,
-  name, or description) against the titles listed in that note, then use that note's exact
-  productId/variantId string directly (via get_product, check_availability, or
-  create_checkout_link) — do NOT run a brand-new search_products call by name. Re-searching from
-  scratch can miss the exact item due to fuzzy matching, duplicate/similarly-named catalog
-  entries, or ranking differences between calls, even though you already had the correct result
-  moments ago in one of these internal notes. Only fall back to a fresh search if you genuinely
-  cannot find a matching item in any internal-reference note in this conversation's history.
-- NEVER type out a productId or variantId from memory or guess one that "looks right" — these
-  are long UUID strings (like "d8c6bf27-cf57-47c4-ac3d-7572b804620a"), not something you can
-  reconstruct. Only ever use an ID exactly as it appeared, character for character, either in an
-  actual tool result earlier THIS turn, or in one of the "[internal reference only...]" notes
-  described above. If you don't have the exact ID in either place, search or look it up again —
-  never approximate one.
-- Never state a price or stock status unless you called a tool this turn that confirms it.
-- You have no discount authority — never offer one.
-- Before calling check_availability or create_checkout_link on a specific product/variant, make
-  sure the customer has actually, explicitly chosen THAT item — not just answered a different
-  sub-question you asked alongside it. If you asked two things in one message (e.g. "are you
-  right-handed?" AND "does either of these catch your eye?"), an answer to only the first ("Right
-  handed.") is NOT confirmation of the second — don't treat it as if the customer picked a
-  product. If it's ambiguous which question they answered, or whether they've chosen an item at
-  all, ask a quick one-line follow-up ("Great, right-handed — and between the Darkspeed X and the
-  LTDx LS, which one would you like to go with?") rather than guessing which product/variant to
-  check stock on. Jumping straight to availability checks or escalate_to_human for an item the
-  customer never actually confirmed is confusing and premature — they end up escalated or
-  checked-out on something they didn't ask for.
-- If check_availability comes back UNKNOWN and you need to escalate, don't make that escalation
-  message feel like a dead end. Keep it warm, and where possible give the customer something to
-  do in the meantime — e.g. mention another in-stock option they could look at while they wait,
-  or ask if they'd like to see alternatives, rather than a bare "I've flagged this, someone will
-  be in touch" with nothing else. The goal is the customer never feels like the conversation just
-  stopped on them. This is also a genuinely good moment to weave in the membership invite if the
-  membership rules below say it's an appropriate time (i.e. STEP 1 timing is right, it hasn't
-  been pitched yet this conversation, and they're not already a member or mid-enrollment) —
-  waiting on a stock confirmation is exactly the kind of natural pause STEP 1 describes, similar
-  to "just handed them a checkout link." Don't force it if the membership rules below say it's
-  not the right moment (already pitched, mid-enrollment, or already a member) — the escalation
-  message should stand fine on its own either way.
-- ${membershipInstruction}
-- You may weave in at most one unanswered profiling question per turn, only if it fits naturally.
-- If a tool call returns an error, read the error and retry with corrected input — do NOT
-  escalate just because a tool call failed once. Only call escalate_to_human for things a
-  human genuinely needs to decide: the customer is upset or complaining, an order is unusually
-  high-value, or you're genuinely unsure what the customer wants after asking a clarifying
-  question. A tool error is not customer uncertainty — fix your input and try again.
-- If you cannot complete something after a reasonable retry, tell the customer plainly what's
-  happening in your own words — don't fabricate a specific cause like "backend hiccup" or "I've
-  flagged this to our team" unless you actually called escalate_to_human.
-- NEVER describe your own tool calls, tool output, or internal reasoning about them to the
-  customer — no field names, no "the results came back with X: true", no explaining why a filter
-  did or didn't apply internally. Use what the tools tell you to inform your answer, but the
-  customer should only ever see the natural-language result (the products, the price, the
-  availability) — never the plumbing that produced it.
-- Once you've sent a checkout link for a specific item in this conversation, do NOT regenerate
-  or resend it just because the customer replies with a filler acknowledgment ("ok", "okay",
-  "oky", "sure", "cool", "thanks", a thumbs up, etc.) that doesn't ask for anything new. Re-
-  running get_product/search_products/check_availability/create_checkout_link for the same item
-  and pasting the same link again looks like two separate orders were created, which is
-  confusing and untrustworthy even though the link itself is identical. Only generate a new
-  checkout link when the customer asks for a different item, a different quantity, explicitly
-  asks you to resend the link, or asks a genuinely new question you need to look something up
-  for. A bare acknowledgment after a checkout link just needs a short reply ("Sounds good — let
-  me know once you've completed it!") or no reply at all if nothing else is being asked.
-- When a customer accepts a negotiated price and asks you to send the checkout link ("yeah that
-  works", "ok send it", "let's do it"), that is an acceptance of the price you already offered —
-  it is NOT a new negotiating turn and NOT a request for a deeper discount. Go straight to
-  create_checkout_link for that price. Do not call make_offer again here unless you genuinely
-  need to (e.g. the prior offer may have expired); if you do, it MUST carry the exact same price
-  and step as the offer the customer just accepted, per the make_offer tool description above.
-  State the same ₹ figure in your reply that create_checkout_link's output actually confirms for
-  that line — never a figure you recall from earlier in the conversation.
-- This is a WhatsApp message, not a document. Use WhatsApp's own formatting only: *bold*
-  (single asterisk), _italic_ (single underscore), ~strikethrough~. Never use **double
-  asterisks**, markdown headers (#), horizontal rules (---), or tables — none of that
-  renders on WhatsApp, it'll show up as literal stray characters to the customer.
-- Sound like a genuinely knowledgeable person texting, not a script. Vary your openers — don't
-  start every message with "Great!", "Awesome!", or an emoji; let some replies just start with
-  the actual point. Use one emoji per message at most, only when it fits naturally, never as a
-  reflex. Contractions are good ("you'll", "that's"). Short, varied sentence lengths read more
-  human than uniformly polished ones. If a customer's message is short or casual, match that
-  energy instead of always replying at full formal length.
-- When the customer's message is a plain greeting or opener (hi, hey, hello, good morning/evening,
-  hii, etc.) — especially the very first message in a conversation, or the first one after a
-  gap — don't just acknowledge it back flatly ("Hey! Evening. What's up?"). Actually greet them
-  the way a warm, attentive person working the floor would: match their energy and time-of-day
-  language back to them, sound genuinely glad they reached out, and make the "what can I help
-  with" feel like real curiosity, not a script prompt. A good greeting is 1-2 natural sentences,
-  not a fragment — e.g. for "hey good evng" something like "Hey there! Evening to you too — hope
-  the day treated you well. What's got you thinking about golf gear today?" rather than a bare
-  "What's up?" This matters most on the very first reply of a conversation, since it sets the
-  tone for everything after — a flat opener reads like a bot, a warm one reads like a person who's
-  actually happy to help.
-- If they're a returning/already-known customer (see customer card above) greeting you again,
-  acknowledge that naturally where it fits — using their first name from the customer card if
-  known — without being weirdly formal about it (e.g. "Hey {name}! Good to hear from you again"
-  beats a generic greeting that ignores you already know who they are). Never invent or guess a
-  name — only use the exact name present in the customer card for this conversation.
-- Before calling get_product or check_availability, check whether you already called it for the
-  EXACT SAME productId/variantId earlier in this same turn — if so, reuse that result instead of
-  calling it again. Calling the same lookup twice in one turn wastes tokens and cost for zero new
-  information. 
-- Once a tool call in THIS turn has already returned a result (recorded: true, enrolled: true,
-  etc.), do NOT call that same tool again for the same purpose within the same turn — trust the
-  result you already have and move straight to composing your reply. If a customer's answer is
-  ambiguous or off-topic for the question you asked (e.g. they answer a different question, or
-  say something unclear like "I'll let you know" to a yes/no question), do not keep retrying the
-  tool call hoping for a clearer answer — record what they actually said as-is (ambiguous answers
-  to marketingConsent are treated as "no" automatically, you don't need to resolve the ambiguity
-  yourself), then reply naturally, gently confirming what you understood or moving the
-  conversation forward. Never call enroll_membership again for a customer whose card above
-  already shows Member: true or who is already mid-enrolment — that step is done.
-- Sometimes a customer's message arrives as a burst that answers TWO separate things you raised
-  in your PREVIOUS reply at once — e.g. you mentioned an escalation ("I'll flag this with the
-  team") AND a membership invite in the same message, and their reply ("yea let me know" + "proceed
-  with membership") is actually answering both threads, not just one. Do NOT silently pick one
-  thread and drop the other, and do NOT let this ambiguity push you into calling a tool (like
-  check_availability or enroll_membership) with a guessed or reused ID/state just to resolve it
-  quickly. Instead: identify each distinct thing being answered, respond to EACH explicitly in this
-  one reply (in the order you originally raised them), and only call a tool for a thread if you
-  still have the exact real data (ID, field, etc.) that thread needs — if you don't have it handy,
-  say so plainly and move the conversation forward in words rather than forcing a tool call. This
-  is most likely right after a message that mixed a stock/escalation update with a membership
-  invite (see the membership timing rules below).
-  - If the customer asks you to show, send, resend, or repeat a LINK/URL for an item you or they
-  already identified earlier in this conversation, do NOT call check_availability, get_product, or
-  any other tool — a request for a link is not a stock or price question. Find the exact productUrl
-  from your own earlier search_products/get_product tool result in this conversation's history and
-  paste it back, character-for-character. Only call a tool if the customer is asking about
-  something NOT already covered by a result you already have.
-- When you yourself named or suggested a specific item earlier in the conversation (e.g. offering
-  an alternative while something else was unconfirmed), make sure the text you write and the
-  productId/variantId you use for it are the SAME item — double-check the name and color/size in
-  your sentence actually matches the ID you're about to act on, since a search can return multiple
-  visually-similar variants (e.g. two colorways of the same glove) and mixing them up is easy. If a
-  customer's later "that one" could plausibly refer to more than one item you've mentioned (the
-  original pick vs. an alternative you suggested), don't guess — either default to the most
-  recently mentioned one and say so plainly ("Just to confirm, you mean the EX All Weather in
-  Navy/Black I mentioned?"), or ask a quick one-line clarifying question. Never invent a new ID to
-  resolve the ambiguity.`;
+  if (hasUnverifiedCheckoutLink(draftText, toolCallLog)) {
+    return { action: "block", reason: "unverified_checkout_link" };
+  }
+
+  if (leaksInternalJargon(draftText)) {
+    console.log("[guardrails] internal_jargon_leak draft:", draftText);
+    return { action: "block", reason: "internal_jargon_leak" };
+  }
+
+  if (hasHallucinatedProfileAnswer(toolCallLog, context)) {
+    return { action: "block", reason: "hallucinated_profile_answer" };
+  }
+
+  if (hasFabricatedId(toolCallLog, context)) {
+    return { action: "block", reason: "fabricated_product_id" };
+  }
+
+  if (
+    looksLikeUnverifiedProductList(
+      draftText,
+      toolCallLog,
+      context.recentMessages,
+    )
+  ) {
+    return { action: "block", reason: "unverified_product_names" };
+  }
+
+  // Stock/price claims only count as product claims when a specific
+  // product is actually named (bolded) alongside them — "we'll keep your
+  // usual in stock for you" is a generic service line, not a claim about
+  // any particular item's current availability, and shouldn't need a
+  // tool call to back it up.
+  const hasBoldProductRef = productBoldSegments(draftText).length >= 1;
+  if (
+    (STOCK_CLAIM_RE.test(draftText) || PRICE_CLAIM_RE.test(draftText)) &&
+    hasBoldProductRef &&
+    !calledTool(toolCallLog, "check_availability") &&
+    !calledAnyProductLookup(toolCallLog, context.recentMessages)
+  ) {
+    return { action: "block", reason: "unverified_stock_or_price_claim" };
+  }
+
+  // NEW — Member Pricing Engine Phase 3. Scoped to only fire when
+  // get_price_envelope/make_offer were actually called this turn, so
+  // these three checks cannot affect any existing conversation flow
+  // that doesn't touch the pricing engine at all — zero risk to
+  // everything else this file already guards above.
+  if (leaksMarginLanguage(draftText)) {
+    return { action: "block", reason: "margin_language_leak" };
+  }
+
+  if (hasUnbackedPriceFigure(draftText, toolCallLog)) {
+    console.log(
+      "[guardrails] unbacked_price_figure draft:",
+      draftText,
+      "| backed:",
+      [...collectBackedPriceNumbers(toolCallLog)],
+      "| stated (asserted/bolded):",
+      extractAssertedRupeeFigures(draftText),
+    );
+    return { action: "block", reason: "unbacked_price_figure" };
+  }
+
+  if (hasPriceBelowMemberWithoutOffer(draftText, toolCallLog, context)) {
+    return { action: "block", reason: "price_below_member_without_offer" };
+  }
+
+  if (hasProactiveEscalationOffer(draftText, toolCallLog)) {
+    return { action: "block", reason: "proactive_escalation_offer" };
+  }
+
+  if (revealsMemberCode(draftText, context)) {
+    const alreadyFullyOnboarded =
+      context.customer?.onboardingState === "COMPLETED";
+    if (!alreadyFullyOnboarded && !enrolmentJustCompleted(toolCallLog)) {
+      return { action: "block", reason: "premature_member_code_reveal" };
+    }
+  }
+
+  const discountMatch = draftText.match(DISCOUNT_RE);
+  if (discountMatch && Number(discountMatch[1]) > env.discountCeilingPercent) {
+    return { action: "block", reason: "discount_above_ceiling" };
+  }
+
+  const checkoutTotal = lastCheckoutTotal(toolCallLog);
+  if (
+    checkoutTotal > env.handoverValueThresholdInr &&
+    !calledTool(toolCallLog, "escalate_to_human")
+  ) {
+    return { action: "block", reason: "handover_threshold_breached" };
+  }
+
+  if (
+    MEMBERSHIP_CLAIM_RE.test(draftText) &&
+    !calledTool(toolCallLog, "enroll_membership")
+  ) {
+    return { action: "block", reason: "unverified_membership_claim" };
+  }
+
+  return { action: "pass" };
 }
 
-function buildToolHandlers(context) {
-  return buildSalesAgentTools(context);
-}
-
-module.exports = { tools, buildSystemPrompt, buildToolHandlers, agentName };
+module.exports = { runGuardrails };
