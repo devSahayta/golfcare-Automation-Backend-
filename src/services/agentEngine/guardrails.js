@@ -381,7 +381,18 @@ const PROACTIVE_ESCALATION_PATTERNS = [
   /push for more\b/i,
 ];
 function hasProactiveEscalationOffer(draftText, toolCallLog) {
-  if (!calledTool(toolCallLog, "make_offer")) return false;
+  // UPDATED — was scoped to calledTool(toolCallLog, "make_offer") only,
+  // which missed a real case: the customer pushed back again on a price
+  // that hadn't changed, so the model only re-called get_price_envelope
+  // (no need to re-record an unchanged offer) and the escalation-offer
+  // text still went straight through unchecked. Scoped the same way
+  // hasUnbackedPriceFigure already is — either pricing tool touching this
+  // turn is enough to treat it as a pricing-conversation turn worth
+  // checking.
+  const touchedPricing = toolCallLog.some(
+    (c) => c.tool === "get_price_envelope" || c.tool === "make_offer",
+  );
+  if (!touchedPricing) return false;
   const mentionsEscalationOrRoom =
     ESCALATION_MENTION_RE.test(draftText) ||
     MORE_ROOM_MENTION_RE.test(draftText);
