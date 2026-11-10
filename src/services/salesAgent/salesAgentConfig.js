@@ -81,7 +81,7 @@ const tools = [
   {
     name: "make_offer",
     description:
-      "Record a price you are offering the customer for one variant. REQUIRED before quoting or confirming any price below that variant's member price — do this the moment you decide to offer a concession, not after the customer accepts. Rejects and returns the real lowest valid price if you try to go below it, or if you try to skip ahead in the negotiation steps.",
+      "Record a price you are offering the customer for one variant. REQUIRED before quoting or confirming any price below that variant's member price — do this the moment you decide to offer a concession, not after the customer accepts. Rejects and returns the real lowest valid price if you try to go below it, or if you try to skip ahead in the negotiation steps. Once the customer has agreed to a specific price and you call this again later in the same negotiation (e.g. right before create_checkout_link), pass the EXACT SAME price and step you already recorded for them — never a new, lower price, even if you recall a deeper lowestAgentPrice or suggestedStep from an earlier get_price_envelope call. Re-submitting the same price is a safe no-op (it returns the existing offer); submitting a different, deeper price silently changes what the customer is charged below what they actually agreed to, which is never correct at this stage. Only offer a price the customer hasn't already accepted when they are still actively negotiating, not when they've said yes and are moving to checkout.",
     input_schema: {
       type: "object",
       properties: {
@@ -406,12 +406,6 @@ Rules:
   described above. If you don't have the exact ID in either place, search or look it up again —
   never approximate one.
 - Never state a price or stock status unless you called a tool this turn that confirms it.
-- These "[internal reference only...]" notes are appended automatically by the system to your
-  own past messages in this conversation's history — you did not write them yourself, and you
-  must never write one. Never include a block like "[internal reference only...]", or any raw
-  productId/variantId string, in the actual reply text you compose for the customer. Use the IDs
-  from these notes silently as tool-call arguments only — never quote, repeat, or imitate this
-  annotation format in what you actually send to the customer.
 - You have no discount authority — never offer one.
 - Before calling check_availability or create_checkout_link on a specific product/variant, make
   sure the customer has actually, explicitly chosen THAT item — not just answered a different
@@ -461,6 +455,14 @@ Rules:
   asks you to resend the link, or asks a genuinely new question you need to look something up
   for. A bare acknowledgment after a checkout link just needs a short reply ("Sounds good — let
   me know once you've completed it!") or no reply at all if nothing else is being asked.
+- When a customer accepts a negotiated price and asks you to send the checkout link ("yeah that
+  works", "ok send it", "let's do it"), that is an acceptance of the price you already offered —
+  it is NOT a new negotiating turn and NOT a request for a deeper discount. Go straight to
+  create_checkout_link for that price. Do not call make_offer again here unless you genuinely
+  need to (e.g. the prior offer may have expired); if you do, it MUST carry the exact same price
+  and step as the offer the customer just accepted, per the make_offer tool description above.
+  State the same ₹ figure in your reply that create_checkout_link's output actually confirms for
+  that line — never a figure you recall from earlier in the conversation.
 - This is a WhatsApp message, not a document. Use WhatsApp's own formatting only: *bold*
   (single asterisk), _italic_ (single underscore), ~strikethrough~. Never use **double
   asterisks**, markdown headers (#), horizontal rules (---), or tables — none of that
