@@ -346,13 +346,27 @@ function hasPriceBelowMemberWithoutOffer(draftText, toolCallLog, context) {
 }
 
 // NEW — catches the agent proactively telegraphing that more negotiating
-// room exists (confirmed in live testing: "...Does that work, or should I
-// escalate to see if there's any more room?"). The system prompt already
-// tells the model negotiation is reactive, never proactive, but a prompt
-// instruction alone didn't hold up against this phrasing in production —
-// same lesson as the internal-reference-note leak above. Scoped to turns
-// where make_offer actually ran, so it can never fire on an ordinary reply
-// that happens to mention "the team" or "room" for an unrelated reason.
+// room exists. The system prompt already tells the model negotiation is
+// reactive, never proactive, but a prompt instruction alone didn't hold up
+// in production. First cut of this check (an exact-phrase list — "escalate
+// to see if", "more room", etc.) missed a real example because the model
+// phrased it slightly differently: "I can escalate to the owner to see if
+// there's any additional room... Want me to do that?" — "to the owner" and
+// "additional" broke the exact phrases. Exact-phrase matching is too
+// brittle against a model that paraphrases, so this is now structural
+// instead: ANY mention of escalating/checking with someone for more,
+// combined with the agent framing it as a question/choice for the
+// customer to opt into, blocks — regardless of the exact words used. The
+// specific phrase list is kept as a fallback for cases with no "?" at all.
+// Scoped to turns where make_offer actually ran, so it can never fire on
+// an ordinary reply that happens to mention "the team" for an unrelated
+// reason.
+const ESCALATION_MENTION_RE =
+  /\bescalat(e|ing|ed)\b|\bcheck(ing)? with (the|my|our) (owner|team|manager)\b/i;
+const MORE_ROOM_MENTION_RE =
+  /\b(more|any more|additional|extra|further)\s+(room|discount|margin)\b|\bbetter (price|deal)\b/i;
+const OFFERS_AS_CHOICE_RE =
+  /\b(want me to|would you like me to|should i|shall i|do you want me to|let me know if you'?d like|let me know if you want)\b/i;
 const PROACTIVE_ESCALATION_PATTERNS = [
   /should i escalate/i,
   /shall i escalate/i,
@@ -368,6 +382,12 @@ const PROACTIVE_ESCALATION_PATTERNS = [
 ];
 function hasProactiveEscalationOffer(draftText, toolCallLog) {
   if (!calledTool(toolCallLog, "make_offer")) return false;
+  const mentionsEscalationOrRoom =
+    ESCALATION_MENTION_RE.test(draftText) ||
+    MORE_ROOM_MENTION_RE.test(draftText);
+  const offersAsChoice =
+    OFFERS_AS_CHOICE_RE.test(draftText) || draftText.includes("?");
+  if (mentionsEscalationOrRoom && offersAsChoice) return true;
   return PROACTIVE_ESCALATION_PATTERNS.some((re) => re.test(draftText));
 }
 
