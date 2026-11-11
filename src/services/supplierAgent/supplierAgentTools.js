@@ -8,6 +8,7 @@ const { updateInventoryItemCost } = require("../shopifyInventory");
 const { computeCostPrice } = require("../pricingCalculator");
 const { researchProductSpecs } = require("./productResearch");
 const { getOpenCheckin, applyConfirmation, confirmAllPendingItems } = require("../supplierCheckinService");
+const { tokenize, findExistingPendingDraft, findExistingCatalogMatch } = require("../productCatalogMatch");
 
 function buildSupplierAgentTools(context) {
   const supplier = context.supplier;
@@ -698,23 +699,6 @@ async function previousAttemptFullyRejected(batchId) {
   return true;
 }
 
-// See create_product_draft's call site — the same document staying in
-// conversation history can get reprocessed by the model on a later turn;
-// this is the actual guard against creating a second Shopify product for
-// something already pending review.
-async function findExistingPendingDraft(supplierId, title) {
-  const normalizedTitle = title.trim().toLowerCase();
-  const pending = await prisma.productDraft.findMany({
-    where: { supplierId, approvalStatus: "PENDING" },
-    select: { approvalToken: true, rawPayload: true },
-  });
-  return (
-    pending.find(
-      (d) => (d.rawPayload?.title || "").trim().toLowerCase() === normalizedTitle,
-    ) || null
-  );
-}
-
 // --- reconcile_stock_list matching (v1 heuristic — see the note on
 // search_products in salesAgentTools.js; same "no embedding pipeline
 // decided yet" situation applies here) ---
@@ -732,14 +716,6 @@ const STOPWORDS = new Set([
 
 function normalizeSku(s) {
   return (s || "").toLowerCase().trim();
-}
-
-function tokenize(s) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/[^\w\s]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length > 1 && !STOPWORDS.has(w));
 }
 
 function candidateLabel(sp) {
@@ -812,83 +788,6 @@ function matchSupplierProduct(catalog, query) {
       .slice(0, 3)
       .map((s) => ({ supplierProductId: s.sp.id, title: candidateLabel(s.sp) })),
   };
-}
-
-// create_product_draft's real-product-already-exists check — deliberately
-// separate from matchSupplierProduct above, which only searches THIS
-// supplier's own SupplierProduct links. This searches Golf Care's whole
-// catalog (every Product/Variant, regardless of supplier), because a
-// product being "unmatched" against one supplier's links says nothing
-// about whether it's genuinely new to Golf Care.
-//
-// Deliberately conservative: only returns a match when both the product
-// AND a specific variant are confidently identified. A wrong auto-link
-// (applying a stock update to the wrong SKU) is worse than occasionally
-// falling through to create a duplicate draft a human then has to notice
-// and reject — asymmetric risk, so this errs toward "no match" whenever
-// there's real ambiguity, rather than trying to disambiguate on its own.
-async function findExistingCatalogMatch({ title, sku, variantOptions }) {
-  // status: "active" only — handleProductDelete (shopifyWebhookController.js)
-  // soft-deletes: a product removed on Shopify gets status flipped to
-  // "archived" here, the row is never actually removed (so order history
-  // etc. stays intact). Without this filter, a deleted-on-Shopify product
-  // still sitting in our table (archived, or "draft" pending its own
-  // approval) would look like a legitimate "this already exists" match —
-  // confirmed for real: a test product's archived leftover row got
-  // auto-linked to a supplier and its 404-on-Shopify variant "confirmed,"
-  // exactly the write-back failure this filter prevents from recurring.
-  if (sku) {
-    const bySku = await prisma.variant.findFirst({
-      where: { sku: { equals: sku, mode: "insensitive" }, Product: { status: "active" } },
-      include: { Product: true },
-    });
-    if (bySku) return { product: bySku.Product, variant: bySku };
-  }
-
-  const titleTokens = tokenize(title);
-  if (titleTokens.length === 0) return null;
-
-  const candidates = await prisma.product.findMany({
-    where: {
-      status: "active",
-      OR: titleTokens.slice(0, 6).map((w) => ({ title: { contains: w, mode: "insensitive" } })),
-    },
-    include: { Variant: true },
-    take: 15,
-  });
-  if (candidates.length === 0) return null;
-
-  const scored = candidates
-    .map((p) => {
-      const candidateTokens = new Set(tokenize(p.title));
-      const overlap = titleTokens.filter((t) => candidateTokens.has(t)).length;
-      return { product: p, score: overlap / titleTokens.length };
-    })
-    .filter((s) => s.score >= 0.6)
-    .sort((a, b) => b.score - a.score);
-
-  if (scored.length === 0) return null;
-  // Require a clearly dominant top match, not just the highest of several
-  // similar scores — same "don't guess" reasoning as matchSupplierProduct.
-  if (scored.length > 1 && scored[1].score >= scored[0].score - 0.15) return null;
-
-  const product = scored[0].product;
-  if (product.Variant.length === 0) return null;
-  if (product.Variant.length === 1) return { product, variant: product.Variant[0] };
-
-  const optionTokens = (variantOptions || []).flatMap((o) => tokenize(o.value));
-  if (optionTokens.length === 0) return null; // multiple variants, nothing to disambiguate with
-
-  const variantScored = product.Variant.map((v) => {
-    const vTokens = new Set(tokenize(v.title));
-    const overlap = optionTokens.filter((t) => vTokens.has(t)).length;
-    return { variant: v, score: overlap / optionTokens.length };
-  }).sort((a, b) => b.score - a.score);
-
-  if (variantScored[0].score < 0.5) return null;
-  if (variantScored.length > 1 && variantScored[1].score >= variantScored[0].score) return null;
-
-  return { product, variant: variantScored[0].variant };
 }
 
 // PendingProductLead upsert/resolve — see the model's schema comment for

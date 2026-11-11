@@ -2,7 +2,14 @@
 const { Router } = require("express");
 const multer = require("multer");
 const { resolveSupplierByToken } = require("../middleware/supplierPortalAuth");
-const { getPortalItems, confirmAll, confirmItem, uploadItemImage } = require("../controllers/supplierPortalController");
+const {
+  getPortalItems,
+  confirmAll,
+  confirmItem,
+  uploadItemImage,
+  getItemStock,
+  createNewProductDraft,
+} = require("../controllers/supplierPortalController");
 
 const router = Router();
 
@@ -44,5 +51,7 @@ function handleUpload(req, res, next) {
 }
 
 router.post("/:token/items/:supplierProductId/image", resolveSupplierByToken, handleUpload, uploadItemImage);
+router.get("/:token/items/:supplierProductId/stock", resolveSupplierByToken, getItemStock);
+router.post("/:token/products", resolveSupplierByToken, handleUpload, createNewProductDraft);
 
 module.exports = router;
