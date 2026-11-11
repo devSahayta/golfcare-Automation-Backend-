@@ -10,6 +10,16 @@ const {
   ENROLMENT_QUESTIONS,
 } = require("./enrolmentQuestions");
 
+const { computeEnvelope } = require("../pricingEngine/computeEnvelope");
+const { loadPricingConfig } = require("../pricingEngine/pricingConfigLoader");
+const {
+  resolveVariantPricingInputs,
+} = require("../pricingEngine/resolveVariantPricingInputs");
+const {
+  createStandingMemberDiscountCode,
+  createCartDiscountCode,
+} = require("../shopifyDiscounts");
+
 const ENROLMENT_FIELD_KEYS = ENROLMENT_QUESTIONS.map((q) => q.fieldKey);
 
 // Module-level — must be reachable from enroll_membership, not scoped
@@ -29,6 +39,10 @@ function buildSalesAgentTools(context) {
       priceMax,
       limit = 5,
     }) {
+      console.log(
+        "[search_products] called with:",
+        JSON.stringify({ query, category, vendor, priceMin, priceMax, limit }),
+      );
       // No embedding pipeline has been decided/built yet (open item —
       // the spec calls for pgvector similarity search, but nobody's
       // picked an embedding provider). This falls back to a keyword
@@ -119,7 +133,7 @@ function buildSalesAgentTools(context) {
       // co-occurring generic word ("cap", "shoe") matches nearly the
       // whole category regardless of color. Declared up here (used by
       // the `words` filter below) even though the actual colorFilter
-      // condition is built further down, once lowerCombined exists.
+      // condition is built further down, once lowerCombined is available.
       const COLOR_WORDS = [
         "black",
         "white",
@@ -309,6 +323,15 @@ function buildSalesAgentTools(context) {
         ...genderConditions,
       ];
 
+      // Candidate pool size for the DB query — deliberately much bigger
+      // than the requested `limit`. The old code took `limit` rows
+      // directly from the DB with no ordering, so whichever rows Postgres
+      // returned first silently won even if a better match existed further
+      // down. Pulling a generous pool here and ranking/truncating in JS
+      // below (after scoreProduct) fixes that without touching the actual
+      // filter conditions at all.
+      const candidatePoolSize = 500;
+
       // Attribute filters, in priority order — LAST item is dropped
       // FIRST when a search returns zero results. This is the
       // generalized replacement for what used to be two separate,
@@ -336,7 +359,7 @@ function buildSalesAgentTools(context) {
       };
       let products = await prisma.product.findMany({
         where: usedWhere,
-        take: Math.min(limit, 15),
+        take: candidatePoolSize,
         include: { Variant: { take: 25 } },
       });
 
@@ -359,7 +382,7 @@ function buildSalesAgentTools(context) {
         };
         products = await prisma.product.findMany({
           where: usedWhere,
-          take: Math.min(limit, 15),
+          take: candidatePoolSize,
           include: { Variant: { take: 25 } },
         });
       }
@@ -387,7 +410,7 @@ function buildSalesAgentTools(context) {
         };
         products = await prisma.product.findMany({
           where: usedWhere,
-          take: Math.min(limit, 15),
+          take: candidatePoolSize,
           include: { Variant: { take: 25 } },
         });
       }
@@ -396,6 +419,38 @@ function buildSalesAgentTools(context) {
       // honestly offer "want to see more?" instead of guessing whether
       // more exist, or worse, implying these 5 are all there is.
       const totalCount = await prisma.product.count({ where: usedWhere });
+
+      // Rank the candidate pool by how well each one actually matches —
+      // title match weighted highest, then vendor/productType, then tags.
+      // This is the fix for the live bug: without this, "JPX 923 Hot Metal
+      // irons" returned "JPX 923 Forged" instead of the exact Hot Metal HL
+      // product, purely because nothing ranked candidates by relevance
+      // before truncating to the first few rows. Scored in JS rather than
+      // in SQL since there's no full-text search index set up yet — this
+      // is the same "no embedding pipeline yet" situation as the OR-based
+      // matching above, just extended to also rank, not only filter.
+      function scoreProduct(p) {
+        const title = (p.title || "").toLowerCase();
+        const vendorLower = (p.vendor || "").toLowerCase();
+        const typeLower = (p.productType || "").toLowerCase();
+        const tagsLower = (p.tags || []).map((t) => t.toLowerCase());
+        let score = 0;
+        for (const w of wordForms) {
+          const wl = w.toLowerCase();
+          if (title.includes(wl)) score += 3;
+          if (vendorLower.includes(wl)) score += 2;
+          if (typeLower.includes(wl)) score += 2;
+          if (tagsLower.some((t) => t.includes(wl))) score += 1;
+        }
+        // Small tie-break: prefer a tighter, more specific title over a
+        // longer one when the word-match score is otherwise equal.
+        score -= title.split(/\s+/).length * 0.01;
+        return score;
+      }
+
+      products = [...products]
+        .sort((a, b) => scoreProduct(b) - scoreProduct(a))
+        .slice(0, Math.min(limit, 15));
 
       // When a color was requested AND actually satisfied (not
       // relaxed), trim each product's variant list down to only the
@@ -492,6 +547,245 @@ function buildSalesAgentTools(context) {
       };
     },
 
+    // ========================================================================
+    // PRICING ENGINE — get_price_envelope
+    //
+    // Member Pricing Engine Phase 1 build spec §5. The agent calls this
+    // before quoting ANY price to a member — it's the only source of
+    // truth for member price / lowest allowed price / negotiation steps.
+    // Deliberately strips computeEnvelope's `_full` (costPrice,
+    // floorPrice, leversApplied, belowFloorAtList) before returning —
+    // the agent must never see cost, margin, or why a discount exists.
+    // ========================================================================
+    async get_price_envelope({ lines }) {
+      if (!customerId) {
+        // No pricing context without a known customer — mirrors
+        // get_customer_profile's own "not a customer yet" posture rather
+        // than inventing a fallback.
+        return { error: "no_customer_context" };
+      }
+      if (!lines?.length) return { error: "lines_required" };
+
+      // Fresh, not context.customer — same reasoning as
+      // get_customer_profile above: context is a turn-start snapshot and
+      // can be stale if something earlier in this turn already changed
+      // the customer (e.g. just enrolled). Pricing must never run on
+      // stale membership data.
+      const liveCustomer = await prisma.customer.findUnique({
+        where: { id: customerId },
+      });
+      if (!liveCustomer) return { error: "customer_not_found" };
+
+      const variantIds = lines.map((l) => l.variantId);
+      const [resolvedInputs, config, activeCampaigns] = await Promise.all([
+        resolveVariantPricingInputs(variantIds),
+        loadPricingConfig(),
+        prisma.discountCampaign.findMany({
+          where: {
+            isActive: true,
+            startsAt: { lte: new Date() },
+            endsAt: { gte: new Date() },
+          },
+        }),
+      ]);
+
+      // Full cart (all requested lines) — needed by the bundle lever and
+      // the high-ticket cart-value check inside computeEnvelope, so every
+      // line's envelope is computed against the WHOLE cart, not itself in
+      // isolation.
+      const cartLines = lines
+        .map((l) => {
+          const resolved = resolvedInputs[l.variantId];
+          if (resolved?.error) return null;
+          return {
+            variantId: l.variantId,
+            qty: l.qty || 1,
+            unitListPrice: Number(resolved.variant.listPrice),
+          };
+        })
+        .filter(Boolean);
+
+      const results = [];
+      for (const line of lines) {
+        const resolved = resolvedInputs[line.variantId];
+        if (resolved?.error) {
+          results.push({ variantId: line.variantId, error: resolved.error });
+          continue;
+        }
+        const envelope = computeEnvelope({
+          variant: resolved.variant,
+          product: resolved.product,
+          customer: {
+            isMember: liveCustomer.isMember,
+            tier: liveCustomer.tier,
+            ltvPercentile: liveCustomer.ltvPercentile,
+          },
+          cart: { lines: cartLines },
+          activeCampaigns,
+          now: new Date(),
+          config,
+        });
+        // _full (costPrice, floorPrice, leversApplied, etc.) is
+        // deliberately dropped here — this is the one enforcement point
+        // that guarantees the model never receives cost/floor/lever
+        // data, no matter what computeEnvelope returns internally. Do
+        // not spread `envelope` as-is.
+        const { _full, ...agentEnvelope } = envelope;
+        results.push(agentEnvelope);
+      }
+      return results;
+    },
+
+    // ========================================================================
+    // PRICING ENGINE — make_offer
+    //
+    // Required before quoting/confirming anything below member price.
+    // Recomputes the envelope server-side (never trusts a cached one),
+    // rejects anything below the real lowest allowed price or that skips
+    // ahead in the negotiation ladder, and records what was actually
+    // offered so create_checkout_link (Phase 4) can validate against it.
+    // ========================================================================
+    async make_offer({ variantId, price, step }) {
+      if (!customerId) return { error: "no_customer_context" };
+      if (price == null || step == null)
+        return { error: "price_and_step_required" };
+
+      const liveCustomer = await prisma.customer.findUnique({
+        where: { id: customerId },
+      });
+      if (!liveCustomer) return { error: "customer_not_found" };
+
+      const resolvedInputs = await resolveVariantPricingInputs([variantId]);
+      const resolved = resolvedInputs[variantId];
+      if (resolved?.error) return { error: resolved.error };
+
+      const config = await loadPricingConfig();
+
+      // Single-line envelope — make_offer's own params are one variant at
+      // a time (matches the build spec's tool signature exactly), so the
+      // bundle lever can't see the rest of the cart here. This means a
+      // make_offer call checks a slightly narrower room than the
+      // get_price_envelope call the agent saw moments earlier if the real
+      // cart has multiple items — in practice the allowed price from
+      // make_offer's recompute can only be EQUAL OR LOWER than what
+      // get_price_envelope showed (never higher), so this is
+      // conservative, not a hole: it can reject a price get_price_envelope
+      // implied was fine, never approve one it didn't. Revisit if that
+      // mismatch proves annoying in practice — passing the full cart into
+      // make_offer too is the fix, not a correctness bug as implemented.
+      const envelope = computeEnvelope({
+        variant: resolved.variant,
+        product: resolved.product,
+        customer: {
+          isMember: liveCustomer.isMember,
+          tier: liveCustomer.tier,
+          ltvPercentile: liveCustomer.ltvPercentile,
+        },
+        cart: {
+          lines: [
+            {
+              variantId,
+              qty: 1,
+              unitListPrice: Number(resolved.variant.listPrice),
+            },
+          ],
+        },
+        activeCampaigns: await prisma.discountCampaign.findMany({
+          where: {
+            isActive: true,
+            startsAt: { lte: new Date() },
+            endsAt: { gte: new Date() },
+          },
+        }),
+        now: new Date(),
+        config,
+      });
+
+      // step 9 = owner-approved via the escalation card (Phase 5) —
+      // bypasses the ladder-order check below since a human already
+      // signed off on a specific price. Every other step must still
+      // respect the floor.
+      if (step !== 9 && Number(price) < envelope.lowestAgentPrice) {
+        return {
+          error: "price_below_lowest_allowed",
+          lowestAgentPrice: envelope.lowestAgentPrice,
+        };
+      }
+
+      const now = new Date();
+      const existingActive = await prisma.offer.findFirst({
+        where: {
+          customerId,
+          variantId,
+          status: "active",
+          expiresAt: { gt: now },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+
+      // "Customer asks again within validity" — same price re-requested
+      // on a still-active offer returns that same offer rather than
+      // minting a new row / new discount code for an unchanged
+      // negotiation.
+      if (
+        existingActive &&
+        Number(existingActive.offeredPrice) === Number(price)
+      ) {
+        return {
+          offerId: existingActive.id,
+          price: Number(existingActive.offeredPrice),
+          step: existingActive.step,
+          expiresAt: existingActive.expiresAt,
+        };
+      }
+
+      // Step-order guard: can't jump straight to a deeper concession than
+      // the next one in line. "Next allowed" = one past whatever step was
+      // last offered for this customer+variant (0 if nothing offered
+      // yet). step 9 (owner-approved) always bypasses this.
+      if (step !== 9) {
+        const lastOffer = await prisma.offer.findFirst({
+          where: { customerId, variantId },
+          orderBy: { createdAt: "desc" },
+        });
+        const nextAllowedStep = lastOffer ? lastOffer.step + 1 : 0;
+        if (step > nextAllowedStep) {
+          return { error: "step_skips_ahead", nextAllowedStep };
+        }
+      }
+
+      if (existingActive) {
+        await prisma.offer.update({
+          where: { id: existingActive.id },
+          data: { status: "superseded" },
+        });
+      }
+
+      const offer = await prisma.offer.create({
+        data: {
+          conversationId: context.conversation.id,
+          customerId,
+          variantId,
+          listPrice: envelope.listPrice,
+          offeredPrice: price,
+          step,
+          leversApplied: envelope._full.leversApplied, // server-side only — never returned to the caller below
+          floorAtOffer: envelope._full.floorPrice,
+          status: "active",
+          expiresAt: new Date(
+            now.getTime() + config.offer.validityHours * 60 * 60 * 1000,
+          ),
+        },
+      });
+
+      return {
+        offerId: offer.id,
+        price: Number(offer.offeredPrice),
+        step: offer.step,
+        expiresAt: offer.expiresAt,
+      };
+    },
+
     async get_customer_profile() {
       if (!customerId) {
         return {
@@ -561,30 +855,194 @@ function buildSalesAgentTools(context) {
       };
     },
 
+    // ========================================================================
+    // Member Pricing Engine Phase 4. Previously built checkout links from
+    // raw list price with zero discount logic — deliberately left that
+    // way through Phase 3, since validating a negotiated Offer against a
+    // checkout link with no real Shopify discount behind it would've been
+    // a check with no teeth. Now actually prices each line correctly
+    // (member price, or a negotiated Offer's price if one is active) and,
+    // if any discount is owed, mints ONE fresh single-use Shopify
+    // discount code for the whole cart (see shopifyDiscounts.js) rather
+    // than trying to stack a per-line code — Shopify checkout only wants
+    // one code applied cleanly at a time. "Calculate variant-wise, apply
+    // cart-wise."
+    //
+    // A non-member, or a member whose items carry no discount at all
+    // (e.g. pricingLocked products), gets the exact same plain list-price
+    // link as before — no code minted, nothing to go wrong there.
+    //
+    // If Shopify's discount-code API call itself fails (network issue,
+    // scope problem, etc.), this deliberately falls BACK to a plain
+    // list-price link rather than failing the whole checkout — a
+    // customer being unable to check out at all is worse than one who
+    // has to be re-offered their discount a moment later. The failure is
+    // logged to AuditLog so it doesn't go unnoticed.
     async create_checkout_link({ variantIds, quantities }) {
       if (!variantIds?.length) return { error: "variantIds_required" };
-      const variants = await prisma.variant.findMany({
-        where: { id: { in: variantIds } },
-      });
-      if (variants.length !== variantIds.length)
-        return { error: "one_or_more_variants_not_found" };
 
-      const byId = Object.fromEntries(variants.map((v) => [v.id, v]));
-      const parts = variantIds.map(
-        (id, i) => `${byId[id].shopifyVariantId}:${quantities[i] || 1}`,
-      );
-      const totalInr = variantIds.reduce(
-        (sum, id, i) => sum + Number(byId[id].price) * (quantities[i] || 1),
+      const resolvedInputs = await resolveVariantPricingInputs(variantIds);
+      for (const id of variantIds) {
+        if (resolvedInputs[id]?.error) {
+          return { error: "one_or_more_variants_not_found" };
+        }
+      }
+
+      // Guest / no customer context yet — same as the old behaviour:
+      // plain list-price link, no discount logic applies at all.
+      const liveCustomer = customerId
+        ? await prisma.customer.findUnique({ where: { id: customerId } })
+        : null;
+
+      const lines = variantIds.map((id, i) => ({
+        variantId: id,
+        qty: quantities[i] || 1,
+        resolved: resolvedInputs[id],
+      }));
+
+      let config = null;
+      let activeCampaigns = [];
+      if (liveCustomer?.isMember) {
+        [config, activeCampaigns] = await Promise.all([
+          loadPricingConfig(),
+          prisma.discountCampaign.findMany({
+            where: {
+              isActive: true,
+              startsAt: { lte: new Date() },
+              endsAt: { gte: new Date() },
+            },
+          }),
+        ]);
+      }
+
+      const cartLines = lines.map((l) => ({
+        variantId: l.variantId,
+        qty: l.qty,
+        unitListPrice: Number(l.resolved.variant.listPrice),
+      }));
+
+      let totalListInr = 0;
+      let totalFinalInr = 0;
+      const priced = [];
+
+      for (const line of lines) {
+        const listPrice = Number(line.resolved.variant.listPrice);
+        let finalPrice = listPrice;
+
+        if (liveCustomer?.isMember) {
+          // An active, unexpired negotiated Offer for this exact
+          // customer+variant wins over the plain member price — this is
+          // what makes a checkout link honour whatever was actually
+          // agreed in the conversation.
+          const activeOffer = await prisma.offer.findFirst({
+            where: {
+              customerId,
+              variantId: line.variantId,
+              status: "active",
+              expiresAt: { gt: new Date() },
+            },
+            orderBy: { createdAt: "desc" },
+          });
+          if (activeOffer) {
+            finalPrice = Number(activeOffer.offeredPrice);
+          } else {
+            const envelope = computeEnvelope({
+              variant: line.resolved.variant,
+              product: line.resolved.product,
+              customer: {
+                isMember: liveCustomer.isMember,
+                tier: liveCustomer.tier,
+                ltvPercentile: liveCustomer.ltvPercentile,
+              },
+              cart: { lines: cartLines },
+              activeCampaigns,
+              now: new Date(),
+              config,
+            });
+            // Deliberately memberPrice, not lowestAgentPrice — a
+            // checkout created with no negotiation on record should
+            // only ever get the plain member price, never the deepest
+            // price the agent could theoretically have gone to.
+            finalPrice = envelope.memberPrice;
+          }
+        }
+
+        totalListInr += listPrice * line.qty;
+        totalFinalInr += finalPrice * line.qty;
+        priced.push({
+          shopifyVariantId: line.resolved.variant.shopifyVariantId,
+          qty: line.qty,
+        });
+      }
+
+      const parts = priced.map((p) => `${p.shopifyVariantId}:${p.qty}`);
+      // Floating-point line-by-line sums can leave a stray paisa of
+      // "negative" discount (e.g. 0.00000000002) — clamp so that never
+      // mints a code for a nonexistent discount.
+      const totalDiscount = Math.max(
         0,
+        Math.round(totalListInr - totalFinalInr),
       );
 
-      return {
-        checkoutUrl: `https://${env.shopify.shopDomain}/cart/${parts.join(",")}`,
-        totalInr,
-      };
+      if (totalDiscount <= 0) {
+        return {
+          checkoutUrl: `https://${env.shopify.shopDomain}/cart/${parts.join(",")}`,
+          totalInr: totalListInr,
+        };
+      }
+
+      // Short, readable, unique-enough code — human-readable in Shopify's
+      // own order/discount records for later debugging, not meant to be
+      // guessable or memorable to the customer (unlike the standing
+      // memberCode, this is single-use and expires in hours).
+      const code =
+        "CO" +
+        Math.random().toString(36).slice(2, 7).toUpperCase() +
+        Date.now().toString(36).slice(-3).toUpperCase();
+      // 48h is a first pass, not pulled from PricingConfig yet — revisit
+      // if a shorter/longer window turns out to matter in practice.
+      const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+
+      try {
+        await createCartDiscountCode({
+          code,
+          amountOff: totalDiscount,
+          expiresAt,
+        });
+        return {
+          checkoutUrl: `https://${env.shopify.shopDomain}/discount/${code}?redirect=/cart/${parts.join(",")}`,
+          totalInr: totalFinalInr,
+          savingsInr: totalDiscount,
+        };
+      } catch (err) {
+        // Fail open to a working (if undiscounted) checkout link rather
+        // than blocking the purchase entirely — but this must not go
+        // unnoticed, since it means a member is about to pay more than
+        // they were quoted.
+        await prisma.auditLog.create({
+          data: {
+            actorType: "SYSTEM",
+            action: "checkout_discount_code_failed",
+            entityType: "Conversation",
+            entityId: context.conversation.id,
+            afterState: {
+              customerId,
+              variantIds,
+              totalDiscount,
+              error: err?.response?.data || err?.message || String(err),
+            },
+            source: "sales_agent",
+          },
+        });
+        return {
+          checkoutUrl: `https://${env.shopify.shopDomain}/cart/${parts.join(",")}`,
+          totalInr: totalListInr,
+          discountFailed: true,
+        };
+      }
     },
 
-    async escalate_to_human({ reason, urgency }) {
+    async escalate_to_human({ reason, urgency, offerContext }) {
       // Deliberately does NOT change conversation.state anymore. This
       // used to flip to AWAITING_HUMAN, which froze the AI out of the
       // conversation until either a manual reset or the next customer
@@ -595,13 +1053,18 @@ function buildSalesAgentTools(context) {
       // purely a notification: staff still see it in AuditLog for
       // follow-up, but the AI keeps handling the conversation live,
       // continuously, no matter how many times this fires.
+      //
+      // offerContext (Member Pricing Engine Phase 3) — when this fires
+      // mid-negotiation, carries {variantId, currentOfferId} so the
+      // escalation card (Phase 5 console) can show the human tier, LTV,
+      // current offer and floor without re-asking the customer anything.
       await prisma.auditLog.create({
         data: {
           actorType: "AGENT",
           action: "escalated_to_human",
           entityType: "Conversation",
           entityId: context.conversation.id,
-          afterState: { reason, urgency },
+          afterState: { reason, urgency, offerContext: offerContext || null },
           source: "sales_agent",
         },
       });
@@ -693,6 +1156,38 @@ function buildSalesAgentTools(context) {
           onboardingStartedAt: new Date(),
         },
       });
+
+      // Member Pricing Engine Phase 4 — register memberCode as a real,
+      // standing Shopify discount code (10% off, store-wide, unlimited
+      // use, no customer restriction — see shopifyDiscounts.js) so this
+      // customer can use it themselves if they buy directly on the
+      // website without the agent involved at all. Deliberately does
+      // NOT block or fail enrollment if this call fails (Shopify being
+      // briefly unreachable shouldn't stop someone from joining) — just
+      // logged, so it doesn't silently go unnoticed. Runs exactly once,
+      // right here in the genuinely-new-enrollment path, never on the
+      // idempotency-guard branch above, so a customer never ends up with
+      // two Shopify price rules for the same memberCode.
+      try {
+        await createStandingMemberDiscountCode({
+          memberCode,
+          percentOff: (await loadPricingConfig()).member.basePct,
+        });
+      } catch (err) {
+        await prisma.auditLog.create({
+          data: {
+            actorType: "SYSTEM",
+            action: "standing_member_discount_code_failed",
+            entityType: "Customer",
+            entityId: customerId,
+            afterState: {
+              memberCode,
+              error: err?.response?.data || err?.message || String(err),
+            },
+            source: "sales_agent",
+          },
+        });
+      }
 
       // Self-contained next-step instruction — do NOT rely on the model
       // remembering the STEP 3 prompt guidance from several messages

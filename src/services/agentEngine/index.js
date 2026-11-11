@@ -68,6 +68,24 @@ function summarizeKnownIdsForHistory(toolCalls) {
   return `\n\n[internal reference only, never shown to the customer — real IDs from this message's tool results, use these exact strings if the customer later refers back to one of these items: ${lines.join(" | ")}]`;
 }
 
+// Defensive strip — the model has been observed mimicking the
+// "[internal reference only...]" annotation format that
+// summarizeKnownIdsForHistory() injects into ITS OWN past turns in
+// conversation history, reproducing a lookalike block (with real
+// productId/variantId values) directly in its live draft reply text.
+// The system-prompt instruction warning against this didn't reliably
+// stop it, and since this is a real customer-facing leak risk if a
+// draft ever slipped past guardrails, strip any such trailing block
+// deterministically before the guardrail check — rather than relying
+// on the model to comply. Only ever touches the live draftText being
+// checked/sent THIS turn — summarizeKnownIdsForHistory's own injection
+// into conversation HISTORY content is untouched, so the "pick the 2nd
+// one" fix that depends on it keeps working exactly as before.
+function stripInternalReferenceNote(text) {
+  if (!text) return text;
+  return text.replace(/\n{0,2}\[internal reference only[\s\S]*$/i, "").trim();
+}
+
 // Kept exactly as before — still the fallback rate for any model not
 // found in MODEL_RATES below (e.g. if env.anthropicModel is set to
 // something not equal to either Sonnet or Haiku's configured string).
@@ -333,6 +351,7 @@ async function runAgent({ conversationId, config, sendFn }) {
       undefined,
       initialModel,
     );
+    finalText = stripInternalReferenceNote(finalText);
     let totalUsage = usage;
     let totalCost = estimateCostForModel(usage, initialModel);
     let lastModelUsed = initialModel;
@@ -376,6 +395,7 @@ async function runAgent({ conversationId, config, sendFn }) {
       });
       const repair = await attempt(repairNote, repairModel);
       finalText = repair.finalText;
+      finalText = stripInternalReferenceNote(finalText);
       toolCallLog = repair.toolCallLog;
       hitIterationCap = repair.hitIterationCap;
       totalUsage = addUsage(totalUsage, repair.usage);
@@ -469,6 +489,7 @@ async function runAgent({ conversationId, config, sendFn }) {
       });
       const retry = await attempt(retryNote, retryModel);
       finalText = retry.finalText;
+      finalText = stripInternalReferenceNote(finalText);
       toolCallLog = retry.toolCallLog;
       // A retry is a real, separately-billed Anthropic call — add its
       // usage to the running total rather than replacing it, so the

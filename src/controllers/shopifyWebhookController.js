@@ -26,6 +26,12 @@ const { prisma } = require("../lib/prisma");
 const {
   maybeSendMembershipInvite,
 } = require("../services/membershipInviteService");
+const {
+  computeFloorPrice,
+} = require("../services/pricingEngine/computeEnvelope");
+const {
+  loadPricingConfig,
+} = require("../services/pricingEngine/pricingConfigLoader");
 
 function computePriceRange(variants) {
   const prices = (variants || [])
@@ -360,6 +366,118 @@ async function resolveOrCreateCustomerFromShopify({
   }
 }
 
+/* ─── Member Pricing Engine Phase 4 — order margin safety net ──────────── */
+//
+// Runs once per genuinely new order (see handleOrderUpsert's
+// `saved.__isNewOrder` gate below — guaranteed to fire for exactly one
+// invocation per order, same lock-backed guarantee the membership-invite
+// dispatch already relies on). Never blocks anything — the order is
+// already placed and paid by the time this webhook fires — it only
+// recomputes the real floor for each line item from our own cost data
+// and flags (via AuditLog) anything that landed below it: a stacked
+// discount, a reused/leaked code, a bug, anything. Tejas sees it, the
+// customer's order is untouched.
+//
+// Deliberately NOT inside the $transaction/advisory-lock block above —
+// this is read-only plus one AuditLog write, nothing that needs to be
+// atomic with the order upsert itself, so it runs after commit, same
+// reasoning as why maybeSendMembershipInvite runs after commit too.
+async function runOrderMarginCheck(order) {
+  try {
+    const lineItems = order.lineItems || [];
+    const shopifyVariantIds = lineItems
+      .map((li) => (li.variant_id != null ? String(li.variant_id) : null))
+      .filter(Boolean);
+    if (!shopifyVariantIds.length) return;
+
+    const [variants, primarySupplierProducts] = await Promise.all([
+      prisma.variant.findMany({
+        where: { shopifyVariantId: { in: shopifyVariantIds } },
+      }),
+      prisma.supplierProduct.findMany({
+        where: { isPrimary: true },
+      }),
+    ]);
+    const variantByShopifyId = new Map(
+      variants.map((v) => [v.shopifyVariantId, v]),
+    );
+    const costByVariantId = new Map(
+      primarySupplierProducts
+        .filter((sp) => sp.variantId)
+        .map((sp) => [sp.variantId, sp.costPrice]),
+    );
+
+    const config = await loadPricingConfig();
+    const violations = [];
+
+    for (const li of lineItems) {
+      const variant = variantByShopifyId.get(String(li.variant_id));
+      if (!variant) continue; // not a product we track pricing for (or a draft/custom line item)
+      const costPrice = costByVariantId.get(variant.id);
+      if (costPrice == null) continue; // no cost on file — nothing to check against
+
+      const listPrice = Number(li.price);
+      const qty = Number(li.quantity) || 1;
+      if (!(listPrice > 0)) continue;
+
+      // Shopify line items carry their OWN price (pre-discount) plus
+      // whatever discount actually landed on that line —
+      // discount_allocations is the real, authoritative amount actually
+      // taken off, regardless of which discount code(s) produced it.
+      const discountTotal = (li.discount_allocations || []).reduce(
+        (sum, d) => sum + Number(d.amount || 0),
+        0,
+      );
+      const actualUnitPrice = listPrice - discountTotal / qty;
+
+      const floor = computeFloorPrice({
+        costPrice: Number(costPrice),
+        listPrice,
+        config,
+      });
+
+      // Small epsilon — this is a safety-net alert, not a blocking
+      // check, so a fraction-of-a-rupee rounding difference between
+      // Shopify's own discount math and ours shouldn't fire a false
+      // alarm for Tejas to chase.
+      if (actualUnitPrice < floor - 0.5) {
+        violations.push({
+          variantId: variant.id,
+          shopifyVariantId: variant.shopifyVariantId,
+          title: li.title || variant.title,
+          listPrice,
+          actualUnitPrice: Math.round(actualUnitPrice * 100) / 100,
+          floor,
+        });
+      }
+    }
+
+    if (violations.length) {
+      await prisma.auditLog.create({
+        data: {
+          actorType: "SYSTEM",
+          action: "order_below_floor_price",
+          entityType: "Order",
+          entityId: order.id,
+          afterState: {
+            orderNumber: order.orderNumber,
+            discountCodes: order.discountCodes || [],
+            violations,
+          },
+          source: "shopify_webhook",
+        },
+      });
+      console.error(
+        `[shopify webhook] order ${order.orderNumber} has ${violations.length} line item(s) priced below floor — see AuditLog (order_below_floor_price).`,
+      );
+    }
+  } catch (err) {
+    // Never let the margin check itself break webhook processing —
+    // this is a safety net, not a required step.
+    console.error("runOrderMarginCheck error:", err);
+  }
+}
+
 /* ─── orders/create, orders/updated ─────────────────────────────────────── */
 
 // All DB work is awaited BEFORE res.send() (serverless constraint).
@@ -452,6 +570,13 @@ async function handleOrderUpsert(req, res) {
       });
 
       if (!existing) {
+        // Member Pricing Engine Phase 4 — margin check runs once per
+        // genuinely new order, same gate as the membership-invite dispatch
+        // below. Stashed here (unconditional on customerId, unlike the
+        // invite) and actually run AFTER the transaction commits — see
+        // runOrderMarginCheck's own comment for why.
+        saved.__isNewOrder = true;
+
         await tx.auditLog.create({
           data: {
             actorType: "SYSTEM",
@@ -545,6 +670,19 @@ async function handleOrderUpsert(req, res) {
     });
 
     // Fires only for the invocation that actually won the lock race and
+    // found a genuinely new order (see __isNewOrder above) — outside the
+    // transaction since this does its own DB reads plus an AuditLog write
+    // and shouldn't hold the advisory lock open while it runs. Uses
+    // `order.line_items` (the raw webhook payload) rather than
+    // `saved.lineItems` purely for clarity; they're the same data.
+    if (saved.__isNewOrder) {
+      await runOrderMarginCheck({
+        ...saved,
+        lineItems: order.line_items || [],
+      });
+    }
+
+    // Fires only for the invocation that actually won the lock race and
     // found a genuinely new order with a resolved Customer (see
     // __updatedCustomerForInvite above) — outside the transaction since
     // sendTemplate is a real network call and shouldn't hold the DB
@@ -624,4 +762,11 @@ module.exports = {
   handleInventoryLevelUpdate,
   handleOrderUpsert,
   handleCustomerUpsert,
+  // Exported in addition to the 5 route handlers above purely so the
+  // margin-check logic can be unit-tested directly (see
+  // scripts/testOrderMarginCheck.js) without needing to fabricate a full
+  // HMAC-signed webhook request. routes/shopifyWebhookRoutes.js only
+  // destructures the 5 handler names it actually wires up, so this
+  // doesn't change anything about how the routes work.
+  runOrderMarginCheck,
 };

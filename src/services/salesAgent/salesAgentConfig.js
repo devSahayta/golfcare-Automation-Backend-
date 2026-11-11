@@ -55,6 +55,75 @@ const tools = [
       required: ["variantId"],
     },
   },
+
+  {
+    name: "get_price_envelope",
+    description:
+      "Get the member price, lowest price you're allowed to offer, and suggested negotiation steps for one or more cart lines. ALWAYS call this before quoting ANY price to a member who might negotiate — never state a discounted price from memory or by estimating a percentage yourself. Only state the ₹ amounts this tool returns; never say or compute a discount percentage out loud.",
+    input_schema: {
+      type: "object",
+      properties: {
+        lines: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              variantId: { type: "string" },
+              qty: { type: "number" },
+            },
+            required: ["variantId"],
+          },
+        },
+      },
+      required: ["lines"],
+    },
+  },
+  {
+    name: "make_offer",
+    description:
+      "Record a price you are offering the customer for one variant. REQUIRED before quoting or confirming any price below that variant's member price — do this the moment you decide to offer a concession, not after the customer accepts. Rejects and returns the real lowest valid price if you try to go below it, or if you try to skip ahead in the negotiation steps. Once the customer has agreed to a specific price and you call this again later in the same negotiation (e.g. right before create_checkout_link), pass the EXACT SAME price and step you already recorded for them — never a new, lower price, even if you recall a deeper lowestAgentPrice or suggestedStep from an earlier get_price_envelope call. Re-submitting the same price is a safe no-op (it returns the existing offer); submitting a different, deeper price silently changes what the customer is charged below what they actually agreed to, which is never correct at this stage. Only offer a price the customer hasn't already accepted when they are still actively negotiating, not when they've said yes and are moving to checkout.",
+    input_schema: {
+      type: "object",
+      properties: {
+        variantId: { type: "string" },
+        price: { type: "number" },
+        step: {
+          type: "number",
+          description:
+            "0 = member price, 1-3 = concession steps in order, 9 = owner-approved (only after escalate_to_human was approved)",
+        },
+      },
+      required: ["variantId", "price", "step"],
+    },
+  },
+
+  // ============================================================================
+  // escalate_to_human — UPDATE the existing entry's input_schema to add
+  // offerContext (keep reason/urgency exactly as they are):
+  // ============================================================================
+
+  {
+    name: "escalate_to_human",
+    description:
+      "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
+    input_schema: {
+      type: "object",
+      properties: {
+        reason: { type: "string" },
+        urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
+        offerContext: {
+          type: "object",
+          description:
+            "Pass this when escalating a pricing conversation — gives the human the current state so they don't have to re-ask the customer.",
+          properties: {
+            variantId: { type: "string" },
+            currentOfferId: { type: "string" },
+          },
+        },
+      },
+      required: ["reason", "urgency"],
+    },
+  },
   {
     name: "get_customer_profile",
     description:
@@ -73,19 +142,19 @@ const tools = [
       required: ["variantIds", "quantities"],
     },
   },
-  {
-    name: "escalate_to_human",
-    description:
-      "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
-    input_schema: {
-      type: "object",
-      properties: {
-        reason: { type: "string" },
-        urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
-      },
-      required: ["reason", "urgency"],
-    },
-  },
+  // {
+  //   name: "escalate_to_human",
+  //   description:
+  //     "Hand this conversation to a human. Use when unsure, for high-value orders, or anything you shouldn't decide alone.",
+  //   input_schema: {
+  //     type: "object",
+  //     properties: {
+  //       reason: { type: "string" },
+  //       urgency: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"] },
+  //     },
+  //     required: ["reason", "urgency"],
+  //   },
+  // },
   {
     name: "enroll_membership",
     description:
@@ -338,6 +407,23 @@ Rules:
   never approximate one.
 - Never state a price or stock status unless you called a tool this turn that confirms it.
 - You have no discount authority — never offer one.
+- Negotiation is reactive, never proactive. When you give a member price or a concession, state
+  that ONE price plainly and stop — do not add anything that hints more room might exist ("...or
+  should I escalate to see if there's any more room?", "if that's still a stretch, let me know",
+  "I could also check with the team"). Every customer will take a free offer to negotiate further
+  if you hand it to them; that offer has to come from them, not you. get_price_envelope's
+  suggestedSteps and canEscalateForMore, and whether you're on step 1 vs step 2 vs step 3, are
+  information for deciding what to do NEXT — never material to put in front of the customer or to
+  tell them exists. Only move to the next step (call make_offer again with the next step down) or
+  call escalate_to_human for more room if the customer explicitly pushes back again on their own
+  ("can you do any better than that?", "that's still too much", "any other discount?") after
+  seeing the current price. If they accept the current price instead, proceed to checkout — see
+  the checkout-acceptance rule below.
+  WRONG: "I can bring it down to ₹78,700 for you. Does that work, or should I escalate to see if
+  there's any more room?"
+  RIGHT: "I can bring it down to ₹78,700 for you."
+  The message ends there, full stop, as if that is the best price — never with a question that
+  invites the customer to ask for more. This applies to every concession, not just the first one.
 - Before calling check_availability or create_checkout_link on a specific product/variant, make
   sure the customer has actually, explicitly chosen THAT item — not just answered a different
   sub-question you asked alongside it. If you asked two things in one message (e.g. "are you
@@ -386,6 +472,14 @@ Rules:
   asks you to resend the link, or asks a genuinely new question you need to look something up
   for. A bare acknowledgment after a checkout link just needs a short reply ("Sounds good — let
   me know once you've completed it!") or no reply at all if nothing else is being asked.
+- When a customer accepts a negotiated price and asks you to send the checkout link ("yeah that
+  works", "ok send it", "let's do it"), that is an acceptance of the price you already offered —
+  it is NOT a new negotiating turn and NOT a request for a deeper discount. Go straight to
+  create_checkout_link for that price. Do not call make_offer again here unless you genuinely
+  need to (e.g. the prior offer may have expired); if you do, it MUST carry the exact same price
+  and step as the offer the customer just accepted, per the make_offer tool description above.
+  State the same ₹ figure in your reply that create_checkout_link's output actually confirms for
+  that line — never a figure you recall from earlier in the conversation.
 - This is a WhatsApp message, not a document. Use WhatsApp's own formatting only: *bold*
   (single asterisk), _italic_ (single underscore), ~strikethrough~. Never use **double
   asterisks**, markdown headers (#), horizontal rules (---), or tables — none of that
