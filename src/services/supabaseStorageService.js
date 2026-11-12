@@ -214,4 +214,44 @@ async function uploadSupplierImage(buffer, productId, mimeType) {
   return data.publicUrl;
 }
 
-module.exports = { uploadGeneratedImage, uploadReferenceImage, uploadSupplierImage };
+/**
+ * uploadNewProductImage
+ *
+ * Stages a supplier-submitted photo for a brand-new product (check-in
+ * portal's "add a new product" form — see supplierPortalController.js's
+ * createNewProductDraft). Same staging posture as uploadSupplierImage —
+ * never written to Shopify from here — but keyed by supplierId instead of
+ * productId, since no Product row exists yet at this point (the Shopify
+ * draft product is what createDraftProduct creates right after this).
+ *
+ * @param {Buffer} buffer     - raw image bytes
+ * @param {string} supplierId - used to build a traceable object path
+ * @param {string} mimeType   - "image/jpeg" | "image/png" | "image/webp"
+ * @returns {Promise<string>} public HTTPS URL
+ */
+async function uploadNewProductImage(buffer, supplierId, mimeType) {
+  await ensureBucket();
+  const supabase = getClient();
+
+  const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
+  const path = `supplier-new-product-submissions/${supplierId}-${Date.now()}.${ext}`;
+
+  const { error: uploadErr } = await supabase.storage
+    .from(env.supabaseStorageBucket)
+    .upload(path, buffer, { contentType: mimeType, upsert: false });
+
+  if (uploadErr) {
+    throw new Error(`Supabase Storage new-product-image upload failed: ${uploadErr.message}`);
+  }
+
+  const { data } = supabase.storage.from(env.supabaseStorageBucket).getPublicUrl(path);
+
+  if (!data?.publicUrl) {
+    throw new Error("Supabase Storage new-product-image upload succeeded but no public URL was returned.");
+  }
+
+  console.log(`[supabaseStorageService] Staged new-product image for supplier ${supplierId} -> ${data.publicUrl}`);
+  return data.publicUrl;
+}
+
+module.exports = { uploadGeneratedImage, uploadReferenceImage, uploadSupplierImage, uploadNewProductImage };

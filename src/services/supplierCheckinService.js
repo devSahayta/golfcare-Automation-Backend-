@@ -46,6 +46,7 @@ async function applyConfirmation({
   mrp,
   marginPercent,
   gstPercent,
+  quantity,
 }) {
   await prisma.supplierProduct.update({
     where: { id: supplierProduct.id },
@@ -64,6 +65,11 @@ async function applyConfirmation({
       source: "SUPPLIER_CONFIRMED",
       changedBy: supplier.id,
       leadTimeDays: leadTimeDays ?? null,
+      // Only the check-in portal's per-item confirm ever passes this
+      // (see supplierPortalController.js's confirmItem) — every other
+      // caller (chat tools, bulk confirm) leaves it undefined and gets
+      // the existing default-quantity behavior, unchanged.
+      quantityOverride: quantity ?? undefined,
     });
     appliedToAvailability = true;
   }

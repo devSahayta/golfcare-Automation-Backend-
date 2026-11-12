@@ -65,11 +65,16 @@ async function getPrimaryLocationId() {
   return cachedLocationId;
 }
 
-function mapStatusToQuantity(status) {
+// `override` is the supplier's own typed-in count from the check-in
+// portal's per-item confirm (see supplierCheckinService.js's applyConfirmation)
+// — only ever honored for IN_STOCK/ON_ORDER. OUT_OF_STOCK always means 0
+// regardless of what was shown/typed; there's no such thing as a positive
+// "out of stock" quantity.
+function mapStatusToQuantity(status, override) {
   switch (status) {
     case "IN_STOCK":
     case "ON_ORDER":
-      return env.shopify.defaultAvailableQty;
+      return Number.isFinite(override) && override >= 0 ? override : env.shopify.defaultAvailableQty;
     case "OUT_OF_STOCK":
     case "DISCONTINUED":
     case "UNKNOWN":
@@ -103,18 +108,42 @@ async function setInventoryLevel(inventoryItemId, locationId, available) {
   });
 }
 
+// Read-side counterpart to setInventoryLevel — lets the check-in portal
+// show a supplier the real current Shopify stock number before they
+// confirm, instead of asking them to type one blind (see
+// supplierPortalController.js's getItemStock). Best-effort by design: the
+// caller treats any failure as "unknown," never as a reason to block
+// confirming.
+async function getInventoryLevel(shopifyVariantId) {
+  const [inventoryItemId, locationId] = await Promise.all([
+    getInventoryItemId(shopifyVariantId),
+    getPrimaryLocationId(),
+  ]);
+  const client = await shopifyClient();
+  const [levelsRes, itemRes] = await Promise.all([
+    client.get(`/inventory_levels.json?inventory_item_ids=${inventoryItemId}&location_ids=${locationId}`),
+    client.get(`/inventory_items/${inventoryItemId}.json`),
+  ]);
+  const level = (levelsRes.data?.inventory_levels || [])[0];
+  return {
+    available: level?.available ?? null,
+    tracked: Boolean(itemRes.data?.inventory_item?.tracked),
+  };
+}
+
 /**
  * Best-effort — never throws. AvailabilityService's own DB commit must not
  * be blocked or rolled back by a Shopify/network blip.
  *
  * @param {{shopifyVariantId: string}} variant
  * @param {string} status - an AvailStatus value
+ * @param {number} [quantityOverride] - supplier-typed real stock count (check-in portal only) — see mapStatusToQuantity
  * @returns {Promise<{ok: true} | {ok: false, error: string}>}
  */
 async function writeAvailabilityToShopify(
   { shopifyVariantId },
   status,
-  { attempts = 2, retryDelayMs = 500 } = {},
+  { attempts = 2, retryDelayMs = 500, quantityOverride } = {},
 ) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -127,7 +156,7 @@ async function writeAvailabilityToShopify(
       await setInventoryLevel(
         inventoryItemId,
         locationId,
-        mapStatusToQuantity(status),
+        mapStatusToQuantity(status, quantityOverride),
       );
       return { ok: true };
     } catch (err) {
@@ -200,4 +229,4 @@ async function updateVariantPrice(shopifyVariantId, price, { attempts = 2, retry
   };
 }
 
-module.exports = { writeAvailabilityToShopify, updateVariantPrice, updateInventoryItemCost };
+module.exports = { writeAvailabilityToShopify, updateVariantPrice, updateInventoryItemCost, getInventoryLevel };
