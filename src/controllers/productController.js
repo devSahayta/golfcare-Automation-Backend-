@@ -14,11 +14,16 @@ async function listProducts(req, res) {
     const where = {};
 
     if (search) {
-      where.OR = [
-        { title: { contains: search, mode: "insensitive" } },
-        { vendor: { contains: search, mode: "insensitive" } },
-        { productType: { contains: search, mode: "insensitive" } },
-      ];
+      const words = search.trim().split(/\s+/).filter(Boolean);
+      if (words.length) {
+        where.AND = words.map((w) => ({
+          OR: [
+            { title: { contains: w, mode: "insensitive" } },
+            { vendor: { contains: w, mode: "insensitive" } },
+            { productType: { contains: w, mode: "insensitive" } },
+          ],
+        }));
+      }
     }
     if (status) where.status = status;
     if (tierLevel) where.tierLevel = tierLevel;
