@@ -44,6 +44,22 @@ const DEFAULTS = [
   },
   { key: "lever.ltv", value: { topPercentile: 10, pct: 2 } },
   { key: "lever.bundle", value: { minItems: 2, minOrderValue: 10000, pct: 2 } },
+  // Flat-threshold overstock/aged-stock, added after Phase 5 — distinct
+  // from lever.overstock/lever.aged.tiers above (the original
+  // sales-velocity design, left in place but still unread by the
+  // engine). These read real supplier-typed data instead: quantityOnHand
+  // (check-in portal) and receivedAt (set the moment a variant
+  // transitions into confirmed IN_STOCK) — see computeEnvelope.js.
+  { key: "lever.overstockQty", value: { minQuantity: 15, pct: 3 } },
+  {
+    key: "lever.agedStock",
+    value: {
+      tiers: [
+        { days: 60, pct: 3 },
+        { days: 120, pct: 5 },
+      ],
+    },
+  },
   { key: "ladder.steps", value: [0.4, 0.75, 1.0] },
   { key: "ladder.thinRoom", value: { minRupees: 200, minPct: 2 } },
   { key: "agent.maxOrderForLevers", value: 40000 },

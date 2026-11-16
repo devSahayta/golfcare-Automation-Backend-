@@ -7,10 +7,16 @@
 // should never crash pricing or silently zero out a discount; it should
 // just behave as if nobody had touched that setting.
 //
-// NOTE: no lever.aged / lever.overstock / lever.scarce.maxQty here —
-// Golf Care is pure dropship (see computeEnvelope.js's header comment),
-// so those rows exist in the table (kept intentionally, not deleted —
-// Tejas's call) but are never read by the engine or this loader.
+// NOTE: lever.aged.tiers / lever.overstock / lever.scarce.maxQty are the
+// ORIGINAL spec's rows — a sales-velocity-based version of overstock and
+// aged-stock that needs per-variant sales history that doesn't exist yet
+// (see computeEnvelope.js's header comment). Those rows exist in the
+// table (kept intentionally, not deleted — Tejas's call) but are still
+// never read by the engine or this loader. lever.overstockQty and
+// lever.agedStock below are a separate, simpler, flat-threshold pair
+// built on real supplier-typed data (quantityOnHand / receivedAt) —
+// distinct keys, so they can't be confused with or clobber the original
+// rows above.
 //
 // Phase 5 addition: assembleConfig(flat) is pulled out of loadPricingConfig
 // below (same "one place this logic lives" move as computeFloorPrice was
@@ -36,6 +42,13 @@ const DEFAULTS = {
   "lever.tier": { STANDARD: 0, SILVER: 2, GOLD: 3, PLATINUM: 5 },
   "lever.ltv": { topPercentile: 10, pct: 2 },
   "lever.bundle": { minItems: 2, minOrderValue: 10000, pct: 2 },
+  "lever.overstockQty": { minQuantity: 15, pct: 3 },
+  "lever.agedStock": {
+    tiers: [
+      { days: 60, pct: 3 },
+      { days: 120, pct: 5 },
+    ],
+  },
   "ladder.steps": [0.4, 0.75, 1.0],
   "ladder.thinRoom": { minRupees: 200, minPct: 2 },
   "agent.maxOrderForLevers": 40000,
@@ -72,6 +85,8 @@ function assembleConfig(flat) {
       tier: flat["lever.tier"],
       ltv: flat["lever.ltv"],
       bundle: flat["lever.bundle"],
+      overstockQty: flat["lever.overstockQty"],
+      agedStock: flat["lever.agedStock"],
     },
     ladder: { steps: flat["ladder.steps"], thinRoom: flat["ladder.thinRoom"] },
     agent: { maxOrderForLevers: flat["agent.maxOrderForLevers"] },

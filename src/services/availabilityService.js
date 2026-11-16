@@ -43,6 +43,7 @@ function invalidateProductCache(_variantId) {
  * @param {number} [input.ttlHours] - overrides the default TTL (env AVAILABILITY_TTL_HOURS) for this write
  * @param {boolean} [input.skipShopifySync] - skip the Shopify write-back for this call (DB stays the source of truth either way). Used by bulk callers confirming hundreds/thousands of variants in one request — each Shopify write is itself 2-3 Admin API calls (see shopifyInventory.js), so doing it inline for every item risks the request timing out and hammering Shopify's rate limit; see supplierAgentTools.js's confirm_all_pending_items for the bounded-inline-count pattern this enables.
  * @param {number} [input.quantityOverride] - a real stock count to use instead of the default IN_STOCK quantity (see shopifyInventory.js's mapStatusToQuantity) — only ever passed by the check-in portal's per-item confirm; every other caller omits it and gets today's default behavior unchanged.
+ * @param {number} [input.quantityOnHand] - the supplier's own typed-in stock count (check-in portal per-item confirm only — same source as quantityOverride above, just persisted here too instead of only forwarded to Shopify). Powers the "overstock" pricing lever. Only ever meaningful while status is IN_STOCK: stored as-is when given, left untouched when omitted (a routine re-confirmation with no new count typed shouldn't wipe out the last real one), and always cleared back to null the moment status becomes anything else — a stale count must never be read as still accurate once the item isn't confirmed in stock anymore.
  */
 async function setAvailability({
   variantId,
@@ -55,6 +56,7 @@ async function setAvailability({
   ttlHours,
   skipShopifySync = false,
   quantityOverride,
+  quantityOnHand,
 }) {
   if (!variantId) throw new Error("setAvailability: variantId is required");
   if (!status) throw new Error("setAvailability: status is required");
@@ -81,6 +83,29 @@ async function setAvailability({
         select: { status: true },
       });
 
+      // Aged-stock / overstock signal bookkeeping — purely additive, never
+      // changes the status/source/Shopify-sync behavior below. "Aged
+      // stock" needs to know how long THIS run of stock has been sitting
+      // confirmed, not how long ago the row was first created, so the
+      // Variant.receivedAt stamp (below) only ever moves on a genuine
+      // transition into or out of IN_STOCK — never on a routine
+      // re-confirmation while it's already IN_STOCK, which would make
+      // every re-confirmed item look freshly stocked and defeat the
+      // point of tracking age at all.
+      const enteringStock =
+        status === "IN_STOCK" && existing?.status !== "IN_STOCK";
+      const leavingStock =
+        status !== "IN_STOCK" && existing?.status === "IN_STOCK";
+      // quantityOnHand mirrors that same in-stock-only lifetime: only
+      // ever holds a real number while status is IN_STOCK, left
+      // untouched on an IN_STOCK re-confirmation that didn't type a new
+      // count (quantityOnHand ?? undefined — Prisma's "don't change this
+      // field" value, same convention quantityOverride already uses
+      // above), and force-cleared to null the moment status isn't
+      // IN_STOCK, so a stale count is never mistaken for a current one.
+      const quantityOnHandValue =
+        status === "IN_STOCK" ? (quantityOnHand ?? undefined) : null;
+
       const state = await tx.availabilityState.upsert({
         where: { variantId },
         create: {
@@ -93,6 +118,7 @@ async function setAvailability({
           confirmedAt: now,
           expiresAt,
           note,
+          quantityOnHand: quantityOnHandValue,
         },
         update: {
           productId: resolvedProductId,
@@ -103,6 +129,7 @@ async function setAvailability({
           confirmedAt: now,
           expiresAt,
           note,
+          quantityOnHand: quantityOnHandValue,
         },
       });
 
@@ -129,7 +156,22 @@ async function setAvailability({
         },
       });
 
-      return { availabilityState: state, previousStatus: existing?.status ?? null };
+      if (enteringStock) {
+        await tx.variant.update({
+          where: { id: variantId },
+          data: { receivedAt: now },
+        });
+      } else if (leavingStock) {
+        await tx.variant.update({
+          where: { id: variantId },
+          data: { receivedAt: null },
+        });
+      }
+
+      return {
+        availabilityState: state,
+        previousStatus: existing?.status ?? null,
+      };
     },
   );
 
@@ -148,7 +190,11 @@ async function setAvailability({
           err.message,
         );
       });
-    return { ...availabilityState, shopifySynced: false, shopifySyncSkipped: true };
+    return {
+      ...availabilityState,
+      shopifySynced: false,
+      shopifySyncSkipped: true,
+    };
   }
 
   const shopifyResult = await writeAvailabilityToShopify(
@@ -314,7 +360,9 @@ async function bulkSetAvailabilityDbOnly({
   //      always-valid NULL.
   const logIds = targets.map(() => crypto.randomUUID());
   const logStateIds = targets.map((t) => stateIdByVariantId.get(t.variantId));
-  const logPrevStatuses = targets.map((t) => existingByVariantId.get(t.variantId)?.status ?? null);
+  const logPrevStatuses = targets.map(
+    (t) => existingByVariantId.get(t.variantId)?.status ?? null,
+  );
   const logChangedBy = changedBy || "system";
   await prisma.$executeRaw`
     INSERT INTO "AvailabilityLog" (id, "availabilityStateId", "previousStatus", "newStatus", "changedBy", "changedAt")

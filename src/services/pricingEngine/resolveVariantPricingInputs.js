@@ -37,6 +37,12 @@ async function resolveVariantPricingInputs(variantIds) {
   const availabilityByVariantId = new Map(
     availabilityStates.map((a) => [a.variantId, a.status]),
   );
+  // quantityOnHand only exists on AvailabilityState while the supplier
+  // check-in portal gave a real typed count (see availabilityService.js's
+  // setAvailability) — absent for everything else, same as costPrice.
+  const quantityByVariantId = new Map(
+    availabilityStates.map((a) => [a.variantId, a.quantityOnHand]),
+  );
   const variantById = new Map(variants.map((v) => [v.id, v]));
 
   const resolved = {};
@@ -51,6 +57,7 @@ async function resolveVariantPricingInputs(variantIds) {
     // posture as check_availability's own existing fallback.
     const availabilityStatus =
       availabilityByVariantId.get(variantId) || "UNKNOWN";
+    const quantityOnHand = quantityByVariantId.get(variantId) ?? null;
 
     resolved[variantId] = {
       variant: {
@@ -59,6 +66,12 @@ async function resolveVariantPricingInputs(variantIds) {
         listPrice: variant.price,
         costPrice,
         availabilityStatus,
+        quantityOnHand,
+        // Stamped by setAvailability() the moment a variant genuinely
+        // transitions into IN_STOCK, and cleared the moment it leaves —
+        // see availabilityService.js. null = either never confirmed in
+        // stock, or not currently confirmed in stock.
+        receivedAt: variant.receivedAt,
       },
       product: {
         id: variant.Product.id,

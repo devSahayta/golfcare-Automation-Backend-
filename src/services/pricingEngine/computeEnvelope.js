@@ -18,6 +18,8 @@
 //     tier: { STANDARD, SILVER, GOLD, PLATINUM },
 //     ltv: { topPercentile, pct },
 //     bundle: { minItems, minOrderValue, pct },
+//     overstockQty: { minQuantity, pct },
+//     agedStock: { tiers: [{ days, pct }, ...] },
 //   },
 //   ladder: { steps: [0.4, 0.75, 1.0], thinRoom: { minRupees, minPct } },
 //   agent: { maxOrderForLevers },
@@ -25,12 +27,20 @@
 //   discounting: { enabled },
 // }
 //
-// NOTE: the original spec's "aged stock" and "overstock" levers are
-// deliberately NOT implemented here — Golf Care is pure dropship and
-// holds no stock itself, so there is no inventory that can age or pile
-// up. The only stock signal that matters is AvailabilityState.status
-// (confirmed by the supplier during check-ins); see the availabilityStatus
-// gate in computeLeverSum below.
+// UPDATE (overstock/aged stock): the original spec's `lever.overstock`
+// (sales-velocity multiple, needs per-variant units-sold history that
+// doesn't exist anywhere yet) and `lever.aged.tiers` were left
+// unimplemented for a while on the reasoning that Golf Care is pure
+// dropship and holds no stock itself. That reasoning undersold one real
+// signal that DOES exist: the supplier's own typed stock count from the
+// check-in portal (variant.quantityOnHand below) and how long a variant
+// has been continuously confirmed IN_STOCK (variant.receivedAt) are both
+// genuine, supplier-sourced facts about stock sitting unsold — just not
+// Golf Care's own warehouse stock. `lever.overstockQty` and
+// `lever.agedStock` below are a simpler, flat-threshold version of the
+// original two levers, built on exactly that data; the original
+// `lever.overstock`/`lever.aged` rows are left untouched in the DB/
+// DEFAULTS in case the velocity-based version gets built later.
 
 function roundUpFriendly(amount, rounding) {
   const increment = amount < 10000 ? rounding.below10k : rounding.above10k;
@@ -107,6 +117,39 @@ function computeLeverSum({
     );
     if (cartTotal >= config.lever.bundle.minOrderValue) {
       levers.bundle = config.lever.bundle.pct;
+    }
+  }
+
+  // Overstock — a real supplier-typed quantity on hand (see
+  // resolveVariantPricingInputs.js / availabilityService.js's
+  // quantityOnHand), not Shopify's inventory number: most dropship
+  // variants don't even have real tracking in Shopify, and the number we
+  // do write there is often just our own display placeholder, not a true
+  // count — reading that back would be reading our own guess as if it
+  // were real data. null (no supplier-typed count on file) never fires
+  // this, same safe-default posture as a null costPrice.
+  if (
+    variant.quantityOnHand != null &&
+    variant.quantityOnHand >= config.lever.overstockQty.minQuantity
+  ) {
+    levers.overstockQty = config.lever.overstockQty.pct;
+  }
+
+  // Aged stock — how long this variant has been continuously confirmed
+  // IN_STOCK (variant.receivedAt, stamped by setAvailability() only on a
+  // genuine transition into stock — see that file). Tiered: the highest
+  // day-threshold actually cleared wins, tiers don't stack with each
+  // other. null (never confirmed in stock, or not currently) never fires
+  // this.
+  if (variant.receivedAt != null) {
+    const daysInStock =
+      (now - new Date(variant.receivedAt)) / (24 * 60 * 60 * 1000);
+    const tiersMet = config.lever.agedStock.tiers.filter(
+      (t) => daysInStock >= t.days,
+    );
+    if (tiersMet.length) {
+      const bestTier = tiersMet.reduce((a, b) => (b.days > a.days ? b : a));
+      levers.agedStock = bestTier.pct;
     }
   }
 

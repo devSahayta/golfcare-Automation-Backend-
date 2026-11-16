@@ -9,8 +9,14 @@
 // from where this originally lived.
 const { prisma } = require("../lib/prisma");
 const { env } = require("../config/env");
-const { setAvailability, bulkSetAvailabilityDbOnly } = require("./availabilityService");
-const { updateVariantPrice, updateInventoryItemCost } = require("./shopifyInventory");
+const {
+  setAvailability,
+  bulkSetAvailabilityDbOnly,
+} = require("./availabilityService");
+const {
+  updateVariantPrice,
+  updateInventoryItemCost,
+} = require("./shopifyInventory");
 const { computeCostPrice } = require("./pricingCalculator");
 
 // The currently-open (status SENT) check-in for a supplier, if any — used
@@ -70,6 +76,11 @@ async function applyConfirmation({
       // caller (chat tools, bulk confirm) leaves it undefined and gets
       // the existing default-quantity behavior, unchanged.
       quantityOverride: quantity ?? undefined,
+      // Same real supplier-typed number, also persisted to our own DB
+      // (not just forwarded to Shopify) so the pricing engine's overstock
+      // lever has a genuine count to read instead of polling Shopify's
+      // often-untracked/placeholder inventory number back at itself.
+      quantityOnHand: quantity ?? undefined,
     });
     appliedToAvailability = true;
   }
@@ -85,9 +96,13 @@ async function applyConfirmation({
   let needsPricingInfo = false;
   if (mrp != null) {
     const resolvedMargin =
-      marginPercent != null ? marginPercent : numberOrNull(supplierProduct.marginPercent);
+      marginPercent != null
+        ? marginPercent
+        : numberOrNull(supplierProduct.marginPercent);
     const resolvedGst =
-      gstPercent != null ? gstPercent : numberOrNull(supplierProduct.gstPercent);
+      gstPercent != null
+        ? gstPercent
+        : numberOrNull(supplierProduct.gstPercent);
 
     if (resolvedMargin != null && resolvedGst != null) {
       const costPrice = computeCostPrice({
@@ -97,7 +112,11 @@ async function applyConfirmation({
       });
       await prisma.supplierProduct.update({
         where: { id: supplierProduct.id },
-        data: { costPrice, marginPercent: resolvedMargin, gstPercent: resolvedGst },
+        data: {
+          costPrice,
+          marginPercent: resolvedMargin,
+          gstPercent: resolvedGst,
+        },
       });
 
       if (supplierProduct.variantId) {
@@ -189,14 +208,16 @@ async function confirmAllPendingItems({ supplier, status, leadTimeDays }) {
   // everything else. See recordConfirmationOnOpenCheck for where
   // individual confirmations land in rawReplies.confirmations.
   const alreadyConfirmedIds = new Set(
-    (Array.isArray(check.rawReplies?.confirmations) ? check.rawReplies.confirmations : []).map(
-      (c) => c.supplierProductId,
-    ),
+    (Array.isArray(check.rawReplies?.confirmations)
+      ? check.rawReplies.confirmations
+      : []
+    ).map((c) => c.supplierProductId),
   );
   const supplierProductIds = items
     .map((i) => i.supplierProductId)
     .filter((id) => id && !alreadyConfirmedIds.has(id));
-  if (supplierProductIds.length === 0) return { error: "check_in_has_no_items" };
+  if (supplierProductIds.length === 0)
+    return { error: "check_in_has_no_items" };
 
   const supplierProducts = await prisma.supplierProduct.findMany({
     where: { id: { in: supplierProductIds }, supplierId: supplier.id },
@@ -209,7 +230,9 @@ async function confirmAllPendingItems({ supplier, status, leadTimeDays }) {
 
   // Module 2's fan-in policy: only the primary supplier's confirmation
   // drives the actual storefront-facing AvailabilityState.
-  const primaryTargets = supplierProducts.filter((sp) => sp.isPrimary && sp.variantId);
+  const primaryTargets = supplierProducts.filter(
+    (sp) => sp.isPrimary && sp.variantId,
+  );
   const syncCap = env.bulkConfirmShopifySyncCap;
 
   // Sequential + paced, not concurrent, for the small inline-Shopify
@@ -223,15 +246,18 @@ async function confirmAllPendingItems({ supplier, status, leadTimeDays }) {
   // rate-safe, just not actively hostile to it.
   const deferredTargets = primaryTargets.slice(syncCap);
   const [syncedResults] = await Promise.all([
-    mapSequentialPaced(primaryTargets.slice(0, syncCap), env.shopifySyncPaceMs, (sp) =>
-      setAvailability({
-        variantId: sp.variantId,
-        productId: sp.productId,
-        status,
-        source: "SUPPLIER_CONFIRMED",
-        changedBy: supplier.id,
-        leadTimeDays: leadTimeDays ?? null,
-      }),
+    mapSequentialPaced(
+      primaryTargets.slice(0, syncCap),
+      env.shopifySyncPaceMs,
+      (sp) =>
+        setAvailability({
+          variantId: sp.variantId,
+          productId: sp.productId,
+          status,
+          source: "SUPPLIER_CONFIRMED",
+          changedBy: supplier.id,
+          leadTimeDays: leadTimeDays ?? null,
+        }),
     ),
     // Bulk, not one setAvailability() transaction per item — confirmed
     // live this matters, not just in theory: even DB-only (no Shopify
@@ -243,7 +269,10 @@ async function confirmAllPendingItems({ supplier, status, leadTimeDays }) {
     // queries instead of thousands of individual transactions, and
     // always queues every target for the scheduler's Shopify sync.
     bulkSetAvailabilityDbOnly({
-      targets: deferredTargets.map((sp) => ({ variantId: sp.variantId, productId: sp.productId })),
+      targets: deferredTargets.map((sp) => ({
+        variantId: sp.variantId,
+        productId: sp.productId,
+      })),
       status,
       source: "SUPPLIER_CONFIRMED",
       changedBy: supplier.id,
@@ -336,9 +365,7 @@ async function recordConfirmationOnOpenCheck({
   const allConfirmed =
     items.length > 0 &&
     items.every((item) =>
-      confirmations.some(
-        (c) => c.supplierProductId === item.supplierProductId,
-      ),
+      confirmations.some((c) => c.supplierProductId === item.supplierProductId),
     );
 
   await prisma.supplierCheck.update({
