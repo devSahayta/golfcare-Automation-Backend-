@@ -646,6 +646,12 @@ model ProductImportBatch {
   // See ImportItemStatus.NEEDS_BRAND_REVIEW.
   needsBrandReviewCount Int         @default(0)
   status          ImportBatchStatus @default(PENDING_EXTRACTION)
+  // How far the scheduler's extraction has gotten through the source
+  // document's own units (rows/pages/text-segments) — lets a restart
+  // resume instead of reprocessing (and re-paying for) the whole document.
+  // Only read/written by golfcare-Automation-Schedular-'s productImportDrain.js;
+  // see that repo's schema.prisma for the full comment.
+  extractedUnitCount Int            @default(0)
   // Set at creation (PENDING_EXTRACTION), consumed once by the scheduler's
   // extraction step (jobs/productImportDrain.js) — the raw document text
   // the supplier sent. The live chat turn never has to parse this itself;
