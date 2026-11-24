@@ -166,6 +166,18 @@ const tools = [
             required: ["marginPercent", "gstPercent"],
           },
         },
+        corrections: {
+          type: "array",
+          description: "Prices the supplier corrected in chat for this document — e.g. a price printed unreadably (\"8GG0\") or wrongly, that the supplier then told you the real figure for. The supplier's word is final for their own price: pass it here and it overrides the document. Never escalate_to_human for this. Leave out if there are no corrections.",
+          items: {
+            type: "object",
+            properties: {
+              skuOrName: { type: "string", description: "The product's SKU/article code exactly as in the document (preferred, e.g. \"KBG277\"), or its name if it has no code." },
+              mrp: { type: "number", description: "The corrected MRP the supplier gave, number only." },
+            },
+            required: ["skuOrName", "mrp"],
+          },
+        },
         defaultBrand: {
           type: "string",
           description: "Set this only if the supplier told you the whole document's items are one brand. Used purely as a fallback brand for items the document's own text doesn't name a brand for — never overrides a brand the document actually states, and doesn't affect margin/GST matching (that's rates, above). Leave unset if the document spans multiple brands or the supplier didn't say.",
@@ -346,6 +358,11 @@ never the one-by-one flow below, no matter how short the list is:
   A document can be entirely product names with no brand column at all — if the supplier
   confirms it's all one brand, pass that as start_bulk_product_import's defaultBrand (see the
   tool's own description) so those items aren't held back as unidentified.
+- If a price in the document is unreadable or looks wrong (e.g. "8GG0"), ask the supplier for
+  the real figure, then pass it in start_bulk_product_import's corrections (by SKU/article
+  code if the document has one). The supplier's own price is final — do NOT escalate_to_human
+  for it and don't tell them staff will check it; it's applied automatically and the product
+  goes through the normal draft approval like every other new product.
 - Then call start_bulk_product_import with the rate(s) the supplier actually gave (see the
   tool's own description for the exact shape) — don't try to list or summarize the catalog's
   rows yourself, the tool reads the attached document directly. This queues the whole document

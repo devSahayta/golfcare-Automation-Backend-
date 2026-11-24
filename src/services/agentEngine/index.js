@@ -65,8 +65,53 @@ function summarizeKnownIdsForHistory(toolCalls) {
     }
   }
 
-  if (!lines.length) return "";
-  return `\n\n[internal reference only, never shown to the customer — real IDs from this message's tool results, use these exact strings if the customer later refers back to one of these items: ${lines.join(" | ")}]`;
+  const actions = summarizeActionsForHistory(toolCalls);
+
+  if (!lines.length && !actions.length) return "";
+  const parts = [];
+  if (lines.length) {
+    parts.push(
+      `real IDs from this message's tool results, use these exact strings if the customer later refers back to one of these items: ${lines.join(" | ")}`,
+    );
+  }
+  if (actions.length) {
+    parts.push(
+      `tools this message actually called, with their results (these really happened, do not redo or apologise for them): ${actions.join(" | ")}`,
+    );
+  }
+  return `\n\n[internal reference only, never shown to the customer — ${parts.join(". ")}]`;
+}
+
+// Every tool call other than the product lookups above (escalate_to_human,
+// start_bulk_product_import, confirm_all_pending_items, make_offer, ...).
+// Without this the model only ever saw its own past TEXT ("I've flagged
+// this for the team"), never the tool call behind it — so Haiku 5.5 kept
+// concluding its earlier claim was false, "correcting" itself to the
+// supplier and calling the tool again (one live chat sent the same
+// escalation to staff 3 times). One short line per call: name, a trimmed
+// input, and done/failed plus a few short result fields.
+const ACTION_SUMMARY_SKIP = new Set(["search_products", "get_product"]);
+
+function shortScalars(obj, maxKeys) {
+  if (!obj || typeof obj !== "object") return "";
+  return Object.entries(obj)
+    .filter(([, v]) => ["string", "number", "boolean"].includes(typeof v))
+    .slice(0, maxKeys)
+    .map(([k, v]) => `${k}=${String(v).slice(0, 60)}`)
+    .join(", ");
+}
+
+function summarizeActionsForHistory(toolCalls) {
+  return toolCalls
+    .filter((c) => c && c.tool && !c.server && !ACTION_SUMMARY_SKIP.has(c.tool))
+    .slice(0, 8)
+    .map((c) => {
+      const input = c.input ? JSON.stringify(c.input).slice(0, 120) : "";
+      const result = c.output?.error
+        ? `FAILED (${String(c.output.error).slice(0, 80)})`
+        : `done${shortScalars(c.output, 4) ? ` (${shortScalars(c.output, 4)})` : ""}`;
+      return `${c.tool}(${input}) → ${result}`;
+    });
 }
 
 // Defensive strip — the model has been observed mimicking the

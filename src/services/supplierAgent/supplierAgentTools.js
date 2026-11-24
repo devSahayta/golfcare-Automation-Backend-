@@ -321,7 +321,7 @@ function buildSupplierAgentTools(context) {
       // catalog before creating a duplicate Shopify product — this was a
       // real bug: a supplier restating a real, already-listed product got
       // a brand new draft product instead of a stock update.
-      const catalogMatch = await findExistingCatalogMatch({ title, sku, variantOptions });
+      const catalogMatch = await findExistingCatalogMatch({ title, sku, variantOptions, brand });
       if (catalogMatch?.variant) {
         let supplierProduct = await prisma.supplierProduct.findFirst({
           where: { supplierId: supplier.id, variantId: catalogMatch.variant.id },
@@ -514,7 +514,7 @@ function buildSupplierAgentTools(context) {
     // (same "isolated call, not the main loop" pattern as
     // research_product_specs), then the normal per-item draining already
     // built proceeds exactly as before.
-    async start_bulk_product_import({ rates, defaultBrand }) {
+    async start_bulk_product_import({ rates, defaultBrand, corrections }) {
       if (!supplier) return { error: "no_supplier_on_conversation" };
       const cleanDefaultBrand = typeof defaultBrand === "string" && defaultBrand.trim() ? defaultBrand.trim() : null;
       const cleanRates = (Array.isArray(rates) ? rates : [])
@@ -555,33 +555,23 @@ function buildSupplierAgentTools(context) {
       // though its tool call had already succeeded. Block on the document
       // text itself, not on the caller somehow being idempotent.
       //
-      // But this must not block FOREVER: confirmed live that a supplier
-      // resent an identical document 8 days after staff explicitly
-      // rejected every item it produced — this matched that old, finished
-      // batch and silently no-op'd, telling the supplier "being processed"
-      // when really nothing was happening and nothing ever would. Only
-      // short-circuit when the earlier attempt is still in flight, or
-      // actually resulted in something live/pending (see
-      // previousAttemptFullyRejected below) — a resend of a fully rejected
-      // document starts a fresh batch so staff can reconsider it.
+      // Only blocks while the earlier batch is still IN FLIGHT. A finished
+      // (DONE) batch never blocks a resend: the scheduler's drain already
+      // skips every product that is live in the catalog (LINKED_EXISTING)
+      // or has a PENDING/APPROVED draft (ALREADY_DRAFTED), so re-importing
+      // only adds what's genuinely missing — products dropped last time
+      // (e.g. an unreadable price the supplier has now corrected) and ones
+      // whose draft was REJECTED or EXPIRED — at the rates given now.
+      // Confirmed live why: a resent Adidas list matched a batch finished a
+      // month earlier and silently no-op'd, so the supplier's new 45%
+      // margin and corrected KBG277 price were never applied to anything.
+      const cleanCorrections = normalizeCorrections(corrections);
       const existingBatch = await prisma.productImportBatch.findFirst({
         where: { supplierId: supplier.id, rawDocumentText: documentText },
         orderBy: { createdAt: "desc" },
       });
-      if (existingBatch) {
-        const canRetry =
-          existingBatch.status === "DONE" && (await previousAttemptFullyRejected(existingBatch.id));
-        if (!canRetry) {
-          return {
-            batchId: existingBatch.id,
-            alreadyQueued: true,
-            status: existingBatch.status,
-            message: `This exact document was already queued (batch ${existingBatch.id}, status ${existingBatch.status}) — not creating a duplicate. Just tell the supplier it's received and being processed.`,
-          };
-        }
-        // Falls through to create a fresh batch — every item from the
-        // matching prior batch was rejected or expired, so there's nothing
-        // live or pending left to collide with.
+      if (existingBatch && existingBatch.status !== "DONE") {
+        return await handleInFlightBatch(existingBatch, cleanRates, cleanCorrections);
       }
 
       const batch = await prisma.productImportBatch.create({
@@ -592,14 +582,23 @@ function buildSupplierAgentTools(context) {
           defaultBrand: cleanDefaultBrand,
           rawDocumentText: documentText,
           sourceMediaUrl: attachmentMsg.mediaUrl || null,
+          supplierCorrections: cleanCorrections.length ? cleanCorrections : undefined,
           status: "PENDING_EXTRACTION",
         },
       });
 
+      const queuedMessage =
+        "Queued the document for background import. This takes a while — parsing the catalog, checking for existing products, researching and creating drafts for new ones — not an instant result. Tell the supplier now that their list was received and is being processed; don't wait for or claim an immediate result, and don't call create_product_draft for any of these items yourself.";
+      if (!existingBatch) {
+        return { batchId: batch.id, ...(cleanCorrections.length && { correctionsApplied: cleanCorrections }), message: queuedMessage };
+      }
+      const previous = summarizeFinishedBatch(existingBatch);
       return {
         batchId: batch.id,
-        message:
-          "Queued the document for background import. This takes a while — parsing the catalog, checking for existing products, researching and creating drafts for new ones — not an instant result. Tell the supplier now that their list was received and is being processed; don't wait for or claim an immediate result, and don't call create_product_draft for any of these items yourself.",
+        reimport: true,
+        previousImport: previous,
+        ...(cleanCorrections.length && { correctionsApplied: cleanCorrections }),
+        message: `This same document was already imported once, on ${previous.finishedOn} (rates then: ${previous.ratesUsed}). It has now been queued AGAIN with the rates and corrections you just passed. Products already live in the store or already drafted and awaiting approval are skipped automatically — only products missing last time, or whose earlier draft was rejected or expired, will be added, using the new rates. Tell the supplier exactly that, plainly: it was imported before on that date, and this time only the missing products will be added. Don't claim the earlier products' rates changed.`,
       };
     },
 
@@ -664,40 +663,80 @@ async function getLatestInboundImageUrl(conversationId) {
   return message?.mediaUrl || null;
 }
 
-// start_bulk_product_import's resend-after-rejection check — true only if
-// every item the matching prior batch produced ended up with no live or
-// pending outcome. Covers both ways an item can be a dead end: an actual
-// REJECTED/EXPIRED draft decision, and a held-back NEEDS_RATE/
-// NEEDS_BRAND_REVIEW/FAILED item that never became a draft at all (confirmed
-// live: a 71-item batch that was entirely NEEDS_BRAND_REVIEW — nothing
-// drafted, nothing pending — still silently blocked a resend after the
-// supplier's brands list was corrected, with the old version of this check
-// only recognizing a REJECTED draft as "safe to retry"). Any item that's
-// still pending a decision, already live (LINKED_EXISTING, an APPROVED
-// draft, a resolved resultMatchedProductId), or already drafted elsewhere
-// (ALREADY_DRAFTED) keeps the dedup block in place — only a clean, final
-// "nothing came of this" across the board clears it.
-async function previousAttemptFullyRejected(batchId) {
-  const items = await prisma.productImportItem.findMany({
-    where: { batchId },
-    select: { status: true, resultProductDraftId: true, resultMatchedProductId: true },
-  });
-  if (items.length === 0) return false;
+// --- start_bulk_product_import helpers ---
 
-  const DEAD_END_STATUSES = new Set(["FAILED", "NEEDS_RATE", "NEEDS_BRAND_REVIEW"]);
-  for (const item of items) {
-    if (item.resultMatchedProductId) return false;
-    if (DEAD_END_STATUSES.has(item.status)) continue;
-    if (item.status !== "DRAFTED") return false; // PENDING/RESEARCHING/LINKED_EXISTING/ALREADY_DRAFTED
-    if (!item.resultProductDraftId) return false;
-    const draft = await prisma.productDraft.findUnique({
-      where: { id: item.resultProductDraftId },
-      select: { approvalStatus: true },
-    });
-    if (!draft || draft.approvalStatus === "PENDING" || draft.approvalStatus === "APPROVED") return false;
-  }
-  return true;
+// Supplier price corrections from chat, e.g. [{skuOrName: "KBG277", mrp:
+// 8800}] for a price the document printed as "8GG0". The supplier's word
+// is final for their own price — these are applied by the scheduler's
+// extraction step instead of escalating to staff (which only ever wrote
+// an audit log nobody could act on).
+function normalizeCorrections(corrections) {
+  return (Array.isArray(corrections) ? corrections : [])
+    .map((c) => ({
+      skuOrName: typeof c?.skuOrName === "string" ? c.skuOrName.trim() : "",
+      mrp: Number(c?.mrp),
+    }))
+    .filter((c) => c.skuOrName && Number.isFinite(c.mrp) && c.mrp > 0);
 }
+
+function mergeCorrections(existing, incoming) {
+  const byKey = new Map();
+  for (const c of [...normalizeCorrections(existing), ...incoming]) {
+    byKey.set(c.skuOrName.toLowerCase(), c); // later (newer) wins
+  }
+  return [...byKey.values()];
+}
+
+function summarizeFinishedBatch(batch) {
+  const ratesUsed = (Array.isArray(batch.rateRules) ? batch.rateRules : [])
+    .map((r) => `${[r.brand, r.category].filter(Boolean).join("/") || "all items"}: ${r.marginPercent}% margin, ${r.gstPercent}% GST`)
+    .join("; ");
+  return {
+    batchId: batch.id,
+    finishedOn: (batch.completedAt || batch.createdAt).toISOString().slice(0, 10),
+    ratesUsed: ratesUsed || "unknown",
+    productsFound: batch.totalItems,
+    newDrafts: batch.draftedCount,
+    linkedToExisting: batch.linkedCount,
+  };
+}
+
+// Same document resent while its earlier batch is still running. Never
+// creates a second batch (the original guardrail-retry duplicate case).
+// If the batch hasn't started reading the document yet, the new rates
+// and corrections are simply put onto it; once reading has started they
+// can't be applied to this run, and the agent is told so honestly
+// instead of saying "being processed with your new price".
+async function handleInFlightBatch(batch, rates, corrections) {
+  const base = { batchId: batch.id, alreadyQueued: true, status: batch.status };
+  const notStartedYet = batch.status === "PENDING_EXTRACTION" && (batch.extractedUnitCount || 0) === 0;
+
+  if (notStartedYet) {
+    const merged = mergeCorrections(batch.supplierCorrections, corrections);
+    await prisma.productImportBatch.update({
+      where: { id: batch.id },
+      data: { rateRules: rates, ...(merged.length && { supplierCorrections: merged }) },
+    });
+    return {
+      ...base,
+      ...(merged.length && { correctionsApplied: merged }),
+      message: `This document is already queued and hasn't been read yet (batch ${batch.id}), so the rates${corrections.length ? " and price corrections" : ""} you just passed were applied to it — no duplicate created. Tell the supplier it's received and being processed with those details.`,
+    };
+  }
+
+  if (corrections.length) {
+    return {
+      ...base,
+      correctionsNotApplied: corrections,
+      message: `This document is already being processed (batch ${batch.id}) and is past the reading step, so the price correction(s) you passed could NOT be applied to this run. Tell the supplier honestly: the list is still being processed, the corrected price couldn't be added to this run, and once they get the completion message they can send the same document again with the correction — only the missing products will be added then.`,
+    };
+  }
+  return {
+    ...base,
+    message: `This exact document is already queued and still being processed (batch ${batch.id}) — not creating a duplicate. Tell the supplier it's received and being processed.`,
+  };
+}
+
 
 // --- reconcile_stock_list matching (v1 heuristic — see the note on
 // search_products in salesAgentTools.js; same "no embedding pipeline

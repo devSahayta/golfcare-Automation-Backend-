@@ -275,7 +275,7 @@ async function createNewProductDraft(req, res) {
     // This "new product" might not be new to Golf Care at all — check the
     // real global catalog before creating a duplicate Shopify product,
     // same branch create_product_draft already takes.
-    const catalogMatch = await findExistingCatalogMatch({ title, sku, variantOptions: [] });
+    const catalogMatch = await findExistingCatalogMatch({ title, sku, variantOptions: [], brand });
     if (catalogMatch?.variant) {
       let supplierProduct = await prisma.supplierProduct.findFirst({
         where: { supplierId: supplier.id, variantId: catalogMatch.variant.id },

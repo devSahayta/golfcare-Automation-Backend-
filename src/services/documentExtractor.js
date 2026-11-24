@@ -260,7 +260,11 @@ async function extractDocxText(buffer) {
 // slide is closer to a set of short labels/bullets than flowing
 // paragraphs), slides separated by a blank line so the model can tell
 // where one ends and the next begins.
-const PPT_RUN_RE = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
+// `<a:t(?:\s[^>]*)?>` — NOT `<a:t[^>]*>`, which also matched table tags
+// that merely start with "a:t" (<a:tbl>, <a:tblPr/>, <a:tc>, <a:tr>,
+// <a:txBody>) and then swallowed raw XML up to the next </a:t>. A table
+// slide came through as ~12K tokens of markup instead of its cell text.
+const PPT_RUN_RE = /<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/g;
 const PPT_SLIDE_PATH_RE = /^ppt\/slides\/slide(\d+)\.xml$/;
 
 async function extractPptxText(buffer) {

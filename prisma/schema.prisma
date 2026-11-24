@@ -673,6 +673,11 @@ model ProductImportBatch {
   // the document actually states. Independent of rateRules below (that's
   // margin/GST matching; this is purely brand identification).
   defaultBrand    String?
+  // Price corrections the supplier gave in chat for this document, e.g.
+  // [{"skuOrName": "KBG277", "mrp": 8800}] for a price printed as "8GG0".
+  // Set by start_bulk_product_import (backend), read by the scheduler's
+  // extraction step — the supplier's word overrides the document.
+  supplierCorrections Json?
   // Margin/GST are NOT one blanket rate for the whole document — a
   // supplier catalog commonly spans several brands/categories with
   // different rates each. rateRules: [{brand, category, marginPercent,
