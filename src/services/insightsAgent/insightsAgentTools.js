@@ -17,6 +17,7 @@ const { prisma } = require("../../lib/prisma");
 const { buildAudience, MAX_AUDIENCE } = require("../broadcastAudienceService");
 const { matchProductImage } = require("../productImageMatchService");
 const { env } = require("../../config/env");
+const { requestOptionsFor } = require("../agentEngine/modelPricing");
 const {
   submitBroadcastCampaignToMeta,
   SubmitError,
@@ -256,18 +257,25 @@ Write 3 message variants following the JSON schema exactly.`;
 
   const response = await client.messages.create({
     model: env.anthropicModelHaiku,
-    max_tokens: 1800,
+    // 1800 for the answer itself; Haiku 5.5 also gets headroom for its
+    // default thinking (see modelPricing.js requestOptionsFor).
+    ...requestOptionsFor(env.anthropicModelHaiku, { answerTokens: 1800, effort: "low" }),
     system: CONTENT_GEN_PROMPT,
     messages: [{ role: "user", content: userMessage }],
   });
 
-  const raw = response.content[0]?.text || "";
+  // Read text blocks by type — Haiku 5.5 can return a thinking block
+  // first, so content[0] is not necessarily the answer anymore.
+  const raw = response.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
 
-  // Parse JSON — strip any accidental markdown fences
-  const cleaned = raw
-    .replace(/^```(?:json)?\n?/, "")
-    .replace(/\n?```$/, "")
-    .trim();
+  // Parse JSON — take the object itself, ignoring markdown fences or any
+  // sentence written around it.
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  const cleaned = start !== -1 && end > start ? raw.slice(start, end + 1) : raw.trim();
   const parsed = JSON.parse(cleaned);
 
   return {

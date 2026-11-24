@@ -5,6 +5,7 @@ const { runToolLoop } = require("./toolLoop");
 const { runGuardrails: runDefaultGuardrails } = require("./guardrails");
 const { logMessage, logAudit, logUsage } = require("./logger");
 const { pickModel } = require("./modelRouter");
+const { computeCost: computeModelCost } = require("./modelPricing");
 
 // NEW — real fix for a confirmed production bug: a customer picking an item
 // by position/name from a list the agent already showed them ("Go with 2",
@@ -86,42 +87,15 @@ function stripInternalReferenceNote(text) {
   return text.replace(/\n{0,2}\[internal reference only[\s\S]*$/i, "").trim();
 }
 
-// Kept exactly as before — still the fallback rate for any model not
-// found in MODEL_RATES below (e.g. if env.anthropicModel is set to
-// something not equal to either Sonnet or Haiku's configured string).
-const COST_INPUT_USD_PER_MTOK = 3;
-const COST_OUTPUT_USD_PER_MTOK = 15;
-const USD_TO_INR = 95;
-
-// NEW — per-model rates, needed because a single conversation can now
-// mix Sonnet and Haiku calls (initial attempt on one model, guardrail
-// retry forced onto Sonnet). Keyed by the actual model string so it
-// stays correct even if env vars change which literal model name each
-// tier points to.
-const MODEL_RATES = {
-  "claude-sonnet-4-6": { input: 3, output: 15 },
-  "claude-haiku-4-5-20251001": { input: 1, output: 5 },
-  [env.anthropicModelSonnet]: { input: 3, output: 15 },
-  [env.anthropicModelHaiku]: { input: 1, output: 5 },
-};
-
+// Per-model cost — a single conversation can mix models (initial attempt
+// on Haiku, guardrail retry forced onto Sonnet), so each attempt is priced
+// at its own model's rate. Rates (including cache write/read multipliers)
+// come from modelPricing.js, the one shared rate table — this file used to
+// keep its own copy, which would have priced Haiku 5.5 at Haiku 4.5's
+// $1/$5 (10x too high) once ANTHROPIC_MODEL_HAIKU moved to the new model.
 function estimateCostForModel(usage, model) {
   if (!usage) return null;
-  const rates = MODEL_RATES[model] || {
-    input: COST_INPUT_USD_PER_MTOK,
-    output: COST_OUTPUT_USD_PER_MTOK,
-  };
-  const inputCost = (usage.inputTokens / 1_000_000) * rates.input;
-  const outputCost = (usage.outputTokens / 1_000_000) * rates.output;
-  // NEW — cache writes cost 1.25x normal input rate, cache reads cost
-  // 0.1x normal input rate. Both were previously untracked entirely,
-  // meaning logged cost understated the real Anthropic bill.
-  const cacheWriteCost =
-    ((usage.cacheCreationTokens || 0) / 1_000_000) * rates.input * 1.25;
-  const cacheReadCost =
-    ((usage.cacheReadTokens || 0) / 1_000_000) * rates.input * 0.1;
-  const usd = inputCost + outputCost + cacheWriteCost + cacheReadCost;
-  return { usd, inr: usd * USD_TO_INR };
+  return computeModelCost(model, usage);
 }
 
 function addUsage(a, b) {

@@ -53,7 +53,7 @@ const env = {
   anthropicModelSonnet:
     process.env.ANTHROPIC_MODEL_SONNET || "claude-sonnet-4-6",
   anthropicModelHaiku:
-    process.env.ANTHROPIC_MODEL_HAIKU || "claude-haiku-4-5-20251001",
+    process.env.ANTHROPIC_MODEL_HAIKU || "claude-haiku-5-5",
   agentMessageDebounceMs: Number(process.env.AGENT_MESSAGE_DEBOUNCE_MS || 8000),
   discountCeilingPercent: Number(process.env.DISCOUNT_CEILING_PERCENT || 0),
   handoverValueThresholdInr: Number(

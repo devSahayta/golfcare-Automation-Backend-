@@ -9,6 +9,7 @@
 
 const Anthropic = require("@anthropic-ai/sdk");
 const { env } = require("../../config/env");
+const { requestOptionsFor } = require("./modelPricing");
 
 const anthropic = new Anthropic({
   apiKey: env.anthropicApiKey,
@@ -31,9 +32,8 @@ const anthropic = new Anthropic({
  *   explicitly (agentEngine/modelRouter.js's per-turn pick, or a caller pinning a
  *   specific model's reliability regardless of what the main conversation would
  *   otherwise use — see supplierAgent/productResearch.js, which pins its isolated
- *   research call to Sonnet even when the main agent is on Haiku; confirmed live:
- *   Haiku unreliably followed the "always return valid JSON" instruction that call
- *   depends on). Falls back to env.anthropicModelSonnet if omitted.
+ *   research call to its own model, Haiku 5.5 as of Nov 2026). Falls back to
+ *   env.anthropicModelSonnet if omitted.
  * @returns {Promise<{finalText: string|null, toolCallLog: Array, hitIterationCap: boolean, stopReason: string, usage: {inputTokens: number, outputTokens: number}}>}
  *   `usage` is the REAL token count summed across every Anthropic API call this
  *   invocation made (every loop iteration is a separate billed call) — not an
@@ -46,9 +46,13 @@ async function runToolLoop({
   history,
   maxIterations,
   model, // which Claude model this loop's calls use — either an explicit pin
-  // (see supplierAgent/productResearch.js, always Sonnet) or chosen per-turn
+  // (see supplierAgent/productResearch.js, its own pinned model) or chosen per-turn
   // by modelRouter.js; falls back to env.anthropicModel if unset.
+  effort, // optional: "low" | "medium" | "high" — how much Haiku 5.5 /
+  // Sonnet 5.5 think before answering. Ignored by older models. Omitted
+  // means the model's own default ("medium" on Haiku 5.5).
 }) {
+  const resolvedModel = model || env.anthropicModelSonnet;
   const messages = history.map((m) => ({ role: m.role, content: m.content }));
   const toolCallLog = [];
   let iterations = 0;
@@ -57,6 +61,7 @@ async function runToolLoop({
   let totalOutputTokens = 0;
   let totalCacheCreationTokens = 0; // NEW
   let totalCacheReadTokens = 0; // NEW
+  let totalWebSearches = 0; // billed per search ($10/1K), separately from tokens
 
   while (true) {
     iterations += 1;
@@ -79,10 +84,14 @@ async function runToolLoop({
       // longer exists — replaced by per-turn dynamic routing (see
       // agentEngine/modelRouter.js). Every real caller today always
       // passes an explicit model (modelRouter's pick, or
-      // productResearch.js's pinned Sonnet), so this is just a safety
+      // productResearch.js's own pinned model), so this is just a safety
       // net, not the normal path.
-      model: model || env.anthropicModelSonnet,
-      max_tokens: 1024,
+      model: resolvedModel,
+      // 1024 is the reply's own budget. Haiku 5.5 / Sonnet 5.5 think by
+      // default and that thinking counts toward max_tokens, so
+      // requestOptionsFor adds headroom for them (and passes effort) —
+      // otherwise a reply could be cut off mid-sentence. See modelPricing.js.
+      ...requestOptionsFor(resolvedModel, { answerTokens: 1024, effort }),
       // Prompt caching — system prompt + tool schemas are identical
       // across every iteration of this loop within a turn, and often
       // across consecutive turns too. Marking them cacheable means only
@@ -118,6 +127,7 @@ async function runToolLoop({
     totalCacheCreationTokens +=
       response.usage?.cache_creation_input_tokens || 0; // NEW
     totalCacheReadTokens += response.usage?.cache_read_input_tokens || 0; // NEW
+    totalWebSearches += response.usage?.server_tool_use?.web_search_requests || 0;
     console.log(
       `[toolLoop] iteration ${iterations}: input_tokens=${response.usage?.input_tokens ?? "n/a"} output_tokens=${response.usage?.output_tokens ?? "n/a"} (running total: ${totalInputTokens} in / ${totalOutputTokens} out)`,
     );
@@ -163,6 +173,7 @@ async function runToolLoop({
           outputTokens: totalOutputTokens,
           cacheCreationTokens: totalCacheCreationTokens, // NEW
           cacheReadTokens: totalCacheReadTokens, // NEW
+          webSearches: totalWebSearches,
         },
       };
     }
