@@ -32,6 +32,7 @@
 
 const { runToolLoop } = require("../agentEngine/toolLoop");
 const { computeCost } = require("../agentEngine/modelPricing");
+const { rehostImage } = require("../rehostImage");
 
 const RESEARCH_MODEL = process.env.PRODUCT_RESEARCH_MODEL || "claude-haiku-5-5";
 
@@ -92,7 +93,9 @@ async function researchProductSpecs({ title, brand }) {
   const parsed = parseResearchResponse(finalText);
   return {
     specs: parsed.specs || null,
-    imageUrl: parsed.imageUrl || null,
+    // Our own copy, not the retailer's URL — Shopify can't download from
+    // sites that block non-browser requests (see rehostImage.js).
+    imageUrl: await rehostImage(parsed.imageUrl),
     sourceNotes: parsed.sourceNotes || null,
     usage,
     cost: computeCost(RESEARCH_MODEL, usage),
